@@ -12,12 +12,14 @@ source_group("Header Files" FILES ${HEADERS})
 
 set(RESOURCES
     "version.rc"
+    "WslTools.rc"
 )
 source_group("Resource Files" FILES ${RESOURCES})
 
 set(SOURCES
     "main.c"
     "wslprv.c"
+    "wslsys.c"
     "wsltab.c"
     "wslutil.c"
 )

@@ -16,6 +16,7 @@ static PH_CALLBACK_REGISTRATION PluginLoadCallbackRegistration;
 static PH_CALLBACK_REGISTRATION PluginUnloadCallbackRegistration;
 static PH_CALLBACK_REGISTRATION MainWindowShowingCallbackRegistration;
 static PH_CALLBACK_REGISTRATION ProcessesUpdatedCallbackRegistration;
+static PH_CALLBACK_REGISTRATION SystemInformationInitializingCallbackRegistration;
 static BOOLEAN WslInstalled = FALSE;
 
 _Function_class_(PH_CALLBACK_FUNCTION)
@@ -69,6 +70,16 @@ static VOID NTAPI ProcessesUpdatedCallback(
         SystemInformer_Invoke(ProcessesUpdatedInvoke, NULL);
 }
 
+_Function_class_(PH_CALLBACK_FUNCTION)
+static VOID NTAPI SystemInformationInitializingCallback(
+    _In_opt_ PVOID Parameter,
+    _In_opt_ PVOID Context
+    )
+{
+    if (WslInstalled && Parameter)
+        WslSystemInformationInitializing(Parameter);
+}
+
 LOGICAL DllMain(
     _In_ HINSTANCE Instance,
     _In_ ULONG Reason,
@@ -92,7 +103,7 @@ LOGICAL DllMain(
                 return FALSE;
 
             info->DisplayName = L"WSL Tools";
-            info->Description = L"Shows WSL distributions and the WSL 2 virtual machine in a WSL tab.";
+            info->Description = L"Shows WSL distributions and the WSL 2 virtual machine in a WSL tab and in System Information.";
 
             PhRegisterCallback(
                 PhGetPluginCallback(PluginInstance, PluginCallbackLoad),
@@ -117,6 +128,12 @@ LOGICAL DllMain(
                 ProcessesUpdatedCallback,
                 NULL,
                 &ProcessesUpdatedCallbackRegistration
+                );
+            PhRegisterCallback(
+                PhGetGeneralCallback(GeneralCallbackSystemInformationInitializing),
+                SystemInformationInitializingCallback,
+                NULL,
+                &SystemInformationInitializingCallbackRegistration
                 );
 
             PhAddSettings(settings, RTL_NUMBER_OF(settings));

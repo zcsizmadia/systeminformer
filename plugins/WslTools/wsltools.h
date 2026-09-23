@@ -107,6 +107,12 @@ PPH_PROCESS_ITEM WslReferenceVmProcessItem(
     _Out_opt_ PULONG NumberOfCandidates
     );
 
+// wslsys.c
+
+VOID WslSystemInformationInitializing(
+    _In_ PPH_PLUGIN_SYSINFO_POINTERS Pointers
+    );
+
 // wsltab.c
 
 VOID WslInitializeTab(
