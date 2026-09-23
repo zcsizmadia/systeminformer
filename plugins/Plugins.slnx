@@ -21,4 +21,5 @@
   <Project Path="Updater/Updater.vcxproj" Id="a0c1595c-fa3e-4b7a-936c-306bc6294c5e" />
   <Project Path="UserNotes/UserNotes.vcxproj" Id="7c38d0aa-572c-4d75-8e4e-d68af3c051af" />
   <Project Path="WindowExplorer/WindowExplorer.vcxproj" Id="37488dc1-e45f-4626-a87c-3a854a153d1a" />
+  <Project Path="WslTools/WslTools.vcxproj" Id="bb8e686e-6287-42fa-8544-88ba7d77b705" />
 </Solution>

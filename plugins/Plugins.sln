@@ -34,6 +34,8 @@ Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "UserNotes", "UserNotes\User
 EndProject
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "HardwareDevices", "HardwareDevices\HardwareDevices.vcxproj", "{5F0D72C4-8319-4B61-9E13-6084B680EB90}"
 EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "WslTools", "WslTools\WslTools.vcxproj", "{BB8E686E-6287-42FA-8544-88BA7D77B705}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|ARM64 = Debug|ARM64
@@ -188,6 +190,18 @@ Global
 		{5F0D72C4-8319-4B61-9E13-6084B680EB90}.Release|Win32.Build.0 = Release|Win32
 		{5F0D72C4-8319-4B61-9E13-6084B680EB90}.Release|x64.ActiveCfg = Release|x64
 		{5F0D72C4-8319-4B61-9E13-6084B680EB90}.Release|x64.Build.0 = Release|x64
+		{BB8E686E-6287-42FA-8544-88BA7D77B705}.Debug|ARM64.ActiveCfg = Debug|ARM64
+		{BB8E686E-6287-42FA-8544-88BA7D77B705}.Debug|ARM64.Build.0 = Debug|ARM64
+		{BB8E686E-6287-42FA-8544-88BA7D77B705}.Debug|Win32.ActiveCfg = Debug|Win32
+		{BB8E686E-6287-42FA-8544-88BA7D77B705}.Debug|Win32.Build.0 = Debug|Win32
+		{BB8E686E-6287-42FA-8544-88BA7D77B705}.Debug|x64.ActiveCfg = Debug|x64
+		{BB8E686E-6287-42FA-8544-88BA7D77B705}.Debug|x64.Build.0 = Debug|x64
+		{BB8E686E-6287-42FA-8544-88BA7D77B705}.Release|ARM64.ActiveCfg = Release|ARM64
+		{BB8E686E-6287-42FA-8544-88BA7D77B705}.Release|ARM64.Build.0 = Release|ARM64
+		{BB8E686E-6287-42FA-8544-88BA7D77B705}.Release|Win32.ActiveCfg = Release|Win32
+		{BB8E686E-6287-42FA-8544-88BA7D77B705}.Release|Win32.Build.0 = Release|Win32
+		{BB8E686E-6287-42FA-8544-88BA7D77B705}.Release|x64.ActiveCfg = Release|x64
+		{BB8E686E-6287-42FA-8544-88BA7D77B705}.Release|x64.Build.0 = Release|x64
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE
