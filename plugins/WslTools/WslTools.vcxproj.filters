@@ -21,6 +21,9 @@
     <ClCompile Include="wslprv.c">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="wslsys.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="wsltab.c">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -38,6 +41,9 @@
   </ItemGroup>
   <ItemGroup>
     <ResourceCompile Include="version.rc">
+      <Filter>Resource Files</Filter>
+    </ResourceCompile>
+    <ResourceCompile Include="WslTools.rc">
       <Filter>Resource Files</Filter>
     </ResourceCompile>
   </ItemGroup>

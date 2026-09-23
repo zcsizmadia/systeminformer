@@ -21,7 +21,7 @@ typedef enum _WSL_TREE_COLUMN
     WSLTNC_VERSION,
     WSLTNC_PID,
     WSLTNC_CPU,
-    WSLTNC_WORKINGSET,
+    WSLTNC_PRIVATEBYTES,
     WSLTNC_VHDSIZE,
     WSLTNC_LOCATION,
     WSLTNC_MAXIMUM
@@ -46,7 +46,7 @@ typedef struct _WSL_NODE
     PH_STRINGREF TextCache[WSLTNC_MAXIMUM];
     WCHAR PidText[PH_INT32_STR_LEN_1];
     WCHAR CpuText[PH_INT32_STR_LEN_1];
-    WCHAR WorkingSetText[PH_INT64_STR_LEN_1];
+    WCHAR PrivateBytesText[PH_INT64_STR_LEN_1];
     WCHAR VhdSizeText[PH_INT64_STR_LEN_1];
     WCHAR VersionText[PH_INT32_STR_LEN_1];
 } WSL_NODE, *PWSL_NODE;
@@ -367,14 +367,14 @@ static VOID WslpGetVmCellText(
             }
         }
         break;
-    case WSLTNC_WORKINGSET:
+    case WSLTNC_PRIVATEBYTES:
         if (processItem)
         {
-            PhInitFormatSize(&format, processItem->VmCounters.WorkingSetSize);
+            PhInitFormatSize(&format, processItem->VmCounters.PagefileUsage);
 
-            if (PhFormatToBuffer(&format, 1, Node->WorkingSetText, sizeof(Node->WorkingSetText), &returnLength))
+            if (PhFormatToBuffer(&format, 1, Node->PrivateBytesText, sizeof(Node->PrivateBytesText), &returnLength))
             {
-                GetCellText->Text.Buffer = Node->WorkingSetText;
+                GetCellText->Text.Buffer = Node->PrivateBytesText;
                 GetCellText->Text.Length = returnLength - sizeof(UNICODE_NULL);
             }
         }
@@ -855,7 +855,7 @@ static VOID WslpInitializeTreeList(
     PhAddTreeNewColumn(WindowHandle, WSLTNC_VERSION, TRUE, L"Version", 50, PH_ALIGN_RIGHT, 2, DT_RIGHT);
     PhAddTreeNewColumn(WindowHandle, WSLTNC_PID, TRUE, L"PID", 50, PH_ALIGN_RIGHT, 3, DT_RIGHT);
     PhAddTreeNewColumn(WindowHandle, WSLTNC_CPU, TRUE, L"CPU", 45, PH_ALIGN_RIGHT, 4, DT_RIGHT);
-    PhAddTreeNewColumn(WindowHandle, WSLTNC_WORKINGSET, TRUE, L"Working set", 80, PH_ALIGN_RIGHT, 5, DT_RIGHT);
+    PhAddTreeNewColumn(WindowHandle, WSLTNC_PRIVATEBYTES, TRUE, L"Private bytes", 80, PH_ALIGN_RIGHT, 5, DT_RIGHT);
     PhAddTreeNewColumn(WindowHandle, WSLTNC_VHDSIZE, TRUE, L"Disk file size", 80, PH_ALIGN_RIGHT, 6, DT_RIGHT);
     PhAddTreeNewColumn(WindowHandle, WSLTNC_LOCATION, TRUE, L"Location", 300, PH_ALIGN_LEFT, 7, DT_PATH_ELLIPSIS);
 

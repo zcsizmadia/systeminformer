@@ -67,6 +67,7 @@
   <ItemGroup>
     <ClCompile Include="main.c" />
     <ClCompile Include="wslprv.c" />
+    <ClCompile Include="wslsys.c" />
     <ClCompile Include="wsltab.c" />
     <ClCompile Include="wslutil.c" />
   </ItemGroup>
@@ -76,6 +77,7 @@
   </ItemGroup>
   <ItemGroup>
     <ResourceCompile Include="version.rc" />
+    <ResourceCompile Include="WslTools.rc" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
 </Project>
