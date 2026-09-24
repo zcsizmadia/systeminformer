@@ -78,6 +78,7 @@ typedef struct _WSL_ACTION_CONTEXT
     PPH_STRING Arguments;
     PPH_STRING Description;
     NTSTATUS Status;
+    PPH_STRING Message; // the tool's own error text, if it printed one
 } WSL_ACTION_CONTEXT, *PWSL_ACTION_CONTEXT;
 
 static PPH_MAIN_TAB_PAGE WslPage = NULL;
@@ -1283,11 +1284,62 @@ static VOID NTAPI WslpShowActionError(
 {
     PWSL_ACTION_CONTEXT context = Parameter;
 
-    PhShowStatus(SystemInformer_GetWindowHandle(), PhGetString(context->Description), context->Status, 0);
+    // The tool's message says why, e.g. "Container '...' is not running."; the status alone
+    // would only say the command failed.
+    if (context->Message)
+        PhShowError2(SystemInformer_GetWindowHandle(), PhGetString(context->Description), L"%s", context->Message->Buffer);
+    else
+        PhShowStatus(SystemInformer_GetWindowHandle(), PhGetString(context->Description), context->Status, 0);
 
+    PhClearReference(&context->Message);
     PhDereferenceObject(context->Arguments);
     PhDereferenceObject(context->Description);
     PhFree(context);
+}
+
+/**
+ * Gets the error message a failed wsl.exe or wslc.exe command printed.
+ *
+ * \param Output The command output (UTF-8).
+ * \return The message lines, without wslc's "If this error was unexpected..." footer, or NULL
+ * if the command printed nothing.
+ */
+static PPH_STRING WslpGetCommandErrorMessage(
+    _In_ PPH_BYTES Output
+    )
+{
+    static CONST PH_STRINGREF footer = PH_STRINGREF_INIT(L"If this error was unexpected");
+    static CONST PH_STRINGREF whitespace = PH_STRINGREF_INIT(L" \t\r");
+    static CONST PH_STRINGREF newLine = PH_STRINGREF_INIT(L"\n");
+    PPH_STRING text;
+    PPH_STRING message = NULL;
+    PH_STRINGREF remaining;
+    PH_STRINGREF line;
+
+    if (!(text = PhConvertUtf8ToUtf16Ex(Output->Buffer, Output->Length)))
+        return NULL;
+
+    remaining = text->sr;
+
+    while (remaining.Length != 0)
+    {
+        PhSplitStringRefAtChar(&remaining, L'\n', &line, &remaining);
+        PhTrimStringRef(&line, &whitespace, 0);
+
+        if (line.Length == 0)
+            continue;
+        if (PhStartsWithStringRef(&line, &footer, TRUE))
+            break;
+
+        if (message)
+            PhMoveReference(&message, PhConcatStringRef3(&message->sr, &newLine, &line));
+        else
+            message = PhCreateString2(&line);
+    }
+
+    PhDereferenceObject(text);
+
+    return message;
 }
 
 /**
@@ -1300,9 +1352,18 @@ static NTSTATUS NTAPI WslpActionThread(
 {
     PWSL_ACTION_CONTEXT context = Parameter;
     NTSTATUS status;
+    PPH_BYTES output = NULL;
 
-    status = WslRunCommand(context->FileName, &context->Arguments->sr, NULL);
+    status = WslRunCommandEx(context->FileName, &context->Arguments->sr, &output, TRUE);
     context->Status = status;
+
+    if (output)
+    {
+        if (!NT_SUCCESS(status))
+            context->Message = WslpGetCommandErrorMessage(output);
+
+        PhDereferenceObject(output);
+    }
 
     WslRefreshProvider();
 
@@ -1534,8 +1595,25 @@ static VOID WslpHandleCommand(
     case ID_WSL_CONTAINERSTOP:
     case ID_WSL_CONTAINERRESTART:
     case ID_WSL_CONTAINERKILL:
+    case ID_WSL_CONTAINERREMOVE:
         {
-            PCWSTR verb = Id == ID_WSL_CONTAINERSTOP ? L"stop" : Id == ID_WSL_CONTAINERRESTART ? L"restart" : L"kill";
+            PCWSTR verb;
+
+            switch (Id)
+            {
+            case ID_WSL_CONTAINERSTOP:
+                verb = L"stop";
+                break;
+            case ID_WSL_CONTAINERRESTART:
+                verb = L"restart";
+                break;
+            case ID_WSL_CONTAINERKILL:
+                verb = L"kill";
+                break;
+            default:
+                verb = L"remove";
+                break;
+            }
 
             if (!node || !node->Container || !WslGetWslcFileName())
                 break;
@@ -1546,12 +1624,24 @@ static VOID WslpHandleCommand(
                 break;
             }
 
-            // Killing skips the container's shutdown, so it asks first; stop and restart do not.
+            // Killing skips the container's shutdown and removing deletes its filesystem, so both
+            // ask first; stop and restart do not.
             if (Id == ID_WSL_CONTAINERKILL && !PhShowConfirmMessage(
                 WindowHandle,
                 L"kill",
                 node->Container->Name->Buffer,
                 L"The container's processes will be killed without a chance to shut down.",
+                TRUE
+                ))
+            {
+                break;
+            }
+
+            if (Id == ID_WSL_CONTAINERREMOVE && !PhShowConfirmMessage(
+                WindowHandle,
+                L"remove",
+                node->Container->Name->Buffer,
+                L"The container and any changes made to its filesystem will be deleted.",
                 TRUE
                 ))
             {
@@ -1615,6 +1705,10 @@ static VOID WslpShowContextMenu(
         PhInsertEMenuItem(menu, PhCreateEMenuItem(0, ID_WSL_CONTAINERSTOP, L"S&top", NULL, NULL), ULONG_MAX);
         PhInsertEMenuItem(menu, PhCreateEMenuItem(0, ID_WSL_CONTAINERRESTART, L"&Restart", NULL, NULL), ULONG_MAX);
         PhInsertEMenuItem(menu, PhCreateEMenuItem(0, ID_WSL_CONTAINERKILL, L"&Kill", NULL, NULL), ULONG_MAX);
+
+        // wslc refuses to remove a running container, so Remove is only offered once it stopped.
+        if (!node->Container->Running)
+            PhInsertEMenuItem(menu, PhCreateEMenuItem(0, ID_WSL_CONTAINERREMOVE, L"Re&move", NULL, NULL), ULONG_MAX);
 
         PhInsertEMenuItem(menu, PhCreateEMenuSeparator(), ULONG_MAX);
 

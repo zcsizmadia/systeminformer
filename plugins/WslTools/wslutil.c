@@ -576,6 +576,29 @@ NTSTATUS WslRunCommand(
     _Out_opt_ PPH_BYTES *Output
     )
 {
+    return WslRunCommandEx(FileName, Arguments, Output, FALSE);
+}
+
+/**
+ * Runs wsl.exe or wslc.exe hidden and captures its output.
+ *
+ * \param FileName The executable, from WslGetWslFileName or WslGetWslcFileName.
+ * \param Arguments The command line arguments, without the executable name.
+ * \param Output Receives the combined stdout and stderr text. The caller owns the string.
+ * \param OutputOnFailure TRUE to also return the output when the tool exits with a non-zero code
+ * (STATUS_UNSUCCESSFUL), so its error message can be shown.
+ * \return STATUS_SUCCESS if wsl.exe exited with code 0, STATUS_UNSUCCESSFUL if it exited with
+ * another code, STATUS_IO_TIMEOUT if it was killed after WSL_COMMAND_TIMEOUT_MS, or another
+ * error status.
+ * \remarks Must not be called on the GUI thread; it blocks until wsl.exe exits.
+ */
+NTSTATUS WslRunCommandEx(
+    _In_ PPH_STRING FileName,
+    _In_ PCPH_STRINGREF Arguments,
+    _Out_opt_ PPH_BYTES *Output,
+    _In_ BOOLEAN OutputOnFailure
+    )
+{
     NTSTATUS status;
     HANDLE processHandle;
     HANDLE readHandle;
@@ -632,7 +655,7 @@ NTSTATUS WslRunCommand(
 
 CleanupExit:
     // Both tools write UTF-8: wsl.exe because WslCreateProcess sets WSL_UTF8, wslc.exe always.
-    if (Output && NT_SUCCESS(status))
+    if (Output && (NT_SUCCESS(status) || (OutputOnFailure && status == STATUS_UNSUCCESSFUL)))
         *Output = PhFinalBytesBuilderBytes(&bytesBuilder);
     else
         PhDeleteBytesBuilder(&bytesBuilder);

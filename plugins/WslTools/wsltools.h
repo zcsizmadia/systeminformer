@@ -230,6 +230,13 @@ NTSTATUS WslRunCommand(
     _Out_opt_ PPH_BYTES *Output
     );
 
+NTSTATUS WslRunCommandEx(
+    _In_ PPH_STRING FileName,
+    _In_ PCPH_STRINGREF Arguments,
+    _Out_opt_ PPH_BYTES *Output,
+    _In_ BOOLEAN OutputOnFailure
+    );
+
 BOOLEAN WslIsSafeDistroName(
     _In_ PPH_STRING Name
     );
