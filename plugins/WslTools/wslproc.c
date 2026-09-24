@@ -21,7 +21,9 @@
 // processes of the distribution the loop runs in.
 
 // The first two frames are one second apart, so CPU usage, which needs two frames, is
-// available right after the tab is shown instead of one full interval later.
+// available right after the tab is shown instead of one full interval later. The cgroup of
+// each process tells the container it runs in, when the distribution hosts a container engine.
+// The script is a PhFormatString format, so "%%" prints the "%" that starts a cgroup line.
 #define WSL_PROCESS_SCRIPT \
     L"t=$(getconf CLK_TCK 2>/dev/null || echo 100); " \
     L"p=$(getconf PAGESIZE 2>/dev/null || echo 4096); " \
@@ -32,6 +34,7 @@
     L"m=0; a=0; while read -r n v r; do case $n in MemTotal:) m=$v ;; MemAvailable:) a=$v ;; esac; done < /proc/meminfo; " \
     L"echo @ $u $t $p $$ $k $m $a; " \
     L"cat /proc/[0-9]*/stat 2>/dev/null; " \
+    L"for d in /proc/[0-9]*; do read -r g < $d/cgroup 2>/dev/null && echo %%${d#/proc/} $g; done; " \
     L"echo @end; " \
     L"sleep $s; " \
     L"s=%lu; " \
@@ -535,47 +538,62 @@ static VOID WslpDiscardEntries(
 }
 
 /**
- * Gets the container ID from a cgroup path, e.g. "0::/docker/<64 hex digits>".
+ * Gets the container ID from a cgroup path.
  *
  * \return The ID, or NULL if the process is not in a container.
+ * \remarks The ID is 64 hexadecimal digits after "/docker/" (WSLC, and Docker with the
+ * cgroupfs driver), "/docker-" (Docker with the systemd driver, "docker-<id>.scope") or
+ * "/libpod-" (Podman, "libpod-<id>.scope").
  */
 static PPH_STRING WslpGetCgroupContainerId(
     _In_ PH_STRINGREF Cgroup
     )
 {
-    static CONST PH_STRINGREF dockerPath = PH_STRINGREF_INIT(L"/docker/");
-    ULONG_PTR index;
-    PH_STRINGREF id;
-
-    if ((index = PhFindStringInStringRef(&Cgroup, &dockerPath, FALSE)) == SIZE_MAX)
-        return NULL;
-
-    id.Buffer = Cgroup.Buffer + index + dockerPath.Length / sizeof(WCHAR);
-    id.Length = Cgroup.Length - index * sizeof(WCHAR) - dockerPath.Length;
-
-    // A full container ID is 64 hexadecimal digits; anything after it is a nested cgroup.
-    if (id.Length < 64 * sizeof(WCHAR))
-        return NULL;
-
-    id.Length = 64 * sizeof(WCHAR);
-
-    for (ULONG i = 0; i < 64; i++)
+    static CONST PH_STRINGREF prefixes[] =
     {
-        WCHAR c = id.Buffer[i];
+        PH_STRINGREF_INIT(L"/docker/"),
+        PH_STRINGREF_INIT(L"/docker-"),
+        PH_STRINGREF_INIT(L"/libpod-"),
+    };
 
-        if (!((c >= L'0' && c <= L'9') || (c >= L'a' && c <= L'f')))
-            return NULL;
+    for (ULONG p = 0; p < RTL_NUMBER_OF(prefixes); p++)
+    {
+        ULONG_PTR index;
+        PH_STRINGREF id;
+        BOOLEAN valid = TRUE;
+
+        if ((index = PhFindStringInStringRef(&Cgroup, &prefixes[p], FALSE)) == SIZE_MAX)
+            continue;
+
+        id.Buffer = Cgroup.Buffer + index + prefixes[p].Length / sizeof(WCHAR);
+        id.Length = Cgroup.Length - index * sizeof(WCHAR) - prefixes[p].Length;
+
+        // Anything after the 64 digits is a nested cgroup or ".scope".
+        if (id.Length < 64 * sizeof(WCHAR))
+            continue;
+
+        id.Length = 64 * sizeof(WCHAR);
+
+        for (ULONG i = 0; i < 64 && valid; i++)
+        {
+            WCHAR c = id.Buffer[i];
+
+            valid = (c >= L'0' && c <= L'9') || (c >= L'a' && c <= L'f');
+        }
+
+        if (valid)
+            return PhCreateString2(&id);
     }
 
-    return PhCreateString2(&id);
+    return NULL;
 }
 
 /**
  * Handles one output line of the collector loop or of a snapshot.
  *
  * \return The frame that the line completed, or NULL. The caller owns the reference.
- * \remarks A "%<pid> <cgroup>" line gives the cgroup of a process of the frame. Only session
- * snapshots print these lines, after all stat lines.
+ * \remarks A "%<pid> <cgroup>" line gives the cgroup of a process of the frame. Both scripts
+ * print these lines after all stat lines.
  */
 static PWSL_PROCESS_FRAME WslpProcessLine(
     _In_ PWSL_FRAME_PARSER Parser,

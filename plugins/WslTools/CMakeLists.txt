@@ -19,6 +19,7 @@ source_group("Resource Files" FILES ${RESOURCES})
 set(SOURCES
     "main.c"
     "wslc.c"
+    "wsldock.c"
     "wslinsp.c"
     "wslproc.c"
     "wslprv.c"

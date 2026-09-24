@@ -19,8 +19,6 @@
 #define ID_WSL_OPENFILELOCATION         40004
 #define ID_WSL_GOTOPROCESS              40005
 #define ID_WSL_COPY                     40006
-#define ID_WSL_CONTAINERSHELL           40007
-#define ID_WSL_CONTAINERLOGS            40008
 #define ID_WSL_CONTAINERSTOP            40009
 #define ID_WSL_CONTAINERRESTART         40010
 #define ID_WSL_CONTAINERKILL            40011

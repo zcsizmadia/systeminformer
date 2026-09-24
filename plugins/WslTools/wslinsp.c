@@ -36,11 +36,12 @@ typedef struct _WSL_INSPECT_NODE
 
 typedef struct _WSL_INSPECT_CONTEXT
 {
-    PPH_STRING SessionName;
+    PPH_STRING SessionName; // The WSLC session, or NULL for an engine container
+    PPH_STRING PipeName; // The Docker API engine, or NULL for a WSLC container
     PPH_STRING ContainerId;
     PPH_STRING ContainerName;
     NTSTATUS Status;
-    PPH_BYTES Output; // The JSON as wslc printed it
+    PPH_BYTES Output; // The JSON as wslc printed it or the engine returned it
 
     // Used by the window.
     HWND WindowHandle;
@@ -81,6 +82,7 @@ static VOID WslpFreeInspectContext(
     }
 
     PhClearReference(&Context->SessionName);
+    PhClearReference(&Context->PipeName);
     PhClearReference(&Context->ContainerId);
     PhClearReference(&Context->ContainerName);
     PhClearReference(&Context->Output);
@@ -402,7 +404,8 @@ static VOID NTAPI WslpShowInspectWindow(
 }
 
 /**
- * Runs "wslc inspect" off the GUI thread; it can wait on the WSL service.
+ * Runs "wslc inspect", or GET /containers/<id>/json on an engine, off the GUI thread; either
+ * can wait on a service.
  */
 _Function_class_(USER_THREAD_START_ROUTINE)
 static NTSTATUS NTAPI WslpInspectThread(
@@ -412,7 +415,27 @@ static NTSTATUS NTAPI WslpInspectThread(
     PWSL_INSPECT_CONTEXT context = Parameter;
     PPH_STRING arguments;
 
-    if (arguments = PhFormatString(L"--session \"%s\" inspect %s", context->SessionName->Buffer, context->ContainerId->Buffer))
+    if (context->PipeName && (arguments = PhFormatString(L"/containers/%s/json", context->ContainerId->Buffer)))
+    {
+        PPH_BYTES path = PhConvertUtf16ToUtf8Ex(arguments->Buffer, arguments->Length);
+        ULONG statusCode;
+
+        context->Status = WslEngineRequest(context->PipeName, "GET", path->Buffer, WSL_COMMAND_TIMEOUT_MS, &statusCode, &context->Output);
+
+        if (NT_SUCCESS(context->Status) && statusCode != 200)
+        {
+            context->Status = statusCode == 404 ? STATUS_NOT_FOUND : STATUS_UNSUCCESSFUL;
+            PhClearReference(&context->Output);
+        }
+
+        PhDereferenceObject(path);
+        PhDereferenceObject(arguments);
+    }
+    else if (context->PipeName)
+    {
+        context->Status = STATUS_NO_MEMORY;
+    }
+    else if (arguments = PhFormatString(L"--session \"%s\" inspect %s", context->SessionName->Buffer, context->ContainerId->Buffer))
     {
         context->Status = WslRunCommand(WslGetWslcFileName(), &arguments->sr, &context->Output);
         PhDereferenceObject(arguments);
@@ -451,6 +474,37 @@ NTSTATUS WslShowContainerInspect(
 
     context = PhAllocateZero(sizeof(WSL_INSPECT_CONTEXT));
     PhSetReference(&context->SessionName, SessionName);
+    PhSetReference(&context->ContainerId, ContainerId);
+    PhSetReference(&context->ContainerName, ContainerName);
+
+    if (!NT_SUCCESS(status = PhCreateThread2(WslpInspectThread, context)))
+        WslpFreeInspectContext(context);
+
+    return status;
+}
+
+/**
+ * Inspects a container of a Docker API engine and shows the result in the Inspect window.
+ *
+ * \param PipeName The engine's pipe.
+ * \param ContainerId The container ID.
+ * \param ContainerName The container name, for the window title.
+ * \return NTSTATUS code indicating whether the inspect could be started.
+ */
+NTSTATUS WslShowEngineContainerInspect(
+    _In_ PPH_STRING PipeName,
+    _In_ PPH_STRING ContainerId,
+    _In_ PPH_STRING ContainerName
+    )
+{
+    PWSL_INSPECT_CONTEXT context;
+    NTSTATUS status;
+
+    if (!WslIsSafePipeName(PipeName) || !WslIsSafeContainerId(ContainerId))
+        return STATUS_INVALID_PARAMETER;
+
+    context = PhAllocateZero(sizeof(WSL_INSPECT_CONTEXT));
+    PhSetReference(&context->PipeName, PipeName);
     PhSetReference(&context->ContainerId, ContainerId);
     PhSetReference(&context->ContainerName, ContainerName);
 

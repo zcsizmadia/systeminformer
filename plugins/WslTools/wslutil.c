@@ -72,6 +72,8 @@ VOID NTAPI WslpSnapshotDeleteProcedure(
 
     if (snapshot->Sessions)
         WslFreeSessions(snapshot->Sessions);
+    if (snapshot->Engines)
+        WslFreeEngines(snapshot->Engines);
 }
 
 /**
@@ -268,6 +270,7 @@ PWSL_SNAPSHOT WslQuerySnapshot(
     snapshot->Distributions = PhCreateList(4);
     snapshot->RunningQueryStatus = STATUS_SUCCESS;
     snapshot->Sessions = NULL;
+    snapshot->Engines = NULL;
 
     context.Distributions = snapshot->Distributions;
     context.DefaultId = NULL;

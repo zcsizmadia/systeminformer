@@ -476,6 +476,11 @@ static NTSTATUS NTAPI WslpProviderThread(
             if (candidates != 0)
                 snapshot->Sessions = WslQuerySessions(sessionVms);
 
+            // Engines are placed by the containers of the distribution frames just attached,
+            // and a Docker API in front of WSLC is recognized by the sessions' containers.
+            if (candidates != 0 && !ReadAcquire(&WslpProviderStopping))
+                snapshot->Engines = WslQueryEngines(snapshot);
+
             if (ReadAcquire(&WslpProviderStopping))
             {
                 PhDereferenceObject(snapshot);
@@ -495,6 +500,7 @@ static NTSTATUS NTAPI WslpProviderThread(
             // Hidden: nothing is collected, and CPU usage starts fresh when shown again.
             WslpStopAllCollectors();
             WslResetSessionProcesses();
+            WslResetEngines();
 
             PhAcquireQueuedLockExclusive(&WslpLatestSnapshotLock);
             PhClearReference(&WslpLatestSnapshot);
@@ -506,6 +512,7 @@ static NTSTATUS NTAPI WslpProviderThread(
 
     WslpStopAllCollectors();
     WslResetSessionProcesses();
+    WslResetEngines();
 
     return STATUS_SUCCESS;
 }

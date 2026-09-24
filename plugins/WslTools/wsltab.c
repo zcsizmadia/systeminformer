@@ -53,7 +53,8 @@ typedef struct _WSL_NODE
     PWSL_DISTRO_ITEM Distro; // Owned by WslCurrentSnapshot; distribution nodes only
     PWSL_LINUX_PROCESS LinuxProcess; // Owned by the distribution's frame; process nodes only
     PWSL_PROCESS_FRAME Frame; // The frame LinuxProcess belongs to; process nodes only
-    PWSL_SESSION Session; // Owned by WslCurrentSnapshot; session and container nodes
+    PWSL_SESSION Session; // Owned by WslCurrentSnapshot; session nodes and their container nodes
+    PWSL_ENGINE Engine; // Owned by WslCurrentSnapshot; container nodes of a Docker API engine
     PWSL_CONTAINER Container; // Owned by WslCurrentSnapshot; container nodes only
     PPH_STRING NameText; // Distribution name, followed by " *" for the default one
     PPH_STRING TooltipText; // Cached name column tooltip
@@ -76,7 +77,9 @@ typedef struct _WSL_NODE
 typedef struct _WSL_ACTION_CONTEXT
 {
     PPH_STRING FileName; // wsl.exe or wslc.exe; a cached string the context does not own
-    PPH_STRING Arguments;
+    PPH_STRING Arguments; // Command line arguments, or the request path for an engine
+    PPH_STRING PipeName; // A Docker API engine to send the request to, instead of running FileName
+    PCSTR Method; // The request method for an engine, e.g. "POST"
     PPH_STRING Description;
     NTSTATUS Status;
     PPH_STRING Message; // the tool's own error text, if it printed one
@@ -214,7 +217,8 @@ static PWSL_NODE WslpFindChildNode(
     {
         PWSL_NODE node = Parent->Children->Items[i];
 
-        if (PhEqualString(node->Id, Id, TRUE))
+        // Process nodes have no id.
+        if (node->Id && PhEqualString(node->Id, Id, TRUE))
             return node;
     }
 
@@ -283,12 +287,16 @@ static VOID WslpUpdateProcessNodes(
 
     nodeTable = PhCreateHashtable(sizeof(PWSL_NODE), WslpProcessNodeEqualFunction, WslpProcessNodeHashFunction, children->Count + 1);
 
+    // A distribution's children are container nodes instead while it hosts an engine; those are
+    // not matched here and so are removed below.
     for (ULONG i = 0; i < children->Count; i++)
     {
         PWSL_NODE child = children->Items[i];
 
         child->Seen = FALSE;
-        PhAddEntryHashtable(nodeTable, &child);
+
+        if (child->Type == WslNodeTypeLinuxProcess)
+            PhAddEntryHashtable(nodeTable, &child);
     }
 
     for (ULONG i = 0; processes && i < processes->Count; i++)
@@ -329,6 +337,59 @@ static VOID WslpUpdateProcessNodes(
         if (!node->Seen)
         {
             PhRemoveItemList(children, i - 1);
+            WslpDestroyNode(node);
+        }
+    }
+}
+
+/**
+ * Matches the children of a distribution that hosts a Docker API engine to the engine's
+ * containers, each with its processes, like the containers of a WSLC session.
+ *
+ * \param DistroNode The distribution node.
+ * \param Engine The engine placed in the distribution.
+ * \param Frame The distribution's processes, or NULL.
+ * \remarks The engine's own processes, e.g. dockerd and containerd, are not shown.
+ */
+static VOID WslpUpdateEngineNodes(
+    _In_ PWSL_NODE DistroNode,
+    _In_ PWSL_ENGINE Engine,
+    _In_opt_ PWSL_PROCESS_FRAME Frame
+    )
+{
+    for (ULONG i = 0; i < DistroNode->Children->Count; i++)
+        ((PWSL_NODE)DistroNode->Children->Items[i])->Seen = FALSE;
+
+    for (ULONG i = 0; i < Engine->Containers->Count; i++)
+    {
+        PWSL_CONTAINER container = Engine->Containers->Items[i];
+        PWSL_NODE containerNode = WslpFindChildNode(DistroNode, container->Id);
+
+        // The distribution's process nodes are removed below, as they are never seen here.
+        if (containerNode && containerNode->Type != WslNodeTypeContainer)
+            containerNode = NULL;
+
+        if (!containerNode)
+        {
+            containerNode = WslpCreateNode(WslNodeTypeContainer, container->Id);
+            PhAddItemList(DistroNode->Children, containerNode);
+        }
+
+        containerNode->Session = NULL;
+        containerNode->Engine = Engine;
+        containerNode->Container = container;
+        containerNode->Seen = TRUE;
+        WslpInvalidateNode(containerNode);
+        WslpUpdateProcessNodes(containerNode, Frame, container->Id);
+    }
+
+    for (ULONG i = DistroNode->Children->Count; i != 0; i--)
+    {
+        PWSL_NODE node = DistroNode->Children->Items[i - 1];
+
+        if (!node->Seen)
+        {
+            PhRemoveItemList(DistroNode->Children, i - 1);
             WslpDestroyNode(node);
         }
     }
@@ -396,6 +457,7 @@ static VOID WslpUpdateSessionNodes(
             }
 
             containerNode->Session = session;
+            containerNode->Engine = NULL;
             containerNode->Container = container;
             containerNode->Seen = TRUE;
             WslpInvalidateNode(containerNode);
@@ -458,6 +520,27 @@ static BOOLEAN WslpSelectVmNode(
 }
 
 /**
+ * Finds the Docker API engine placed in a distribution.
+ *
+ * \return The engine, or NULL if the distribution hosts none.
+ */
+static PWSL_ENGINE WslpFindDistroEngine(
+    _In_opt_ PPH_LIST Engines,
+    _In_ PPH_STRING DistroId
+    )
+{
+    for (ULONG i = 0; Engines && i < Engines->Count; i++)
+    {
+        PWSL_ENGINE engine = Engines->Items[i];
+
+        if (PhEqualString(engine->DistroId, DistroId, TRUE))
+            return engine;
+    }
+
+    return NULL;
+}
+
+/**
  * Applies a new snapshot from the provider. Runs on the GUI thread.
  *
  * \param Parameter The snapshot. This function takes ownership of the reference.
@@ -469,6 +552,7 @@ VOID NTAPI WslOnSnapshotUpdated(
 {
     PWSL_SNAPSHOT snapshot = Parameter;
     BOOLEAN hasWsl2 = FALSE;
+    PWSL_ENGINE engine;
 
     // The tab window can be gone while a snapshot is still queued.
     if (!WslTreeNewHandle)
@@ -499,7 +583,10 @@ VOID NTAPI WslOnSnapshotUpdated(
         else
             PhSetReference(&node->NameText, distro->Name);
 
-        WslpUpdateProcessNodes(node, distro->Processes, NULL);
+        if (engine = WslpFindDistroEngine(snapshot->Engines, distro->Id))
+            WslpUpdateEngineNodes(node, engine, distro->Processes);
+        else
+            WslpUpdateProcessNodes(node, distro->Processes, NULL);
 
         if (distro->Version == 2)
             hasWsl2 = TRUE;
@@ -642,6 +729,7 @@ static PCPH_STRINGREF WslpGetMemoryTooltip(
     static CONST PH_STRINGREF distroText = PH_STRINGREF_INIT(L"Sum of the resident sets of the distribution's processes. Shared pages are counted once per process.");
     static CONST PH_STRINGREF processText = PH_STRINGREF_INIT(L"Resident set of the Linux process.");
     static CONST PH_STRINGREF containerText = PH_STRINGREF_INIT(L"Memory usage as reported by wslc stats.");
+    static CONST PH_STRINGREF engineContainerText = PH_STRINGREF_INIT(L"Sum of the resident sets of the container's processes. Shared pages are counted once per process.");
     static CONST PH_STRINGREF sessionText = PH_STRINGREF_INIT(L"Sum of the memory usage of the session's running containers.");
     static CONST PH_STRINGREF sessionVmText = PH_STRINGREF_INIT(L"Private bytes of the session VM process: the memory the VM holds on the host.");
 
@@ -656,7 +744,7 @@ static PCPH_STRINGREF WslpGetMemoryTooltip(
     case WslNodeTypeSession:
         return WslSessionVmProcessItem ? &sessionVmText : &sessionText;
     default:
-        return &containerText;
+        return Node->Engine ? &engineContainerText : &containerText;
     }
 }
 
@@ -1434,6 +1522,20 @@ static PWSL_NODE WslpGetSelectedNode(
 }
 
 /**
+ * Frees an action context.
+ */
+static VOID WslpFreeActionContext(
+    _In_ PWSL_ACTION_CONTEXT Context
+    )
+{
+    PhClearReference(&Context->Message);
+    PhClearReference(&Context->PipeName);
+    PhDereferenceObject(Context->Arguments);
+    PhDereferenceObject(Context->Description);
+    PhFree(Context);
+}
+
+/**
  * Shows an action error. Runs on the GUI thread.
  *
  * \param Parameter The action context. This function frees it.
@@ -1451,10 +1553,7 @@ static VOID NTAPI WslpShowActionError(
     else
         PhShowStatus(SystemInformer_GetWindowHandle(), PhGetString(context->Description), context->Status, 0);
 
-    PhClearReference(&context->Message);
-    PhDereferenceObject(context->Arguments);
-    PhDereferenceObject(context->Description);
-    PhFree(context);
+    WslpFreeActionContext(context);
 }
 
 /**
@@ -1514,43 +1613,59 @@ static NTSTATUS NTAPI WslpActionThread(
     NTSTATUS status;
     PPH_BYTES output = NULL;
 
-    status = WslRunCommandEx(context->FileName, &context->Arguments->sr, WSL_ACTION_TIMEOUT_MS, &output, TRUE);
-    context->Status = status;
-
-    if (output)
+    if (context->PipeName)
     {
-        if (!NT_SUCCESS(status))
-            context->Message = WslpGetCommandErrorMessage(output);
+        PPH_BYTES path = PhConvertUtf16ToUtf8Ex(context->Arguments->Buffer, context->Arguments->Length);
+        ULONG statusCode;
 
-        PhDereferenceObject(output);
+        status = WslEngineRequest(context->PipeName, context->Method, path->Buffer, WSL_ACTION_TIMEOUT_MS, &statusCode, &output);
+        PhDereferenceObject(path);
+
+        // 304 is e.g. stopping a container that already stopped.
+        if (NT_SUCCESS(status) && !(statusCode >= 200 && statusCode < 300) && statusCode != 304)
+        {
+            status = STATUS_UNSUCCESSFUL;
+
+            if (!(context->Message = WslGetEngineErrorMessage(output)))
+                context->Message = PhFormatString(L"The engine answered with HTTP status %lu.", statusCode);
+        }
     }
+    else
+    {
+        status = WslRunCommandEx(context->FileName, &context->Arguments->sr, WSL_ACTION_TIMEOUT_MS, &output, TRUE);
+
+        if (output && !NT_SUCCESS(status))
+            context->Message = WslpGetCommandErrorMessage(output);
+    }
+
+    PhClearReference(&output);
+    context->Status = status;
 
     WslRefreshProvider();
 
     if (NT_SUCCESS(status))
-    {
-        PhDereferenceObject(context->Arguments);
-        PhDereferenceObject(context->Description);
-        PhFree(context);
-    }
+        WslpFreeActionContext(context);
     else
-    {
         SystemInformer_Invoke(WslpShowActionError, context);
-    }
 
     return STATUS_SUCCESS;
 }
 
 /**
- * Starts a wsl.exe or wslc.exe action in the background.
+ * Starts an action in the background, a wsl.exe or wslc.exe command or a Docker API request.
  *
- * \param FileName The executable, from WslGetWslFileName or WslGetWslcFileName.
- * \param Arguments The arguments, from PhFormatString. This function takes ownership of the
- * string; NULL does nothing.
+ * \param FileName The executable, from WslGetWslFileName or WslGetWslcFileName, or NULL with
+ * PipeName.
+ * \param PipeName The pipe of a Docker API engine, or NULL to run FileName.
+ * \param Method The request method for PipeName, e.g. "POST".
+ * \param Arguments The command line arguments, or the request path for PipeName, from
+ * PhFormatString. This function takes ownership of the string; NULL does nothing.
  * \param Description The error text shown if the action fails.
  */
 static VOID WslpStartAction(
-    _In_ PPH_STRING FileName,
+    _In_opt_ PPH_STRING FileName,
+    _In_opt_ PPH_STRING PipeName,
+    _In_opt_ PCSTR Method,
     _In_opt_ PPH_STRING Arguments,
     _In_ PCWSTR Description
     )
@@ -1562,15 +1677,13 @@ static VOID WslpStartAction(
 
     context = PhAllocateZero(sizeof(WSL_ACTION_CONTEXT));
     context->FileName = FileName;
+    PhSetReference(&context->PipeName, PipeName);
+    context->Method = Method;
     context->Arguments = Arguments;
     context->Description = PhCreateString(Description);
 
     if (!NT_SUCCESS(PhCreateThread2(WslpActionThread, context)))
-    {
-        PhDereferenceObject(context->Arguments);
-        PhDereferenceObject(context->Description);
-        PhFree(context);
-    }
+        WslpFreeActionContext(context);
 }
 
 /**
@@ -1679,6 +1792,8 @@ static VOID WslpHandleCommand(
             {
                 WslpStartAction(
                     WslGetWslFileName(),
+                    NULL,
+                    NULL,
                     PhFormatString(L"--terminate %s", node->Distro->Name->Buffer),
                     L"Unable to terminate the distribution."
                     );
@@ -1695,7 +1810,7 @@ static VOID WslpHandleCommand(
                 TRUE
                 ))
             {
-                WslpStartAction(WslGetWslFileName(), PhCreateString(L"--shutdown"), L"Unable to shut down WSL.");
+                WslpStartAction(WslGetWslFileName(), NULL, NULL, PhCreateString(L"--shutdown"), L"Unable to shut down WSL.");
             }
         }
         break;
@@ -1716,8 +1831,9 @@ static VOID WslpHandleCommand(
             if (!node)
                 break;
 
-            // The WSL VM for its own row, the session VM for a session and its containers.
-            if (node->Type == WslNodeTypeSession || node->Type == WslNodeTypeContainer)
+            // The session VM for a session and its containers; the WSL VM for everything else,
+            // including the containers of an engine, which run in a distribution.
+            if (node->Type == WslNodeTypeSession || (node->Type == WslNodeTypeContainer && !node->Engine))
                 WslpGoToVmProcess(WslSessionVmProcessItem);
             else
                 WslpGoToVmProcess(WslVmProcessItem);
@@ -1733,18 +1849,6 @@ static VOID WslpHandleCommand(
             PhShellExecute(WindowHandle, PhaFormatString(L"http://localhost:%hu/", port)->Buffer, NULL);
         }
         break;
-    case ID_WSL_CONTAINERSHELL:
-    case ID_WSL_CONTAINERLOGS:
-        {
-            NTSTATUS status;
-
-            if (!node || !node->Container)
-                break;
-
-            if (!NT_SUCCESS(status = WslStartContainerConsole(node->Session->Name, node->Container->Id, Id == ID_WSL_CONTAINERLOGS)))
-                PhShowStatus(WindowHandle, Id == ID_WSL_CONTAINERLOGS ? L"Unable to show the container logs." : L"Unable to open a shell.", status, 0);
-        }
-        break;
     case ID_WSL_CONTAINERINSPECT:
         {
             NTSTATUS status;
@@ -1752,7 +1856,12 @@ static VOID WslpHandleCommand(
             if (!node || !node->Container)
                 break;
 
-            if (!NT_SUCCESS(status = WslShowContainerInspect(node->Session->Name, node->Container->Id, node->Container->Name)))
+            if (node->Engine)
+                status = WslShowEngineContainerInspect(node->Engine->PipeName, node->Container->Id, node->Container->Name);
+            else
+                status = WslShowContainerInspect(node->Session->Name, node->Container->Id, node->Container->Name);
+
+            if (!NT_SUCCESS(status))
                 PhShowStatus(WindowHandle, L"Unable to inspect the container.", status, 0);
         }
         break;
@@ -1779,10 +1888,11 @@ static VOID WslpHandleCommand(
                 break;
             }
 
-            if (!node || !node->Container || !WslGetWslcFileName())
+            if (!node || !node->Container || (!node->Engine && !WslGetWslcFileName()))
                 break;
 
-            if (!WslIsSafeSessionName(node->Session->Name) || !WslIsSafeContainerId(node->Container->Id))
+            if ((node->Engine ? !WslIsSafePipeName(node->Engine->PipeName) : !WslIsSafeSessionName(node->Session->Name)) ||
+                !WslIsSafeContainerId(node->Container->Id))
             {
                 PhShowStatus(WindowHandle, L"Unable to control the container.", STATUS_INVALID_PARAMETER, 0);
                 break;
@@ -1812,11 +1922,29 @@ static VOID WslpHandleCommand(
                 break;
             }
 
-            WslpStartAction(
-                WslGetWslcFileName(),
-                PhFormatString(L"--session \"%s\" %s %s", node->Session->Name->Buffer, verb, node->Container->Id->Buffer),
-                L"Unable to control the container."
-                );
+            // The Docker API has the same actions: POST /containers/<id>/<verb>, and DELETE to remove.
+            if (node->Engine)
+            {
+                WslpStartAction(
+                    NULL,
+                    node->Engine->PipeName,
+                    Id == ID_WSL_CONTAINERREMOVE ? "DELETE" : "POST",
+                    Id == ID_WSL_CONTAINERREMOVE ?
+                        PhFormatString(L"/containers/%s", node->Container->Id->Buffer) :
+                        PhFormatString(L"/containers/%s/%s", node->Container->Id->Buffer, verb),
+                    L"Unable to control the container."
+                    );
+            }
+            else
+            {
+                WslpStartAction(
+                    WslGetWslcFileName(),
+                    NULL,
+                    NULL,
+                    PhFormatString(L"--session \"%s\" %s %s", node->Session->Name->Buffer, verb, node->Container->Id->Buffer),
+                    L"Unable to control the container."
+                    );
+            }
         }
         break;
     case ID_WSL_COPY:
@@ -1862,15 +1990,14 @@ static VOID WslpShowContextMenu(
     }
     else if (node->Type == WslNodeTypeContainer)
     {
-        PhInsertEMenuItem(menu, PhCreateEMenuItem(0, ID_WSL_CONTAINERSHELL, L"Open &shell", NULL, NULL), ULONG_MAX);
-        PhInsertEMenuItem(menu, PhCreateEMenuItem(0, ID_WSL_CONTAINERLOGS, L"&Logs", NULL, NULL), ULONG_MAX);
+        // The same items for WSLC containers and for the containers of a Docker API engine.
         PhInsertEMenuItem(menu, PhCreateEMenuItem(0, ID_WSL_CONTAINERINSPECT, L"&Inspect...", NULL, NULL), ULONG_MAX);
         PhInsertEMenuItem(menu, PhCreateEMenuSeparator(), ULONG_MAX);
         PhInsertEMenuItem(menu, PhCreateEMenuItem(0, ID_WSL_CONTAINERSTOP, L"S&top", NULL, NULL), ULONG_MAX);
         PhInsertEMenuItem(menu, PhCreateEMenuItem(0, ID_WSL_CONTAINERRESTART, L"&Restart", NULL, NULL), ULONG_MAX);
         PhInsertEMenuItem(menu, PhCreateEMenuItem(0, ID_WSL_CONTAINERKILL, L"&Kill", NULL, NULL), ULONG_MAX);
 
-        // wslc refuses to remove a running container, so Remove is only offered once it stopped.
+        // A running container cannot be removed, so Remove is only offered once it stopped.
         if (!node->Container->Running)
             PhInsertEMenuItem(menu, PhCreateEMenuItem(0, ID_WSL_CONTAINERREMOVE, L"Re&move", NULL, NULL), ULONG_MAX);
 
@@ -1886,13 +2013,13 @@ static VOID WslpShowContextMenu(
 
         if (!node->Container->Running)
         {
-            PhEnableEMenuItem(menu, ID_WSL_CONTAINERSHELL, FALSE);
             PhEnableEMenuItem(menu, ID_WSL_CONTAINERSTOP, FALSE);
             PhEnableEMenuItem(menu, ID_WSL_CONTAINERKILL, FALSE);
             PhEnableEMenuItem(menu, ID_WSL_CONTAINEROPENPORT, FALSE);
         }
 
-        if (!WslSessionVmProcessItem)
+        // An engine's containers run in the WSL VM, a session's in the session VM.
+        if (!(node->Engine ? WslVmProcessItem : WslSessionVmProcessItem))
             PhEnableEMenuItem(menu, ID_WSL_GOTOPROCESS, FALSE);
     }
     else if (node->Type == WslNodeTypeSession)

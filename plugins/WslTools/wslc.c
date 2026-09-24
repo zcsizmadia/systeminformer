@@ -99,9 +99,9 @@ BOOLEAN WslIsSafeContainerId(
 }
 
 /**
- * Frees a container.
+ * Frees a container, of a WSLC session or of a Docker API engine.
  */
-static VOID WslpFreeContainer(
+VOID WslFreeContainer(
     _In_ PWSL_CONTAINER Container
     )
 {
@@ -128,7 +128,7 @@ VOID WslFreeSessions(
         PWSL_SESSION session = Sessions->Items[i];
 
         for (ULONG j = 0; j < session->Containers->Count; j++)
-            WslpFreeContainer(session->Containers->Items[j]);
+            WslFreeContainer(session->Containers->Items[j]);
 
         PhDereferenceObject(session->Containers);
         PhClearReference(&session->Processes);
@@ -311,7 +311,7 @@ static VOID WslpParseContainerLine(
         if (container->Id && container->Name)
             PhAddItemList(session->Containers, container);
         else
-            WslpFreeContainer(container);
+            WslFreeContainer(container);
     }
 
     PhFreeJsonObject(object);
@@ -506,58 +506,6 @@ static VOID WslpQuerySessionContainers(
     }
 
     PhDereferenceObject(statsList);
-}
-
-/**
- * Opens a console window with a shell in a container, or with its log output.
- *
- * \param SessionName The session the container runs in.
- * \param ContainerId The container ID.
- * \param Logs TRUE to follow the container's logs, FALSE to open a shell.
- * \return NTSTATUS code indicating success or failure.
- * \remarks The shell is sh, which almost every image has; the window stays open while it runs.
- */
-NTSTATUS WslStartContainerConsole(
-    _In_ PPH_STRING SessionName,
-    _In_ PPH_STRING ContainerId,
-    _In_ BOOLEAN Logs
-    )
-{
-    NTSTATUS status;
-    PPH_STRING fileName;
-    PPH_STRING commandLine;
-
-    if (!(fileName = WslGetWslcFileName()))
-        return STATUS_NOT_SUPPORTED;
-    if (!WslIsSafeSessionName(SessionName) || !WslIsSafeContainerId(ContainerId))
-        return STATUS_INVALID_PARAMETER;
-
-    commandLine = PhFormatString(
-        Logs ? L"\"%s\" --session \"%s\" logs --follow %s" : L"\"%s\" --session \"%s\" exec --interactive --tty %s sh",
-        fileName->Buffer,
-        SessionName->Buffer,
-        ContainerId->Buffer
-        );
-
-    if (!commandLine)
-        return STATUS_NO_MEMORY;
-
-    status = PhCreateProcessWin32Ex(
-        fileName->Buffer,
-        commandLine->Buffer,
-        NULL,
-        NULL,
-        NULL,
-        PH_CREATE_PROCESS_NEW_CONSOLE,
-        NULL,
-        NULL,
-        NULL,
-        NULL
-        );
-
-    PhDereferenceObject(commandLine);
-
-    return status;
 }
 
 /**
