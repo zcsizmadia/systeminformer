@@ -20,16 +20,23 @@
 // Every distribution has its own PID namespace in the shared VM, so /proc lists only the
 // processes of the distribution the loop runs in.
 
+// The first two frames are one second apart, so CPU usage, which needs two frames, is
+// available right after the tab is shown instead of one full interval later.
 #define WSL_PROCESS_SCRIPT \
     L"t=$(getconf CLK_TCK 2>/dev/null || echo 100); " \
     L"p=$(getconf PAGESIZE 2>/dev/null || echo 4096); " \
+    L"s=1; " \
     L"while :; do " \
     L"read u i < /proc/uptime; " \
     L"echo @ $u $t $p $$; " \
     L"cat /proc/[0-9]*/stat 2>/dev/null; " \
     L"echo @end; " \
-    L"sleep %lu; " \
+    L"sleep $s; " \
+    L"s=%lu; " \
     L"done"
+
+// How long WslStopCollector waits for the reader thread before cancelling its read.
+#define WSL_COLLECTOR_STOP_TIMEOUT_MS 2000
 
 // Fields of /proc/<pid>/stat, counted from the state field that follows the name.
 #define WSL_STAT_STATE 0
@@ -66,6 +73,7 @@ typedef struct _WSL_COLLECTOR
     HANDLE JobHandle; // Kill-on-close job with wsl.exe and its helper processes
     HANDLE ThreadHandle;
     LONG Running;
+    LONG Stopping; // Set by WslStopCollector; the reader thread checks it before each read
 
     PH_QUEUED_LOCK FrameLock;
     PWSL_PROCESS_FRAME Frame; // Latest complete frame, protected by FrameLock
@@ -80,6 +88,7 @@ typedef struct _WSL_COLLECTOR
     ULONG64 TicksPerSecond;
     ULONG64 PageSize;
     ULONG SelfProcessId;
+    ULONG FrameCount; // Complete frames so far, counted up to 2
     BOOLEAN InFrame;
 } WSL_COLLECTOR, *PWSL_COLLECTOR;
 
@@ -115,6 +124,25 @@ VOID WslInitializeProcessFrameType(
     )
 {
     WslpProcessFrameType = PhCreateObjectType(L"WslProcessFrame", 0, WslpProcessFrameDeleteProcedure);
+}
+
+/**
+ * Gets the number of host logical processors across all processor groups.
+ *
+ * \remarks This is the count the process provider divides CPU time by
+ * (PhSystemProcessorInformation, which is not exported), so WSL rows use the same unit as
+ * the VM row. PhSystemBasicInformation only covers the current processor group.
+ */
+static ULONG WslpGetHostProcessorCount(
+    VOID
+    )
+{
+    static ULONG processorCount = 0;
+
+    if (processorCount == 0)
+        processorCount = max(GetActiveProcessorCount(ALL_PROCESSOR_GROUPS), 1);
+
+    return processorCount;
 }
 
 _Function_class_(PH_HASHTABLE_EQUAL_FUNCTION)
@@ -174,6 +202,10 @@ PCPH_STRINGREF WslGetLinuxProcessStateText(
 
 /**
  * Parses a frame header, "@ <uptime> <ticks per second> <page size> <shell pid>".
+ *
+ * \remarks A process name can contain a newline, so a line that only starts like a header
+ * can be the tail of a stat line. The rest of that stat line always follows the name on the
+ * same line, so requiring exactly these fields and nothing after them rejects it.
  */
 static BOOLEAN WslpParseHeader(
     _In_ PWSL_COLLECTOR Collector,
@@ -206,7 +238,7 @@ static BOOLEAN WslpParseHeader(
 
     Collector->SelfProcessId = (ULONG)value;
 
-    return TRUE;
+    return Line.Length == 0;
 }
 
 /**
@@ -340,18 +372,30 @@ static VOID WslpCompleteFrame(
     DOUBLE capacity = 0; // Host CPU ticks available since the previous frame
 
     // The shell's parent is its Relay, and the Relay's parent is the session's SessionLeader.
+    // Both are checked by name, so an unexpected tree never hides an unrelated process.
     if (self = WslpFindEntry(Collector->Entries, Collector->SelfProcessId))
     {
-        relayProcessId = self->Process.ParentProcessId;
+        static CONST PH_STRINGREF relayPrefix = PH_STRINGREF_INIT(L"Relay(");
+        static CONST PH_STRINGREF sessionLeaderName = PH_STRINGREF_INIT(L"SessionLeader");
+        PWSL_STAT_ENTRY sessionLeader;
 
-        if (relay = WslpFindEntry(Collector->Entries, relayProcessId))
-            sessionLeaderProcessId = relay->Process.ParentProcessId;
+        if ((relay = WslpFindEntry(Collector->Entries, self->Process.ParentProcessId)) &&
+            PhStartsWithStringRef(&relay->Process.Name->sr, &relayPrefix, FALSE))
+        {
+            relayProcessId = relay->Process.ProcessId;
+
+            if ((sessionLeader = WslpFindEntry(Collector->Entries, relay->Process.ParentProcessId)) &&
+                PhEqualStringRef(&sessionLeader->Process.Name->sr, &sessionLeaderName, FALSE))
+            {
+                sessionLeaderProcessId = sessionLeader->Process.ProcessId;
+            }
+        }
     }
 
     if (Collector->HavePrevious && Collector->Uptime > Collector->PreviousUptime)
     {
         capacity = (Collector->Uptime - Collector->PreviousUptime) *
-            (DOUBLE)Collector->TicksPerSecond * PhSystemBasicInformation.NumberOfProcessors;
+            (DOUBLE)Collector->TicksPerSecond * WslpGetHostProcessorCount();
     }
 
     // PhCreateObject does not zero the object.
@@ -428,6 +472,14 @@ static VOID WslpCompleteFrame(
     PhAcquireQueuedLockExclusive(&Collector->FrameLock);
     PhMoveReference(&Collector->Frame, frame);
     PhReleaseQueuedLockExclusive(&Collector->FrameLock);
+
+    // Show the first frame and the first CPU usage as soon as they exist; later frames are
+    // picked up by the regular refresh.
+    if (Collector->FrameCount < 2)
+    {
+        Collector->FrameCount++;
+        WslRefreshProvider();
+    }
 }
 
 /**
@@ -515,7 +567,11 @@ static NTSTATUS NTAPI WslpCollectorThread(
             buffer = PhReAllocate(buffer, allocatedLength);
         }
 
-        // Blocks until output arrives; fails once wsl.exe has exited and the pipe is closed.
+        if (ReadAcquire(&collector->Stopping))
+            break;
+
+        // Blocks until output arrives; fails once wsl.exe has exited and the pipe is closed,
+        // or when WslStopCollector cancels the read.
         if (!NT_SUCCESS(PhReadFile(collector->ReadHandle, buffer + usedLength, PAGE_SIZE, NULL, &bytesRead)) || bytesRead == 0)
             break;
 
@@ -602,14 +658,26 @@ VOID WslStopCollector(
     _In_ PWSL_COLLECTOR Collector
     )
 {
+    WriteRelease(&Collector->Stopping, TRUE);
+
     // Ending the job kills wsl.exe and its helpers, which closes every copy of the pipe's write
     // end and so ends the reader thread's blocking read.
     if (Collector->JobHandle)
         NtTerminateJobObject(Collector->JobHandle, STATUS_SUCCESS);
 
+    // Should a copy of the write end survive outside the job, the read would never end on its
+    // own, so cancel it. The cancel is repeated because it only affects a read that is already
+    // pending; once Stopping is set, the thread does not start another one.
     if (Collector->ThreadHandle)
     {
-        NtWaitForSingleObject(Collector->ThreadHandle, FALSE, NULL);
+        LARGE_INTEGER timeout;
+        IO_STATUS_BLOCK isb;
+
+        PhTimeoutFromMilliseconds(&timeout, WSL_COLLECTOR_STOP_TIMEOUT_MS);
+
+        while (NtWaitForSingleObject(Collector->ThreadHandle, FALSE, &timeout) != STATUS_WAIT_0)
+            NtCancelSynchronousIoFile(Collector->ThreadHandle, NULL, &isb);
+
         NtClose(Collector->ThreadHandle);
     }
 

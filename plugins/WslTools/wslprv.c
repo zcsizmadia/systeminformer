@@ -125,6 +125,10 @@ static VOID WslpStopAllCollectors(
  * seconds, so the window is small. A collector whose wsl.exe exits on its own is not
  * restarted, for the same reason; it is replaced once the distribution has been seen
  * stopped, or when the tab is shown again.
+ *
+ * An unknown state, e.g. after the running query timed out once, keeps the collectors as
+ * they are. Only WSL 2 distributions get a collector; the WSL 1 process tree and pipe
+ * handling have not been verified.
  */
 static VOID WslpUpdateCollectors(
     _In_ PWSL_SNAPSHOT Snapshot
@@ -134,7 +138,7 @@ static VOID WslpUpdateCollectors(
     for (ULONG i = WslpCollectors->Count; i != 0; i--)
     {
         PWSL_COLLECTOR_ENTRY entry = WslpCollectors->Items[i - 1];
-        BOOLEAN running = FALSE;
+        BOOLEAN keep = FALSE;
 
         for (ULONG j = 0; j < Snapshot->Distributions->Count; j++)
         {
@@ -142,12 +146,12 @@ static VOID WslpUpdateCollectors(
 
             if (PhEqualString(distro->Id, entry->Id, TRUE))
             {
-                running = distro->State == WslDistroStateRunning;
+                keep = distro->State != WslDistroStateStopped;
                 break;
             }
         }
 
-        if (!running)
+        if (!keep)
         {
             PhRemoveItemList(WslpCollectors, i - 1);
             WslpDestroyCollectorEntry(entry);
@@ -159,7 +163,7 @@ static VOID WslpUpdateCollectors(
         PWSL_DISTRO_ITEM distro = Snapshot->Distributions->Items[i];
         PWSL_COLLECTOR_ENTRY entry = NULL;
 
-        if (distro->State != WslDistroStateRunning)
+        if (distro->Version != 2)
             continue;
 
         for (ULONG j = 0; j < WslpCollectors->Count; j++)
@@ -170,6 +174,11 @@ static VOID WslpUpdateCollectors(
                 break;
             }
         }
+
+        // A new collector needs a distribution reported as running just now; an existing one
+        // also keeps supplying frames while the state is unknown.
+        if (!entry && distro->State != WslDistroStateRunning)
+            continue;
 
         if (!entry)
         {
