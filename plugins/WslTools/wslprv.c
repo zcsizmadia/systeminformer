@@ -13,12 +13,19 @@
 
 // The provider thread builds a snapshot every WSL_REFRESH_INTERVAL_MS while enabled, and
 // hands it to the GUI thread. It is enabled only while the WSL tab is visible, so a hidden
-// tab costs nothing: no registry reads and no wsl.exe.
+// tab costs nothing: no registry reads, no wsl.exe and no process collectors.
+
+typedef struct _WSL_COLLECTOR_ENTRY
+{
+    PPH_STRING Id; // Distribution id
+    PWSL_COLLECTOR Collector; // NULL if it could not be started
+} WSL_COLLECTOR_ENTRY, *PWSL_COLLECTOR_ENTRY;
 
 static HANDLE WslpProviderThreadHandle = NULL;
 static HANDLE WslpProviderWakeEvent = NULL;
 static LONG WslpProviderEnabled = FALSE;
 static LONG WslpProviderStopping = FALSE;
+static PPH_LIST WslpCollectors = NULL; // PWSL_COLLECTOR_ENTRY, used only by the provider thread
 
 static CONST PH_STRINGREF WslpVmProcessNameWin11 = PH_STRINGREF_INIT(L"vmmemWSL");
 static CONST PH_STRINGREF WslpVmProcessName = PH_STRINGREF_INIT(L"vmmem");
@@ -82,6 +89,103 @@ PPH_PROCESS_ITEM WslReferenceVmProcessItem(
 }
 
 /**
+ * Stops a collector entry and frees it.
+ */
+static VOID WslpDestroyCollectorEntry(
+    _In_ PWSL_COLLECTOR_ENTRY Entry
+    )
+{
+    if (Entry->Collector)
+        WslStopCollector(Entry->Collector);
+
+    PhDereferenceObject(Entry->Id);
+    PhFree(Entry);
+}
+
+/**
+ * Stops every collector, e.g. when the tab is hidden.
+ */
+static VOID WslpStopAllCollectors(
+    VOID
+    )
+{
+    for (ULONG i = 0; i < WslpCollectors->Count; i++)
+        WslpDestroyCollectorEntry(WslpCollectors->Items[i]);
+
+    PhClearList(WslpCollectors);
+}
+
+/**
+ * Matches the collectors to the running distributions of a snapshot, and attaches each
+ * collector's latest frame to its distribution.
+ *
+ * \remarks A collector is only started for a distribution the snapshot just reported as
+ * running, because starting one starts a stopped distribution. The distribution could still
+ * stop in between, but WSL only stops a distribution after it has been idle for several
+ * seconds, so the window is small. A collector whose wsl.exe exits on its own is not
+ * restarted, for the same reason; it is replaced once the distribution has been seen
+ * stopped, or when the tab is shown again.
+ */
+static VOID WslpUpdateCollectors(
+    _In_ PWSL_SNAPSHOT Snapshot
+    )
+{
+    // Stop the collectors of distributions that stopped or were unregistered.
+    for (ULONG i = WslpCollectors->Count; i != 0; i--)
+    {
+        PWSL_COLLECTOR_ENTRY entry = WslpCollectors->Items[i - 1];
+        BOOLEAN running = FALSE;
+
+        for (ULONG j = 0; j < Snapshot->Distributions->Count; j++)
+        {
+            PWSL_DISTRO_ITEM distro = Snapshot->Distributions->Items[j];
+
+            if (PhEqualString(distro->Id, entry->Id, TRUE))
+            {
+                running = distro->State == WslDistroStateRunning;
+                break;
+            }
+        }
+
+        if (!running)
+        {
+            PhRemoveItemList(WslpCollectors, i - 1);
+            WslpDestroyCollectorEntry(entry);
+        }
+    }
+
+    for (ULONG i = 0; i < Snapshot->Distributions->Count; i++)
+    {
+        PWSL_DISTRO_ITEM distro = Snapshot->Distributions->Items[i];
+        PWSL_COLLECTOR_ENTRY entry = NULL;
+
+        if (distro->State != WslDistroStateRunning)
+            continue;
+
+        for (ULONG j = 0; j < WslpCollectors->Count; j++)
+        {
+            if (PhEqualString(((PWSL_COLLECTOR_ENTRY)WslpCollectors->Items[j])->Id, distro->Id, TRUE))
+            {
+                entry = WslpCollectors->Items[j];
+                break;
+            }
+        }
+
+        if (!entry)
+        {
+            entry = PhAllocateZero(sizeof(WSL_COLLECTOR_ENTRY));
+            PhSetReference(&entry->Id, distro->Id);
+            entry->Collector = WslStartCollector(distro->Name);
+            PhAddItemList(WslpCollectors, entry);
+        }
+
+        // A frame from a collector that has exited would be stale.
+        if (entry->Collector && WslIsCollectorRunning(entry->Collector))
+            distro->Processes = WslReferenceCollectorFrame(entry->Collector);
+    }
+}
+
+/**
  * Provider thread: builds snapshots while enabled and sleeps otherwise.
  */
 _Function_class_(USER_THREAD_START_ROUTINE)
@@ -107,13 +211,20 @@ static NTSTATUS NTAPI WslpProviderThread(
             PhClearReference(&vmProcessItem);
 
             snapshot = WslQuerySnapshot(candidates != 0);
+            WslpUpdateCollectors(snapshot);
 
             // The GUI thread takes ownership of the snapshot reference.
             SystemInformer_Invoke(WslOnSnapshotUpdated, snapshot);
         }
+        else if (WslpCollectors->Count != 0)
+        {
+            WslpStopAllCollectors();
+        }
 
         NtWaitForSingleObject(WslpProviderWakeEvent, FALSE, &interval);
     }
+
+    WslpStopAllCollectors();
 
     return STATUS_SUCCESS;
 }
@@ -131,10 +242,13 @@ VOID WslStartProvider(
     if (!NT_SUCCESS(NtCreateEvent(&WslpProviderWakeEvent, EVENT_ALL_ACCESS, NULL, SynchronizationEvent, FALSE)))
         return;
 
+    WslpCollectors = PhCreateList(4);
+
     if (!NT_SUCCESS(PhCreateThreadEx(&WslpProviderThreadHandle, WslpProviderThread, NULL)))
     {
         NtClose(WslpProviderWakeEvent);
         WslpProviderWakeEvent = NULL;
+        PhClearReference(&WslpCollectors);
     }
 }
 
@@ -158,6 +272,7 @@ VOID WslStopProvider(
     WslpProviderThreadHandle = NULL;
     NtClose(WslpProviderWakeEvent);
     WslpProviderWakeEvent = NULL;
+    PhClearReference(&WslpCollectors);
 }
 
 /**
@@ -171,9 +286,9 @@ VOID WslSetProviderEnabled(
 {
     WriteRelease(&WslpProviderEnabled, Enabled);
 
-    // Refresh right away when the tab becomes visible instead of waiting for the next interval.
-    if (Enabled)
-        WslRefreshProvider();
+    // Wake the thread either way: to refresh right away when the tab becomes visible, and to
+    // stop the collectors right away when it is hidden.
+    WslRefreshProvider();
 }
 
 /**

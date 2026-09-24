@@ -48,6 +48,7 @@ static VOID NTAPI MainWindowShowingCallback(
         return;
 
     WslInitializeSnapshotType();
+    WslInitializeProcessFrameType();
     WslInitializeTab();
     WslStartProvider();
 }

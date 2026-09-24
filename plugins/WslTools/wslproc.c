@@ -1,0 +1,663 @@
+/*
+ * Copyright (c) 2022 Winsider Seminars & Solutions, Inc.  All rights reserved.
+ *
+ * This file is part of System Informer.
+ *
+ * Authors:
+ *
+ *     zcsizmadia   2026
+ *
+ */
+
+#include "wsltools.h"
+
+// A collector is one long-running wsl.exe per running distribution. Inside the distribution
+// a POSIX shell loop prints every process's /proc/<pid>/stat line, framed by a header, at
+// the refresh interval. Nothing is installed in the distribution: the loop uses only sh,
+// cat and sleep, which even busybox provides. Killing wsl.exe ends the loop inside the
+// distribution as well, and the job it runs in guarantees that also when System Informer exits.
+//
+// Every distribution has its own PID namespace in the shared VM, so /proc lists only the
+// processes of the distribution the loop runs in.
+
+#define WSL_PROCESS_SCRIPT \
+    L"t=$(getconf CLK_TCK 2>/dev/null || echo 100); " \
+    L"p=$(getconf PAGESIZE 2>/dev/null || echo 4096); " \
+    L"while :; do " \
+    L"read u i < /proc/uptime; " \
+    L"echo @ $u $t $p $$; " \
+    L"cat /proc/[0-9]*/stat 2>/dev/null; " \
+    L"echo @end; " \
+    L"sleep %lu; " \
+    L"done"
+
+// Fields of /proc/<pid>/stat, counted from the state field that follows the name.
+#define WSL_STAT_STATE 0
+#define WSL_STAT_PPID 1
+#define WSL_STAT_UTIME 11
+#define WSL_STAT_STIME 12
+#define WSL_STAT_CUTIME 13
+#define WSL_STAT_CSTIME 14
+#define WSL_STAT_THREADS 17
+#define WSL_STAT_STARTTIME 19
+#define WSL_STAT_RSS 21
+#define WSL_STAT_FIELD_COUNT 22
+
+typedef struct _WSL_CPU_SAMPLE
+{
+    ULONG ProcessId;
+    ULONG64 StartTime;
+    ULONG64 Ticks; // utime + stime
+} WSL_CPU_SAMPLE, *PWSL_CPU_SAMPLE;
+
+// A /proc/<pid>/stat line as parsed, before the collector's own processes are removed.
+typedef struct _WSL_STAT_ENTRY
+{
+    WSL_LINUX_PROCESS Process;
+    ULONG64 Ticks; // utime + stime
+    ULONG64 ChildTicks; // cutime + cstime: exited children that the process has waited for
+} WSL_STAT_ENTRY, *PWSL_STAT_ENTRY;
+
+typedef struct _WSL_COLLECTOR
+{
+    PPH_STRING DistroName;
+    HANDLE ProcessHandle;
+    HANDLE ReadHandle;
+    HANDLE JobHandle; // Kill-on-close job with wsl.exe and its helper processes
+    HANDLE ThreadHandle;
+    LONG Running;
+
+    PH_QUEUED_LOCK FrameLock;
+    PWSL_PROCESS_FRAME Frame; // Latest complete frame, protected by FrameLock
+
+    // Used only by the reader thread.
+    PPH_HASHTABLE PreviousSamples; // WSL_CPU_SAMPLE
+    ULONG64 PreviousTotalTicks;
+    DOUBLE PreviousUptime;
+    BOOLEAN HavePrevious;
+    PPH_LIST Entries; // PWSL_STAT_ENTRY of the frame being read
+    DOUBLE Uptime;
+    ULONG64 TicksPerSecond;
+    ULONG64 PageSize;
+    ULONG SelfProcessId;
+    BOOLEAN InFrame;
+} WSL_COLLECTOR, *PWSL_COLLECTOR;
+
+static PPH_OBJECT_TYPE WslpProcessFrameType = NULL;
+
+/**
+ * Frees the processes owned by a frame.
+ */
+_Function_class_(PH_TYPE_DELETE_PROCEDURE)
+static VOID NTAPI WslpProcessFrameDeleteProcedure(
+    _In_ PVOID Object,
+    _In_ ULONG Flags
+    )
+{
+    PWSL_PROCESS_FRAME frame = Object;
+
+    for (ULONG i = 0; i < frame->Processes->Count; i++)
+    {
+        PWSL_LINUX_PROCESS process = frame->Processes->Items[i];
+
+        PhClearReference(&process->Name);
+        PhFree(process);
+    }
+
+    PhDereferenceObject(frame->Processes);
+}
+
+/**
+ * Creates the object type used for process frames. Must be called once before WslStartCollector.
+ */
+VOID WslInitializeProcessFrameType(
+    VOID
+    )
+{
+    WslpProcessFrameType = PhCreateObjectType(L"WslProcessFrame", 0, WslpProcessFrameDeleteProcedure);
+}
+
+_Function_class_(PH_HASHTABLE_EQUAL_FUNCTION)
+static BOOLEAN NTAPI WslpCpuSampleEqualFunction(
+    _In_ PVOID Entry1,
+    _In_ PVOID Entry2
+    )
+{
+    return ((PWSL_CPU_SAMPLE)Entry1)->ProcessId == ((PWSL_CPU_SAMPLE)Entry2)->ProcessId;
+}
+
+_Function_class_(PH_HASHTABLE_HASH_FUNCTION)
+static ULONG NTAPI WslpCpuSampleHashFunction(
+    _In_ PVOID Entry
+    )
+{
+    return PhHashInt32(((PWSL_CPU_SAMPLE)Entry)->ProcessId);
+}
+
+/**
+ * Gets the display text for a Linux process state letter.
+ *
+ * \param State The state letter from /proc/<pid>/stat.
+ * \return The display text.
+ */
+PCPH_STRINGREF WslGetLinuxProcessStateText(
+    _In_ WCHAR State
+    )
+{
+    static CONST PH_STRINGREF runningText = PH_STRINGREF_INIT(L"Running");
+    static CONST PH_STRINGREF sleepingText = PH_STRINGREF_INIT(L"Sleeping");
+    static CONST PH_STRINGREF diskSleepText = PH_STRINGREF_INIT(L"Waiting (disk)");
+    static CONST PH_STRINGREF zombieText = PH_STRINGREF_INIT(L"Zombie");
+    static CONST PH_STRINGREF stoppedText = PH_STRINGREF_INIT(L"Stopped");
+    static CONST PH_STRINGREF idleText = PH_STRINGREF_INIT(L"Idle");
+    static CONST PH_STRINGREF otherText = PH_STRINGREF_INIT(L"Other");
+
+    switch (State)
+    {
+    case L'R':
+        return &runningText;
+    case L'S':
+        return &sleepingText;
+    case L'D':
+        return &diskSleepText;
+    case L'Z':
+        return &zombieText;
+    case L'T':
+    case L't':
+        return &stoppedText;
+    case L'I':
+        return &idleText;
+    default:
+        return &otherText;
+    }
+}
+
+/**
+ * Parses a frame header, "@ <uptime> <ticks per second> <page size> <shell pid>".
+ */
+static BOOLEAN WslpParseHeader(
+    _In_ PWSL_COLLECTOR Collector,
+    _In_ PH_STRINGREF Line
+    )
+{
+    PH_STRINGREF part;
+    ULONG64 value;
+
+    PhSplitStringRefAtChar(&Line, L' ', &part, &Line); // "@"
+    PhSplitStringRefAtChar(&Line, L' ', &part, &Line);
+
+    if (!PhStringToDouble(&part, 0, &Collector->Uptime))
+        return FALSE;
+
+    PhSplitStringRefAtChar(&Line, L' ', &part, &Line);
+
+    if (!PhStringToUInt64(&part, 10, &Collector->TicksPerSecond) || Collector->TicksPerSecond == 0)
+        return FALSE;
+
+    PhSplitStringRefAtChar(&Line, L' ', &part, &Line);
+
+    if (!PhStringToUInt64(&part, 10, &Collector->PageSize))
+        return FALSE;
+
+    PhSplitStringRefAtChar(&Line, L' ', &part, &Line);
+
+    if (!PhStringToUInt64(&part, 10, &value))
+        return FALSE;
+
+    Collector->SelfProcessId = (ULONG)value;
+
+    return TRUE;
+}
+
+/**
+ * Parses a /proc/<pid>/stat line.
+ *
+ * \return A new entry, or NULL if the line is malformed.
+ * \remarks The name is between the first "(" and the last ")"; it can itself contain
+ * spaces and parentheses, e.g. "init(skrog-engi".
+ */
+static PWSL_STAT_ENTRY WslpParseStatLine(
+    _In_ PWSL_COLLECTOR Collector,
+    _In_ PH_STRINGREF Line
+    )
+{
+    PWSL_STAT_ENTRY entry;
+    PH_STRINGREF pidPart;
+    PH_STRINGREF remaining;
+    PH_STRINGREF name;
+    ULONG64 fields[WSL_STAT_FIELD_COUNT] = { 0 };
+    WCHAR state = 0;
+    ULONG_PTR open;
+    ULONG_PTR close;
+    ULONG64 pid;
+
+    open = PhFindCharInStringRef(&Line, L'(', FALSE);
+    close = PhFindLastCharInStringRef(&Line, L')', FALSE);
+
+    if (open == SIZE_MAX || close == SIZE_MAX || close < open || open == 0)
+        return NULL;
+
+    pidPart.Buffer = Line.Buffer;
+    pidPart.Length = (open - 1) * sizeof(WCHAR);
+    name.Buffer = Line.Buffer + open + 1;
+    name.Length = (close - open - 1) * sizeof(WCHAR);
+
+    if (!PhStringToUInt64(&pidPart, 10, &pid))
+        return NULL;
+
+    // Skip ") " to reach the state field.
+    if (Line.Length < (close + 2) * sizeof(WCHAR))
+        return NULL;
+
+    remaining.Buffer = Line.Buffer + close + 2;
+    remaining.Length = Line.Length - (close + 2) * sizeof(WCHAR);
+
+    for (ULONG i = 0; i < WSL_STAT_FIELD_COUNT && remaining.Length != 0; i++)
+    {
+        PH_STRINGREF field;
+
+        PhSplitStringRefAtChar(&remaining, L' ', &field, &remaining);
+
+        if (i == WSL_STAT_STATE)
+            state = field.Length != 0 ? field.Buffer[0] : 0;
+        else if (!PhStringToUInt64(&field, 10, &fields[i]))
+            return NULL;
+    }
+
+    entry = PhAllocateZero(sizeof(WSL_STAT_ENTRY));
+    entry->Process.ProcessId = (ULONG)pid;
+    entry->Process.ParentProcessId = (ULONG)fields[WSL_STAT_PPID];
+    entry->Process.StartTime = fields[WSL_STAT_STARTTIME];
+    entry->Process.Name = PhCreateString2(&name);
+    entry->Process.State = state;
+    entry->Process.NumberOfThreads = (ULONG)fields[WSL_STAT_THREADS];
+    entry->Process.ResidentBytes = fields[WSL_STAT_RSS] * Collector->PageSize;
+    entry->Ticks = fields[WSL_STAT_UTIME] + fields[WSL_STAT_STIME];
+    entry->ChildTicks = fields[WSL_STAT_CUTIME] + fields[WSL_STAT_CSTIME];
+
+    return entry;
+}
+
+/**
+ * Finds a parsed entry by process ID.
+ */
+static PWSL_STAT_ENTRY WslpFindEntry(
+    _In_ PPH_LIST Entries,
+    _In_ ULONG ProcessId
+    )
+{
+    for (ULONG i = 0; i < Entries->Count; i++)
+    {
+        PWSL_STAT_ENTRY entry = Entries->Items[i];
+
+        if (entry->Process.ProcessId == ProcessId)
+            return entry;
+    }
+
+    return NULL;
+}
+
+/**
+ * Determines whether an entry belongs to the collector itself: its shell, the shell's
+ * children (cat, sleep), and the Relay and SessionLeader processes WSL creates for the
+ * collector's wsl.exe session.
+ */
+static BOOLEAN WslpIsCollectorEntry(
+    _In_ PWSL_COLLECTOR Collector,
+    _In_ PWSL_STAT_ENTRY Entry,
+    _In_ ULONG RelayProcessId,
+    _In_ ULONG SessionLeaderProcessId
+    )
+{
+    ULONG pid = Entry->Process.ProcessId;
+
+    return pid == Collector->SelfProcessId ||
+        Entry->Process.ParentProcessId == Collector->SelfProcessId ||
+        (RelayProcessId && pid == RelayProcessId) ||
+        (SessionLeaderProcessId && pid == SessionLeaderProcessId);
+}
+
+/**
+ * Turns the parsed entries of a complete frame into a published frame with CPU usage.
+ *
+ * \remarks CPU usage is expressed as a fraction of all host processors, the unit of the
+ * VM row and of every Windows process, so the numbers can be compared. A vCPU second is
+ * counted as a host CPU second, which is close but not exact. The distribution total is
+ * the change of the sum of utime + stime + cutime + cstime over live processes: when a
+ * process exits, its time moves into its parent's cutime, so exited processes stay counted.
+ */
+static VOID WslpCompleteFrame(
+    _In_ PWSL_COLLECTOR Collector
+    )
+{
+    PWSL_PROCESS_FRAME frame;
+    PPH_HASHTABLE samples;
+    PWSL_STAT_ENTRY self;
+    PWSL_STAT_ENTRY relay;
+    ULONG relayProcessId = 0;
+    ULONG sessionLeaderProcessId = 0;
+    ULONG64 totalTicks = 0;
+    DOUBLE capacity = 0; // Host CPU ticks available since the previous frame
+
+    // The shell's parent is its Relay, and the Relay's parent is the session's SessionLeader.
+    if (self = WslpFindEntry(Collector->Entries, Collector->SelfProcessId))
+    {
+        relayProcessId = self->Process.ParentProcessId;
+
+        if (relay = WslpFindEntry(Collector->Entries, relayProcessId))
+            sessionLeaderProcessId = relay->Process.ParentProcessId;
+    }
+
+    if (Collector->HavePrevious && Collector->Uptime > Collector->PreviousUptime)
+    {
+        capacity = (Collector->Uptime - Collector->PreviousUptime) *
+            (DOUBLE)Collector->TicksPerSecond * PhSystemBasicInformation.NumberOfProcessors;
+    }
+
+    // PhCreateObject does not zero the object.
+    frame = PhCreateObject(sizeof(WSL_PROCESS_FRAME), WslpProcessFrameType);
+    memset(frame, 0, sizeof(WSL_PROCESS_FRAME));
+    frame->Processes = PhCreateList(Collector->Entries->Count);
+    samples = PhCreateHashtable(sizeof(WSL_CPU_SAMPLE), WslpCpuSampleEqualFunction, WslpCpuSampleHashFunction, Collector->Entries->Count);
+
+    for (ULONG i = 0; i < Collector->Entries->Count; i++)
+    {
+        PWSL_STAT_ENTRY entry = Collector->Entries->Items[i];
+        PWSL_LINUX_PROCESS process;
+        WSL_CPU_SAMPLE sample;
+
+        if (WslpIsCollectorEntry(Collector, entry, relayProcessId, sessionLeaderProcessId))
+        {
+            PhClearReference(&entry->Process.Name);
+            continue;
+        }
+
+        totalTicks += entry->Ticks + entry->ChildTicks;
+
+        if (capacity > 0)
+        {
+            PWSL_CPU_SAMPLE previous;
+            WSL_CPU_SAMPLE lookup;
+
+            lookup.ProcessId = entry->Process.ProcessId;
+            previous = PhFindEntryHashtable(Collector->PreviousSamples, &lookup);
+
+            if (previous && previous->StartTime == entry->Process.StartTime && entry->Ticks >= previous->Ticks)
+            {
+                entry->Process.CpuUsage = (FLOAT)((entry->Ticks - previous->Ticks) / capacity);
+                entry->Process.HaveCpuUsage = TRUE;
+            }
+            else if (entry->Process.StartTime >= Collector->PreviousUptime * Collector->TicksPerSecond)
+            {
+                // Started since the previous frame, so all of its time is new.
+                entry->Process.CpuUsage = (FLOAT)(entry->Ticks / capacity);
+                entry->Process.HaveCpuUsage = TRUE;
+            }
+        }
+
+        sample.ProcessId = entry->Process.ProcessId;
+        sample.StartTime = entry->Process.StartTime;
+        sample.Ticks = entry->Ticks;
+        PhAddEntryHashtable(samples, &sample);
+
+        process = PhAllocateCopy(&entry->Process, sizeof(WSL_LINUX_PROCESS));
+        PhAddItemList(frame->Processes, process);
+        frame->ResidentBytes += process->ResidentBytes;
+    }
+
+    // The total can drop when a process exits without being waited for; that time is lost.
+    if (capacity > 0)
+    {
+        frame->CpuUsage = totalTicks > Collector->PreviousTotalTicks ? (FLOAT)((totalTicks - Collector->PreviousTotalTicks) / capacity) : 0;
+        frame->CpuUsage = min(frame->CpuUsage, 1.0f);
+        frame->HaveCpuUsage = TRUE;
+    }
+
+    PhDereferenceObject(Collector->PreviousSamples);
+    Collector->PreviousSamples = samples;
+    Collector->PreviousTotalTicks = totalTicks;
+    Collector->PreviousUptime = Collector->Uptime;
+    Collector->HavePrevious = TRUE;
+
+    // Names moved into the frame's processes; the entries themselves are no longer needed.
+    for (ULONG i = 0; i < Collector->Entries->Count; i++)
+        PhFree(Collector->Entries->Items[i]);
+
+    PhClearList(Collector->Entries);
+
+    PhAcquireQueuedLockExclusive(&Collector->FrameLock);
+    PhMoveReference(&Collector->Frame, frame);
+    PhReleaseQueuedLockExclusive(&Collector->FrameLock);
+}
+
+/**
+ * Discards the entries of an incomplete frame.
+ */
+static VOID WslpDiscardEntries(
+    _In_ PWSL_COLLECTOR Collector
+    )
+{
+    for (ULONG i = 0; i < Collector->Entries->Count; i++)
+    {
+        PWSL_STAT_ENTRY entry = Collector->Entries->Items[i];
+
+        PhClearReference(&entry->Process.Name);
+        PhFree(entry);
+    }
+
+    PhClearList(Collector->Entries);
+}
+
+/**
+ * Handles one output line of the collector loop.
+ */
+static VOID WslpProcessLine(
+    _In_ PWSL_COLLECTOR Collector,
+    _In_ PSTR Buffer,
+    _In_ SIZE_T Length
+    )
+{
+    PPH_STRING line;
+    PH_STRINGREF lineRef;
+
+    if (Length != 0 && Buffer[Length - 1] == '\r')
+        Length--;
+
+    line = PhConvertUtf8ToUtf16Ex(Buffer, Length);
+    lineRef = line->sr;
+
+    if (PhEqualStringRef2(&lineRef, L"@end", FALSE))
+    {
+        if (Collector->InFrame)
+            WslpCompleteFrame(Collector);
+
+        Collector->InFrame = FALSE;
+    }
+    else if (lineRef.Length >= 2 * sizeof(WCHAR) && lineRef.Buffer[0] == L'@' && lineRef.Buffer[1] == L' ')
+    {
+        WslpDiscardEntries(Collector);
+        Collector->InFrame = WslpParseHeader(Collector, lineRef);
+    }
+    else if (Collector->InFrame)
+    {
+        PWSL_STAT_ENTRY entry;
+
+        if (entry = WslpParseStatLine(Collector, lineRef))
+            PhAddItemList(Collector->Entries, entry);
+    }
+
+    PhDereferenceObject(line);
+}
+
+/**
+ * Reader thread: reads the collector output until wsl.exe exits.
+ */
+_Function_class_(USER_THREAD_START_ROUTINE)
+static NTSTATUS NTAPI WslpCollectorThread(
+    _In_ PVOID Parameter
+    )
+{
+    PWSL_COLLECTOR collector = Parameter;
+    PSTR buffer;
+    SIZE_T allocatedLength = PAGE_SIZE * 4;
+    SIZE_T usedLength = 0;
+
+    buffer = PhAllocate(allocatedLength);
+
+    while (TRUE)
+    {
+        ULONG bytesRead;
+        SIZE_T lineStart = 0;
+
+        if (allocatedLength - usedLength < PAGE_SIZE)
+        {
+            allocatedLength *= 2;
+            buffer = PhReAllocate(buffer, allocatedLength);
+        }
+
+        // Blocks until output arrives; fails once wsl.exe has exited and the pipe is closed.
+        if (!NT_SUCCESS(PhReadFile(collector->ReadHandle, buffer + usedLength, PAGE_SIZE, NULL, &bytesRead)) || bytesRead == 0)
+            break;
+
+        usedLength += bytesRead;
+
+        for (SIZE_T i = 0; i < usedLength; i++)
+        {
+            if (buffer[i] == '\n')
+            {
+                WslpProcessLine(collector, buffer + lineStart, i - lineStart);
+                lineStart = i + 1;
+            }
+        }
+
+        // Keep an incomplete last line for the next read.
+        memmove(buffer, buffer + lineStart, usedLength - lineStart);
+        usedLength -= lineStart;
+    }
+
+    PhFree(buffer);
+    WslpDiscardEntries(collector);
+    WriteRelease(&collector->Running, FALSE);
+
+    return STATUS_SUCCESS;
+}
+
+/**
+ * Starts collecting the processes of a running distribution.
+ *
+ * \param DistroName The distribution name.
+ * \return The collector, or NULL if wsl.exe could not be started.
+ * \remarks This runs wsl.exe with --distribution, which starts the distribution if it is
+ * stopped. Callers must only start a collector for a distribution they just saw running.
+ * While the collector runs, its wsl.exe session also keeps the distribution from
+ * stopping on idle.
+ */
+PWSL_COLLECTOR WslStartCollector(
+    _In_ PPH_STRING DistroName
+    )
+{
+    PWSL_COLLECTOR collector;
+    PPH_STRING script;
+    PPH_STRING arguments;
+    NTSTATUS status;
+
+    if (!WslIsSafeDistroName(DistroName))
+        return NULL;
+
+    // The script is one double-quoted argument, so it must not contain double quotes itself.
+    // --cd / keeps the shell off the Windows drives that are mounted in the distribution.
+    script = PhFormatString(WSL_PROCESS_SCRIPT, WSL_REFRESH_INTERVAL_MS / 1000);
+    arguments = PhFormatString(L"--distribution %s --cd / --exec /bin/sh -c \"%s\"", DistroName->Buffer, script->Buffer);
+    PhDereferenceObject(script);
+
+    collector = PhAllocateZero(sizeof(WSL_COLLECTOR));
+    PhSetReference(&collector->DistroName, DistroName);
+    PhInitializeQueuedLock(&collector->FrameLock);
+    collector->PreviousSamples = PhCreateHashtable(sizeof(WSL_CPU_SAMPLE), WslpCpuSampleEqualFunction, WslpCpuSampleHashFunction, 64);
+    collector->Entries = PhCreateList(64);
+    collector->Running = TRUE;
+
+    status = WslCreateProcess(&arguments->sr, &collector->ProcessHandle, &collector->ReadHandle, &collector->JobHandle);
+    PhDereferenceObject(arguments);
+
+    if (NT_SUCCESS(status))
+        status = PhCreateThreadEx(&collector->ThreadHandle, WslpCollectorThread, collector);
+
+    if (!NT_SUCCESS(status))
+    {
+        collector->Running = FALSE;
+        WslStopCollector(collector);
+        return NULL;
+    }
+
+    return collector;
+}
+
+/**
+ * Stops a collector and frees it.
+ *
+ * \param Collector The collector.
+ */
+VOID WslStopCollector(
+    _In_ PWSL_COLLECTOR Collector
+    )
+{
+    // Ending the job kills wsl.exe and its helpers, which closes every copy of the pipe's write
+    // end and so ends the reader thread's blocking read.
+    if (Collector->JobHandle)
+        NtTerminateJobObject(Collector->JobHandle, STATUS_SUCCESS);
+
+    if (Collector->ThreadHandle)
+    {
+        NtWaitForSingleObject(Collector->ThreadHandle, FALSE, NULL);
+        NtClose(Collector->ThreadHandle);
+    }
+
+    if (Collector->ProcessHandle)
+        NtClose(Collector->ProcessHandle);
+    if (Collector->ReadHandle)
+        NtClose(Collector->ReadHandle);
+    if (Collector->JobHandle)
+        NtClose(Collector->JobHandle);
+
+    PhClearReference(&Collector->Frame);
+    PhClearReference(&Collector->PreviousSamples);
+    PhClearReference(&Collector->Entries);
+    PhClearReference(&Collector->DistroName);
+    PhFree(Collector);
+}
+
+/**
+ * Determines whether a collector's wsl.exe is still running.
+ *
+ * \param Collector The collector.
+ * \return FALSE once wsl.exe has exited, e.g. because the distribution was terminated.
+ */
+BOOLEAN WslIsCollectorRunning(
+    _In_ PWSL_COLLECTOR Collector
+    )
+{
+    return !!ReadAcquire(&Collector->Running);
+}
+
+/**
+ * Gets the latest complete frame of a collector.
+ *
+ * \param Collector The collector.
+ * \return The frame, or NULL before the first frame. The caller owns the reference.
+ */
+PWSL_PROCESS_FRAME WslReferenceCollectorFrame(
+    _In_ PWSL_COLLECTOR Collector
+    )
+{
+    PWSL_PROCESS_FRAME frame;
+
+    PhAcquireQueuedLockShared(&Collector->FrameLock);
+
+    if (frame = Collector->Frame)
+        PhReferenceObject(frame);
+
+    PhReleaseQueuedLockShared(&Collector->FrameLock);
+
+    return frame;
+}
