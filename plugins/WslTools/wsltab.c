@@ -13,7 +13,8 @@
 
 // The tab is a tree: the WSL 2 virtual machine with its distributions below it, and WSL 1
 // distributions at the root because they do not run in the VM. Each running distribution
-// lists its Linux processes below it.
+// lists its Linux processes below it. Each running WSLC session is a root node with its
+// containers below it.
 
 typedef enum _WSL_TREE_COLUMN
 {
@@ -27,6 +28,8 @@ typedef enum _WSL_TREE_COLUMN
     WSLTNC_LOCATION,
     // New columns go last: the IDs are stored in the saved column layout and sort.
     WSLTNC_RESIDENT,
+    WSLTNC_MEMORY,
+    WSLTNC_IMAGE,
     WSLTNC_MAXIMUM
 } WSL_TREE_COLUMN;
 
@@ -34,7 +37,9 @@ typedef enum _WSL_NODE_TYPE
 {
     WslNodeTypeVm,
     WslNodeTypeDistro,
-    WslNodeTypeLinuxProcess
+    WslNodeTypeLinuxProcess,
+    WslNodeTypeSession,
+    WslNodeTypeContainer
 } WSL_NODE_TYPE;
 
 typedef struct _WSL_NODE
@@ -44,9 +49,12 @@ typedef struct _WSL_NODE
     PPH_STRING Id; // Distribution id; NULL for the VM node
     PWSL_DISTRO_ITEM Distro; // Owned by WslCurrentSnapshot; distribution nodes only
     PWSL_LINUX_PROCESS LinuxProcess; // Owned by the distribution's frame; process nodes only
+    PWSL_SESSION Session; // Owned by WslCurrentSnapshot; session and container nodes
+    PWSL_CONTAINER Container; // Owned by WslCurrentSnapshot; container nodes only
     PPH_STRING NameText; // Distribution name, followed by " *" for the default one
+    PPH_STRING TooltipText; // Container status and ports
     // VM node: its distribution nodes, which WslDistroNodes owns.
-    // Distribution node: its process nodes, which it owns.
+    // Distribution and session nodes: their process and container nodes, which they own.
     PPH_LIST Children;
     BOOLEAN Seen; // Scratch flag while a snapshot is applied
 
@@ -55,12 +63,14 @@ typedef struct _WSL_NODE
     WCHAR CpuText[PH_INT32_STR_LEN_1];
     WCHAR PrivateBytesText[PH_INT64_STR_LEN_1];
     WCHAR ResidentText[PH_INT64_STR_LEN_1];
+    WCHAR MemoryText[PH_INT64_STR_LEN_1];
     WCHAR VhdSizeText[PH_INT64_STR_LEN_1];
     WCHAR VersionText[PH_INT32_STR_LEN_1];
 } WSL_NODE, *PWSL_NODE;
 
 typedef struct _WSL_ACTION_CONTEXT
 {
+    PPH_STRING FileName; // wsl.exe or wslc.exe; a cached string the context does not own
     PPH_STRING Arguments;
     PPH_STRING Description;
     NTSTATUS Status;
@@ -75,7 +85,8 @@ static BOOLEAN WslTabSelected = FALSE;
 static PWSL_SNAPSHOT WslCurrentSnapshot = NULL;
 static PWSL_NODE WslVmNode = NULL;
 static PPH_LIST WslDistroNodes = NULL; // PWSL_NODE, all distributions
-static PPH_LIST WslRootNodes = NULL; // PWSL_NODE, the VM node and WSL 1 distributions
+static PPH_LIST WslRootNodes = NULL; // PWSL_NODE, the VM node, WSL 1 distributions and sessions
+static PPH_LIST WslSessionNodes = NULL; // PWSL_NODE, all WSLC sessions
 static PPH_PROCESS_ITEM WslVmProcessItem = NULL;
 static ULONG WslVmCandidates = 0;
 
@@ -108,7 +119,7 @@ static PWSL_NODE WslpCreateNode(
 
     if (Id)
         PhSetReference(&node->Id, Id);
-    if (Type != WslNodeTypeLinuxProcess)
+    if (Type == WslNodeTypeVm || Type == WslNodeTypeDistro || Type == WslNodeTypeSession)
         node->Children = PhCreateList(4);
 
     // A distribution can have hundreds of processes; start collapsed to keep the overview.
@@ -127,7 +138,7 @@ static VOID WslpDestroyNode(
     _In_ PWSL_NODE Node
     )
 {
-    if (Node->Type == WslNodeTypeDistro)
+    if (Node->Type == WslNodeTypeDistro || Node->Type == WslNodeTypeSession)
     {
         for (ULONG i = 0; i < Node->Children->Count; i++)
             WslpDestroyNode(Node->Children->Items[i]);
@@ -135,6 +146,7 @@ static VOID WslpDestroyNode(
 
     PhClearReference(&Node->Id);
     PhClearReference(&Node->NameText);
+    PhClearReference(&Node->TooltipText);
     PhClearReference(&Node->Children);
     PhFree(Node);
 }
@@ -170,6 +182,7 @@ static VOID WslpInvalidateNode(
     )
 {
     memset(Node->TextCache, 0, sizeof(Node->TextCache));
+    PhClearReference(&Node->TooltipText);
     PhInvalidateTreeNewNode(&Node->Node, TN_CACHE_COLOR);
 }
 
@@ -260,6 +273,102 @@ static VOID WslpUpdateProcessNodes(
 }
 
 /**
+ * Matches the session nodes, and their container nodes, to the sessions of a snapshot.
+ *
+ * \param Sessions The running sessions, or NULL.
+ * \remarks Sessions are matched by name and containers by ID, so selection and expansion
+ * survive refreshes. There are few of either, so the matching is linear.
+ */
+static VOID WslpUpdateSessionNodes(
+    _In_opt_ PPH_LIST Sessions
+    )
+{
+    for (ULONG i = 0; i < WslSessionNodes->Count; i++)
+        ((PWSL_NODE)WslSessionNodes->Items[i])->Seen = FALSE;
+
+    for (ULONG i = 0; Sessions && i < Sessions->Count; i++)
+    {
+        PWSL_SESSION session = Sessions->Items[i];
+        PWSL_NODE sessionNode = NULL;
+
+        for (ULONG j = 0; j < WslSessionNodes->Count; j++)
+        {
+            PWSL_NODE node = WslSessionNodes->Items[j];
+
+            if (PhEqualString(node->Id, session->Name, FALSE))
+            {
+                sessionNode = node;
+                break;
+            }
+        }
+
+        if (!sessionNode)
+        {
+            sessionNode = WslpCreateNode(WslNodeTypeSession, session->Name);
+            PhAddItemList(WslSessionNodes, sessionNode);
+        }
+
+        sessionNode->Session = session;
+        sessionNode->Seen = TRUE;
+        WslpInvalidateNode(sessionNode);
+
+        for (ULONG j = 0; j < sessionNode->Children->Count; j++)
+            ((PWSL_NODE)sessionNode->Children->Items[j])->Seen = FALSE;
+
+        for (ULONG j = 0; j < session->Containers->Count; j++)
+        {
+            PWSL_CONTAINER container = session->Containers->Items[j];
+            PWSL_NODE containerNode = NULL;
+
+            for (ULONG k = 0; k < sessionNode->Children->Count; k++)
+            {
+                PWSL_NODE node = sessionNode->Children->Items[k];
+
+                if (PhEqualString(node->Id, container->Id, TRUE))
+                {
+                    containerNode = node;
+                    break;
+                }
+            }
+
+            if (!containerNode)
+            {
+                containerNode = WslpCreateNode(WslNodeTypeContainer, container->Id);
+                PhAddItemList(sessionNode->Children, containerNode);
+            }
+
+            containerNode->Session = session;
+            containerNode->Container = container;
+            containerNode->Seen = TRUE;
+            WslpInvalidateNode(containerNode);
+        }
+
+        for (ULONG j = sessionNode->Children->Count; j != 0; j--)
+        {
+            PWSL_NODE node = sessionNode->Children->Items[j - 1];
+
+            if (!node->Seen)
+            {
+                PhRemoveItemList(sessionNode->Children, j - 1);
+                WslpDestroyNode(node);
+            }
+        }
+    }
+
+    // Remove the nodes of sessions that ended.
+    for (ULONG i = WslSessionNodes->Count; i != 0; i--)
+    {
+        PWSL_NODE node = WslSessionNodes->Items[i - 1];
+
+        if (!node->Seen)
+        {
+            PhRemoveItemList(WslSessionNodes, i - 1);
+            WslpDestroyNode(node);
+        }
+    }
+}
+
+/**
  * Applies a new snapshot from the provider. Runs on the GUI thread.
  *
  * \param Parameter The snapshot. This function takes ownership of the reference.
@@ -319,7 +428,9 @@ VOID NTAPI WslOnSnapshotUpdated(
         }
     }
 
-    // The previous snapshot owned the distribution items and process frames the nodes pointed to.
+    WslpUpdateSessionNodes(snapshot->Sessions);
+
+    // The previous snapshot owned the distribution items, process frames and sessions the nodes pointed to.
     PhMoveReference(&WslCurrentSnapshot, snapshot);
 
     if (hasWsl2 && !WslVmNode)
@@ -342,6 +453,9 @@ VOID NTAPI WslOnSnapshotUpdated(
         else
             PhAddItemList(WslRootNodes, node);
     }
+
+    for (ULONG i = 0; i < WslSessionNodes->Count; i++)
+        PhAddItemList(WslRootNodes, WslSessionNodes->Items[i]);
 
     if (WslVmNode)
         WslpInvalidateNode(WslVmNode);
@@ -372,8 +486,10 @@ VOID WslOnProcessesUpdated(
 }
 
 /**
- * Compares two nodes for the current sort column. The VM node always sorts first; the other
- * nodes are only ever compared with nodes of their own type, because they are siblings.
+ * Compares two nodes for the current sort column.
+ *
+ * \remarks Siblings of different types, e.g. the VM, WSL 1 distributions and sessions at the
+ * root, are grouped by type in WSL_NODE_TYPE order whatever the sort order.
  */
 static int __cdecl WslpCompareNodes(
     _In_ void *Context,
@@ -386,7 +502,7 @@ static int __cdecl WslpCompareNodes(
     int sortResult = 0;
 
     if (node1->Type != node2->Type)
-        return node1->Type == WslNodeTypeVm ? -1 : 1;
+        return intcmp(node1->Type, node2->Type);
 
     if (node1->Type == WslNodeTypeLinuxProcess)
     {
@@ -443,6 +559,34 @@ static int __cdecl WslpCompareNodes(
 
         if (sortResult == 0)
             sortResult = PhCompareString(distro1->Name, distro2->Name, TRUE);
+    }
+    else if (node1->Type == WslNodeTypeContainer)
+    {
+        PWSL_CONTAINER container1 = node1->Container;
+        PWSL_CONTAINER container2 = node2->Container;
+
+        switch (WslTreeNewSortColumn)
+        {
+        case WSLTNC_STATE:
+            sortResult = PhCompareStringWithNull(container1->State, container2->State, TRUE);
+            break;
+        case WSLTNC_CPU:
+            sortResult = singlecmp(container1->CpuUsage, container2->CpuUsage);
+            break;
+        case WSLTNC_MEMORY:
+            sortResult = uint64cmp(container1->MemoryBytes, container2->MemoryBytes);
+            break;
+        case WSLTNC_IMAGE:
+            sortResult = PhCompareStringWithNull(container1->Image, container2->Image, TRUE);
+            break;
+        }
+
+        if (sortResult == 0)
+            sortResult = PhCompareString(container1->Name, container2->Name, TRUE);
+    }
+    else if (node1->Type == WslNodeTypeSession)
+    {
+        sortResult = PhCompareString(node1->Session->Name, node2->Session->Name, TRUE);
     }
 
     return PhModifySort(sortResult, WslTreeNewSortOrder);
@@ -522,6 +666,31 @@ static VOID WslpSetSizeCellText(
 }
 
 /**
+ * Gets the state of the WSL 2 VM.
+ *
+ * \remarks With a single VM process, that process decides. On Windows 10 every VM process,
+ * WSLC sessions included, is called vmmem, so with several of them the VM is running exactly
+ * when a WSL 2 distribution is, and otherwise its state is unknown.
+ */
+static WSL_DISTRO_STATE WslpGetVmState(
+    VOID
+    )
+{
+    if (WslVmProcessItem)
+        return WslDistroStateRunning;
+
+    for (ULONG i = 0; i < WslDistroNodes->Count; i++)
+    {
+        PWSL_DISTRO_ITEM distro = ((PWSL_NODE)WslDistroNodes->Items[i])->Distro;
+
+        if (distro->Version == 2 && distro->State == WslDistroStateRunning)
+            return WslDistroStateRunning;
+    }
+
+    return WslVmCandidates > 1 ? WslDistroStateUnknown : WslDistroStateStopped;
+}
+
+/**
  * Formats the cell text of the VM node.
  */
 static VOID WslpGetVmCellText(
@@ -538,12 +707,7 @@ static VOID WslpGetVmCellText(
         GetCellText->Text = WslVmNodeText;
         break;
     case WSLTNC_STATE:
-        if (processItem)
-            GetCellText->Text = *WslGetDistroStateText(WslDistroStateRunning);
-        else if (WslVmCandidates > 1)
-            GetCellText->Text = *WslGetDistroStateText(WslDistroStateUnknown);
-        else
-            GetCellText->Text = *WslGetDistroStateText(WslDistroStateStopped);
+        GetCellText->Text = *WslGetDistroStateText(WslpGetVmState());
         break;
     case WSLTNC_VERSION:
         PhInitializeStringRef(&GetCellText->Text, L"2");
@@ -643,6 +807,71 @@ static VOID WslpGetProcessCellText(
 }
 
 /**
+ * Formats the cell text of a WSLC session node.
+ */
+static VOID WslpGetSessionCellText(
+    _In_ PWSL_NODE Node,
+    _Inout_ PPH_TREENEW_GET_CELL_TEXT GetCellText
+    )
+{
+    PWSL_SESSION session = Node->Session;
+
+    switch (GetCellText->Id)
+    {
+    case WSLTNC_NAME:
+        GetCellText->Text = PhGetStringRef(session->Name);
+        break;
+    case WSLTNC_STATE:
+        // wslc only lists running sessions.
+        GetCellText->Text = *WslGetDistroStateText(WslDistroStateRunning);
+        break;
+    case WSLTNC_VERSION:
+        PhInitializeStringRef(&GetCellText->Text, L"WSLC");
+        break;
+    case WSLTNC_CPU:
+        if (session->HaveStats)
+            WslpSetCpuCellText(GetCellText, Node, session->CpuUsage);
+        break;
+    case WSLTNC_MEMORY:
+        if (session->HaveStats)
+            WslpSetSizeCellText(GetCellText, session->MemoryBytes, Node->MemoryText, sizeof(Node->MemoryText));
+        break;
+    }
+}
+
+/**
+ * Formats the cell text of a container node.
+ */
+static VOID WslpGetContainerCellText(
+    _In_ PWSL_NODE Node,
+    _Inout_ PPH_TREENEW_GET_CELL_TEXT GetCellText
+    )
+{
+    PWSL_CONTAINER container = Node->Container;
+
+    switch (GetCellText->Id)
+    {
+    case WSLTNC_NAME:
+        GetCellText->Text = PhGetStringRef(container->Name);
+        break;
+    case WSLTNC_STATE:
+        GetCellText->Text = PhGetStringRef(container->State);
+        break;
+    case WSLTNC_CPU:
+        if (container->HaveStats)
+            WslpSetCpuCellText(GetCellText, Node, container->CpuUsage);
+        break;
+    case WSLTNC_MEMORY:
+        if (container->HaveStats)
+            WslpSetSizeCellText(GetCellText, container->MemoryBytes, Node->MemoryText, sizeof(Node->MemoryText));
+        break;
+    case WSLTNC_IMAGE:
+        GetCellText->Text = PhGetStringRef(container->Image);
+        break;
+    }
+}
+
+/**
  * Gets the selected node, or NULL if nothing or more than one node is selected.
  */
 static PWSL_NODE WslpGetSelectedNode(
@@ -687,7 +916,7 @@ static VOID NTAPI WslpShowActionError(
 }
 
 /**
- * Runs a wsl.exe action off the GUI thread; "--shutdown" can take several seconds.
+ * Runs a wsl.exe or wslc.exe action off the GUI thread; "--shutdown" can take several seconds.
  */
 _Function_class_(USER_THREAD_START_ROUTINE)
 static NTSTATUS NTAPI WslpActionThread(
@@ -697,7 +926,7 @@ static NTSTATUS NTAPI WslpActionThread(
     PWSL_ACTION_CONTEXT context = Parameter;
     NTSTATUS status;
 
-    status = WslRunCommand(&context->Arguments->sr, NULL);
+    status = WslRunCommand(context->FileName, &context->Arguments->sr, NULL);
     context->Status = status;
 
     WslRefreshProvider();
@@ -717,12 +946,14 @@ static NTSTATUS NTAPI WslpActionThread(
 }
 
 /**
- * Starts a wsl.exe action in the background.
+ * Starts a wsl.exe or wslc.exe action in the background.
  *
- * \param Arguments The wsl.exe arguments.
+ * \param FileName The executable, from WslGetWslFileName or WslGetWslcFileName.
+ * \param Arguments The arguments. This function takes ownership of the string.
  * \param Description The error text shown if the action fails.
  */
 static VOID WslpStartAction(
+    _In_ PPH_STRING FileName,
     _In_ PPH_STRING Arguments,
     _In_ PCWSTR Description
     )
@@ -730,6 +961,7 @@ static VOID WslpStartAction(
     PWSL_ACTION_CONTEXT context;
 
     context = PhAllocateZero(sizeof(WSL_ACTION_CONTEXT));
+    context->FileName = FileName;
     context->Arguments = Arguments;
     context->Description = PhCreateString(Description);
 
@@ -787,6 +1019,7 @@ static VOID WslpHandleCommand(
                 ))
             {
                 WslpStartAction(
+                    WslGetWslFileName(),
                     PhFormatString(L"--terminate %s", node->Distro->Name->Buffer),
                     L"Unable to terminate the distribution."
                     );
@@ -803,7 +1036,7 @@ static VOID WslpHandleCommand(
                 TRUE
                 ))
             {
-                WslpStartAction(PhCreateString(L"--shutdown"), L"Unable to shut down WSL.");
+                WslpStartAction(WslGetWslFileName(), PhCreateString(L"--shutdown"), L"Unable to shut down WSL.");
             }
         }
         break;
@@ -831,6 +1064,52 @@ static VOID WslpHandleCommand(
                 SystemInformer_SelectTabPage(0);
                 SystemInformer_SelectProcessNode(processNode);
             }
+        }
+        break;
+    case ID_WSL_CONTAINERSHELL:
+    case ID_WSL_CONTAINERLOGS:
+        {
+            NTSTATUS status;
+
+            if (!node || !node->Container)
+                break;
+
+            if (!NT_SUCCESS(status = WslStartContainerConsole(node->Session->Name, node->Container->Id, Id == ID_WSL_CONTAINERLOGS)))
+                PhShowStatus(WindowHandle, Id == ID_WSL_CONTAINERLOGS ? L"Unable to show the container logs." : L"Unable to open a shell.", status, 0);
+        }
+        break;
+    case ID_WSL_CONTAINERSTOP:
+    case ID_WSL_CONTAINERRESTART:
+    case ID_WSL_CONTAINERKILL:
+        {
+            PCWSTR verb = Id == ID_WSL_CONTAINERSTOP ? L"stop" : Id == ID_WSL_CONTAINERRESTART ? L"restart" : L"kill";
+
+            if (!node || !node->Container || !WslGetWslcFileName())
+                break;
+
+            if (!WslIsSafeSessionName(node->Session->Name) || !WslIsSafeContainerId(node->Container->Id))
+            {
+                PhShowStatus(WindowHandle, L"Unable to control the container.", STATUS_INVALID_PARAMETER, 0);
+                break;
+            }
+
+            // Killing skips the container's shutdown, so it asks first; stop and restart do not.
+            if (Id == ID_WSL_CONTAINERKILL && !PhShowConfirmMessage(
+                WindowHandle,
+                L"kill",
+                node->Container->Name->Buffer,
+                L"The container's processes will be killed without a chance to shut down.",
+                TRUE
+                ))
+            {
+                break;
+            }
+
+            WslpStartAction(
+                WslGetWslcFileName(),
+                PhFormatString(L"--session \"%s\" %s %s", node->Session->Name->Buffer, verb, node->Container->Id->Buffer),
+                L"Unable to control the container."
+                );
         }
         break;
     case ID_WSL_COPY:
@@ -872,6 +1151,22 @@ static VOID WslpShowContextMenu(
         if (!WslVmProcessItem)
             PhEnableEMenuItem(menu, ID_WSL_GOTOPROCESS, FALSE);
     }
+    else if (node->Type == WslNodeTypeContainer)
+    {
+        PhInsertEMenuItem(menu, PhCreateEMenuItem(0, ID_WSL_CONTAINERSHELL, L"Open &shell", NULL, NULL), ULONG_MAX);
+        PhInsertEMenuItem(menu, PhCreateEMenuItem(0, ID_WSL_CONTAINERLOGS, L"&Logs", NULL, NULL), ULONG_MAX);
+        PhInsertEMenuItem(menu, PhCreateEMenuSeparator(), ULONG_MAX);
+        PhInsertEMenuItem(menu, PhCreateEMenuItem(0, ID_WSL_CONTAINERSTOP, L"S&top", NULL, NULL), ULONG_MAX);
+        PhInsertEMenuItem(menu, PhCreateEMenuItem(0, ID_WSL_CONTAINERRESTART, L"&Restart", NULL, NULL), ULONG_MAX);
+        PhInsertEMenuItem(menu, PhCreateEMenuItem(0, ID_WSL_CONTAINERKILL, L"&Kill", NULL, NULL), ULONG_MAX);
+
+        if (!node->Container->Running)
+        {
+            PhEnableEMenuItem(menu, ID_WSL_CONTAINERSHELL, FALSE);
+            PhEnableEMenuItem(menu, ID_WSL_CONTAINERSTOP, FALSE);
+            PhEnableEMenuItem(menu, ID_WSL_CONTAINERKILL, FALSE);
+        }
+    }
     else if (node->Type == WslNodeTypeDistro)
     {
         PhInsertEMenuItem(menu, PhCreateEMenuItem(0, ID_WSL_OPENSHELL, L"Open &shell", NULL, NULL), ULONG_MAX);
@@ -885,8 +1180,8 @@ static VOID WslpShowContextMenu(
             PhEnableEMenuItem(menu, ID_WSL_OPENFILELOCATION, FALSE);
     }
 
-    // A Linux process only offers Copy, so it needs no separator.
-    if (node->Type != WslNodeTypeLinuxProcess)
+    // A Linux process and a session only offer Copy, so they need no separator.
+    if (node->Type != WslNodeTypeLinuxProcess && node->Type != WslNodeTypeSession)
         PhInsertEMenuItem(menu, PhCreateEMenuSeparator(), ULONG_MAX);
 
     PhInsertEMenuItem(menu, PhCreateEMenuItem(0, ID_WSL_COPY, L"&Copy\bCtrl+C", NULL, NULL), ULONG_MAX);
@@ -955,8 +1250,12 @@ static BOOLEAN NTAPI WslpTreeNewCallback(
                 WslpGetVmCellText(node, getCellText);
             else if (node->Type == WslNodeTypeDistro)
                 WslpGetDistroCellText(node, getCellText);
-            else
+            else if (node->Type == WslNodeTypeLinuxProcess)
                 WslpGetProcessCellText(node, getCellText);
+            else if (node->Type == WslNodeTypeSession)
+                WslpGetSessionCellText(node, getCellText);
+            else
+                WslpGetContainerCellText(node, getCellText);
 
             getCellText->Flags = TN_CACHE;
         }
@@ -969,9 +1268,11 @@ static BOOLEAN NTAPI WslpTreeNewCallback(
 
             // Grey out what is not running, so the busy parts of WSL stand out.
             if (node->Type == WslNodeTypeVm)
-                stopped = !WslVmProcessItem;
+                stopped = WslpGetVmState() != WslDistroStateRunning;
             else if (node->Type == WslNodeTypeDistro)
                 stopped = node->Distro->State != WslDistroStateRunning;
+            else if (node->Type == WslNodeTypeContainer)
+                stopped = !node->Container->Running;
             else
                 stopped = FALSE;
 
@@ -990,11 +1291,31 @@ static BOOLEAN NTAPI WslpTreeNewCallback(
                 return FALSE;
 
             if (node->Type == WslNodeTypeVm && !WslVmProcessItem && WslVmCandidates > 1)
+            {
                 getCellTooltip->Text = WslAmbiguousVmText;
+            }
             else if (node->Type == WslNodeTypeDistro && node->Distro->Default)
+            {
                 getCellTooltip->Text = WslDefaultTooltipText;
+            }
+            else if (node->Type == WslNodeTypeContainer)
+            {
+                PWSL_CONTAINER container = node->Container;
+
+                if (!node->TooltipText)
+                {
+                    if (PhIsNullOrEmptyString(container->Ports))
+                        node->TooltipText = container->Status ? PhReferenceObject(container->Status) : PhReferenceEmptyString();
+                    else
+                        node->TooltipText = PhFormatString(L"%s\nPorts: %s", PhGetString(container->Status), container->Ports->Buffer);
+                }
+
+                getCellTooltip->Text = node->TooltipText->sr;
+            }
             else
+            {
                 return FALSE;
+            }
 
             getCellTooltip->Unfolding = FALSE;
             getCellTooltip->MaximumWidth = ULONG_MAX;
@@ -1077,8 +1398,10 @@ static VOID WslpInitializeTreeList(
     PhAddTreeNewColumn(WindowHandle, WSLTNC_CPU, TRUE, L"CPU", 45, PH_ALIGN_RIGHT, 4, DT_RIGHT);
     PhAddTreeNewColumn(WindowHandle, WSLTNC_PRIVATEBYTES, TRUE, L"Private bytes", 80, PH_ALIGN_RIGHT, 5, DT_RIGHT);
     PhAddTreeNewColumn(WindowHandle, WSLTNC_RESIDENT, TRUE, L"Resident set", 80, PH_ALIGN_RIGHT, 6, DT_RIGHT);
-    PhAddTreeNewColumn(WindowHandle, WSLTNC_VHDSIZE, TRUE, L"Disk file size", 80, PH_ALIGN_RIGHT, 7, DT_RIGHT);
-    PhAddTreeNewColumn(WindowHandle, WSLTNC_LOCATION, TRUE, L"Location", 300, PH_ALIGN_LEFT, 8, DT_PATH_ELLIPSIS);
+    PhAddTreeNewColumn(WindowHandle, WSLTNC_MEMORY, TRUE, L"Memory", 80, PH_ALIGN_RIGHT, 7, DT_RIGHT);
+    PhAddTreeNewColumn(WindowHandle, WSLTNC_IMAGE, TRUE, L"Image", 120, PH_ALIGN_LEFT, 8, 0);
+    PhAddTreeNewColumn(WindowHandle, WSLTNC_VHDSIZE, TRUE, L"Disk file size", 80, PH_ALIGN_RIGHT, 9, DT_RIGHT);
+    PhAddTreeNewColumn(WindowHandle, WSLTNC_LOCATION, TRUE, L"Location", 300, PH_ALIGN_LEFT, 10, DT_PATH_ELLIPSIS);
 
     TreeNew_SetTriState(WindowHandle, TRUE);
     TreeNew_SetSort(WindowHandle, WSLTNC_NAME, AscendingSortOrder);
@@ -1174,6 +1497,7 @@ static BOOLEAN WslpPageCallback(
 
             WslDistroNodes = PhCreateList(4);
             WslRootNodes = PhCreateList(4);
+            WslSessionNodes = PhCreateList(2);
 
             WslpInitializeTreeList(windowHandle);
 
