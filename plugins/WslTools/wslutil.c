@@ -430,6 +430,9 @@ NTSTATUS WslCreateProcess(
     PVOID environment = NULL;
     HANDLE readHandle = NULL;
     HANDLE writeHandle = NULL;
+    HANDLE inputHandle = NULL;
+    HANDLE inputWriteHandle = NULL;
+    HANDLE handleList[2];
     HANDLE processHandle = NULL;
     HANDLE threadHandle = NULL;
     HANDLE jobHandle = NULL;
@@ -461,23 +464,40 @@ NTSTATUS WslCreateProcess(
     if (!NT_SUCCESS(status = PhCreatePipe(&readHandle, &writeHandle)))
         goto CleanupExit;
 
-    // Only the write end is inherited, and the handle list keeps any other inheritable
-    // handle in this process out of wsl.exe.
+    // Only the pipe's write end and the input handle are inherited, and the handle list keeps
+    // any other inheritable handle in this process out of the child.
     handleFlags.Inherit = TRUE;
     handleFlags.ProtectFromClose = FALSE;
 
     if (!NT_SUCCESS(status = NtSetInformationObject(writeHandle, ObjectHandleFlagInformation, &handleFlags, sizeof(handleFlags))))
         goto CleanupExit;
 
+    // stdin is a pipe that is already at end-of-file: nothing here ever writes to a tool's
+    // input. "wslc system session run" needs a valid input handle, and it must not be the NUL
+    // device: with NUL as stdin, session run fails with ERROR_INVALID_HANDLE part way through
+    // a larger output.
+    if (!NT_SUCCESS(status = PhCreatePipe(&inputHandle, &inputWriteHandle)))
+        goto CleanupExit;
+
+    NtClose(inputWriteHandle);
+    inputWriteHandle = NULL;
+
+    if (!NT_SUCCESS(status = NtSetInformationObject(inputHandle, ObjectHandleFlagInformation, &handleFlags, sizeof(handleFlags))))
+        goto CleanupExit;
+
+    handleList[0] = writeHandle;
+    handleList[1] = inputHandle;
+
     if (!NT_SUCCESS(status = PhInitializeProcThreadAttributeList(&attributeList, 1)))
         goto CleanupExit;
-    if (!NT_SUCCESS(status = PhUpdateProcThreadAttribute(attributeList, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, &writeHandle, sizeof(HANDLE))))
+    if (!NT_SUCCESS(status = PhUpdateProcThreadAttribute(attributeList, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, handleList, sizeof(handleList))))
         goto CleanupExit;
 
     memset(&startupInfo, 0, sizeof(STARTUPINFOEX));
     startupInfo.StartupInfo.cb = sizeof(STARTUPINFOEX);
     startupInfo.StartupInfo.dwFlags = STARTF_USESHOWWINDOW | STARTF_FORCEOFFFEEDBACK | STARTF_USESTDHANDLES;
     startupInfo.StartupInfo.wShowWindow = SW_HIDE;
+    startupInfo.StartupInfo.hStdInput = inputHandle;
     startupInfo.StartupInfo.hStdOutput = writeHandle;
     startupInfo.StartupInfo.hStdError = writeHandle;
     startupInfo.lpAttributeList = attributeList;
@@ -525,6 +545,8 @@ CleanupExit:
     // Our copy of the write end is always closed, so the read end reports end-of-file once wsl.exe exits.
     if (writeHandle)
         NtClose(writeHandle);
+    if (inputHandle)
+        NtClose(inputHandle);
     if (readHandle)
         NtClose(readHandle);
     // PhDeleteProcThreadAttributeList is not exported; the list is a PhAllocateZero allocation.

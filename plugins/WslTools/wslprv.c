@@ -429,15 +429,18 @@ static NTSTATUS NTAPI WslpProviderThread(
             // The GUI thread takes ownership of the snapshot reference.
             SystemInformer_Invoke(WslOnSnapshotUpdated, snapshot);
         }
-        else if (WslpCollectors->Count != 0)
+        else
         {
+            // Hidden: nothing is collected, and CPU usage starts fresh when the tab is shown again.
             WslpStopAllCollectors();
+            WslResetSessionProcesses();
         }
 
         NtWaitForSingleObject(WslpProviderWakeEvent, FALSE, &interval);
     }
 
     WslpStopAllCollectors();
+    WslResetSessionProcesses();
 
     return STATUS_SUCCESS;
 }

@@ -60,7 +60,7 @@ typedef struct _WSL_NODE
     PPH_STRING ImageText; // Cached "kernel <version>" of the VM
     PPH_STRING StatusText; // Cached uptime or container status
     // VM node: its distribution nodes, which WslDistroNodes owns.
-    // Distribution and session nodes: their process and container nodes, which they own.
+    // Distribution, session and container nodes: their process and container nodes, which they own.
     PPH_LIST Children;
     BOOLEAN Seen; // Scratch flag while a snapshot is applied
 
@@ -105,6 +105,7 @@ static CONST PH_STRINGREF WslEmptyText = PH_STRINGREF_INIT(L"No WSL distribution
 static CONST PH_STRINGREF WslAmbiguousVmText = PH_STRINGREF_INIT(L"Several virtual machine processes exist; the WSL one cannot be identified.");
 static CONST PH_STRINGREF WslDefaultMarker = PH_STRINGREF_INIT(L" *");
 static CONST PH_STRINGREF WslDefaultTooltipText = PH_STRINGREF_INIT(L"Default distribution");
+static CONST PH_STRINGREF WslGuestUptimeTooltipText = PH_STRINGREF_INIT(L"Time the VM has been running since the start, from the VM's own clock. It leaves out time the VM was paused, e.g. while the host was asleep.");
 
 /**
  * Creates a tree node.
@@ -128,11 +129,11 @@ static PWSL_NODE WslpCreateNode(
 
     if (Id)
         PhSetReference(&node->Id, Id);
-    if (Type == WslNodeTypeVm || Type == WslNodeTypeDistro || Type == WslNodeTypeSession)
+    if (Type != WslNodeTypeLinuxProcess)
         node->Children = PhCreateList(4);
 
-    // A distribution can have hundreds of processes; start collapsed to keep the overview.
-    if (Type == WslNodeTypeDistro)
+    // A distribution or container can have hundreds of processes; start collapsed to keep the overview.
+    if (Type == WslNodeTypeDistro || Type == WslNodeTypeContainer)
         node->Node.Expanded = FALSE;
 
     return node;
@@ -147,7 +148,7 @@ static VOID WslpDestroyNode(
     _In_ PWSL_NODE Node
     )
 {
-    if (Node->Type == WslNodeTypeDistro || Node->Type == WslNodeTypeSession)
+    if (Node->Type == WslNodeTypeDistro || Node->Type == WslNodeTypeSession || Node->Type == WslNodeTypeContainer)
     {
         for (ULONG i = 0; i < Node->Children->Count; i++)
             WslpDestroyNode(Node->Children->Items[i]);
@@ -224,19 +225,24 @@ static ULONG NTAPI WslpProcessNodeHashFunction(
 }
 
 /**
- * Matches the process nodes of a distribution node to the processes of its latest frame.
+ * Matches the process nodes of a distribution or container node to the processes of a frame.
  *
- * \param DistroNode The distribution node, already pointing at its new distribution item.
+ * \param ParentNode The distribution or container node.
+ * \param Frame The distribution's or session's latest frame, or NULL.
+ * \param ContainerId For a container, its short ID: only processes in that container are
+ * shown. NULL for a distribution.
  * \remarks Processes are matched by PID and start time, so a reused PID gets a new node and
  * selection stays on the process it was on. The nodes still point at the previous frame,
  * which the previous snapshot keeps alive until the update is done.
  */
 static VOID WslpUpdateProcessNodes(
-    _In_ PWSL_NODE DistroNode
+    _In_ PWSL_NODE ParentNode,
+    _In_opt_ PWSL_PROCESS_FRAME Frame,
+    _In_opt_ PPH_STRING ContainerId
     )
 {
-    PPH_LIST processes = DistroNode->Distro->Processes ? DistroNode->Distro->Processes->Processes : NULL;
-    PPH_LIST children = DistroNode->Children;
+    PPH_LIST processes = Frame ? Frame->Processes : NULL;
+    PPH_LIST children = ParentNode->Children;
     PPH_HASHTABLE nodeTable;
 
     nodeTable = PhCreateHashtable(sizeof(PWSL_NODE), WslpProcessNodeEqualFunction, WslpProcessNodeHashFunction, children->Count + 1);
@@ -257,6 +263,10 @@ static VOID WslpUpdateProcessNodes(
         PWSL_NODE *entry;
         PWSL_NODE node = NULL;
 
+        // "wslc list" prints the short container ID; the cgroup has the full one.
+        if (ContainerId && (!process->ContainerId || !PhStartsWithString(process->ContainerId, ContainerId, TRUE)))
+            continue;
+
         lookupNode.LinuxProcess = process;
 
         if (entry = PhFindEntryHashtable(nodeTable, &lookupNodePtr))
@@ -269,7 +279,7 @@ static VOID WslpUpdateProcessNodes(
         }
 
         node->LinuxProcess = process;
-        node->Frame = DistroNode->Distro->Processes;
+        node->Frame = Frame;
         node->Seen = TRUE;
         WslpInvalidateNode(node);
     }
@@ -364,6 +374,7 @@ static VOID WslpUpdateSessionNodes(
             containerNode->Container = container;
             containerNode->Seen = TRUE;
             WslpInvalidateNode(containerNode);
+            WslpUpdateProcessNodes(containerNode, session->Processes, container->Id);
         }
 
         for (ULONG j = sessionNode->Children->Count; j != 0; j--)
@@ -463,7 +474,7 @@ VOID NTAPI WslOnSnapshotUpdated(
         else
             PhSetReference(&node->NameText, distro->Name);
 
-        WslpUpdateProcessNodes(node);
+        WslpUpdateProcessNodes(node, distro->Processes, NULL);
 
         if (distro->Version == 2)
             hasWsl2 = TRUE;
@@ -1757,6 +1768,16 @@ static BOOLEAN NTAPI WslpTreeNewCallback(
             if (getCellTooltip->Column->Id == WSLTNC_MEMORY)
             {
                 getCellTooltip->Text = *WslpGetMemoryTooltip(node);
+                getCellTooltip->Unfolding = FALSE;
+                getCellTooltip->MaximumWidth = ULONG_MAX;
+                return TRUE;
+            }
+
+            // Distribution and Linux process uptimes come from /proc/uptime inside the VM, which
+            // stops while the VM is paused; a container's status is wall-clock time from wslc.
+            if (getCellTooltip->Column->Id == WSLTNC_STATUS && (node->Type == WslNodeTypeDistro || node->Type == WslNodeTypeLinuxProcess))
+            {
+                getCellTooltip->Text = WslGuestUptimeTooltipText;
                 getCellTooltip->Unfolding = FALSE;
                 getCellTooltip->MaximumWidth = ULONG_MAX;
                 return TRUE;

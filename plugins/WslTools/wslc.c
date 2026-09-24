@@ -18,7 +18,29 @@
 // are only ever listed for a session it reported, and always with --session, because
 // "wslc list" without a session could create or start the default session.
 
+// The processes of a session VM, with the cgroup of each, printed once. This is a one-shot
+// snapshot per refresh rather than a loop like the distribution collector, because a loop
+// started with "session run" keeps running inside the VM when wslc.exe is killed. The script
+// is one double-quoted argument, so it must not contain double quotes itself.
+#define WSL_SESSION_PROCESS_SCRIPT \
+    L"t=$(getconf CLK_TCK 2>/dev/null || echo 100); " \
+    L"p=$(getconf PAGESIZE 2>/dev/null || echo 4096); " \
+    L"read -r k < /proc/sys/kernel/osrelease; " \
+    L"read -r u i < /proc/uptime; " \
+    L"echo @ $u $t $p $$ $k; " \
+    L"cat /proc/[0-9]*/stat 2>/dev/null; " \
+    L"for d in /proc/[0-9]*; do read -r g < $d/cgroup 2>/dev/null && echo %${d#/proc/} $g; done; " \
+    L"echo @end"
+
+typedef struct _WSL_SESSION_PARSER
+{
+    PPH_STRING Name;
+    PWSL_FRAME_PARSER Parser; // Keeps the previous snapshot of the session, for CPU usage
+    BOOLEAN Seen;
+} WSL_SESSION_PARSER, *PWSL_SESSION_PARSER;
+
 static CONST PH_STRINGREF WslpSpace = PH_STRINGREF_INIT(L" ");
+static PPH_LIST WslpSessionParsers = NULL; // PWSL_SESSION_PARSER, used only by the provider thread
 
 typedef struct _WSL_CONTAINER_STATS
 {
@@ -107,6 +129,7 @@ VOID WslFreeSessions(
             WslpFreeContainer(session->Containers->Items[j]);
 
         PhDereferenceObject(session->Containers);
+        PhClearReference(&session->Processes);
         PhClearReference(&session->Name);
         PhFree(session);
     }
@@ -488,6 +511,120 @@ NTSTATUS WslStartContainerConsole(
 }
 
 /**
+ * Gets the frame parser of a session, and marks it as still in use.
+ */
+static PWSL_FRAME_PARSER WslpGetSessionParser(
+    _In_ PPH_STRING Name
+    )
+{
+    PWSL_SESSION_PARSER entry;
+
+    if (!WslpSessionParsers)
+        WslpSessionParsers = PhCreateList(2);
+
+    for (ULONG i = 0; i < WslpSessionParsers->Count; i++)
+    {
+        entry = WslpSessionParsers->Items[i];
+
+        if (PhEqualString(entry->Name, Name, FALSE))
+        {
+            entry->Seen = TRUE;
+            return entry->Parser;
+        }
+    }
+
+    entry = PhAllocateZero(sizeof(WSL_SESSION_PARSER));
+    PhSetReference(&entry->Name, Name);
+    entry->Parser = WslCreateFrameParser();
+    entry->Seen = TRUE;
+    PhAddItemList(WslpSessionParsers, entry);
+
+    return entry->Parser;
+}
+
+/**
+ * Frees the parsers of sessions that were not seen since the last call.
+ */
+static VOID WslpPruneSessionParsers(
+    VOID
+    )
+{
+    if (!WslpSessionParsers)
+        return;
+
+    for (ULONG i = WslpSessionParsers->Count; i != 0; i--)
+    {
+        PWSL_SESSION_PARSER entry = WslpSessionParsers->Items[i - 1];
+
+        if (!entry->Seen)
+        {
+            PhRemoveItemList(WslpSessionParsers, i - 1);
+            WslDestroyFrameParser(entry->Parser);
+            PhDereferenceObject(entry->Name);
+            PhFree(entry);
+        }
+        else
+        {
+            entry->Seen = FALSE;
+        }
+    }
+}
+
+/**
+ * Reads the processes of a running session VM, with the container each one runs in.
+ *
+ * \remarks Runs a short shell in the session VM, only for a session that "wslc system session
+ * list" just reported and only when a container is running.
+ */
+static VOID WslpQuerySessionProcesses(
+    _In_ PPH_STRING FileName,
+    _In_ PWSL_SESSION Session
+    )
+{
+    PPH_STRING arguments;
+    PPH_BYTES output;
+    BOOLEAN anyRunning = FALSE;
+
+    for (ULONG i = 0; i < Session->Containers->Count; i++)
+        anyRunning |= ((PWSL_CONTAINER)Session->Containers->Items[i])->Running;
+
+    if (!anyRunning || !WslIsSafeSessionName(Session->Name))
+        return;
+
+    arguments = PhFormatString(L"--session \"%s\" system session run /bin/sh -c \"%s\"", Session->Name->Buffer, WSL_SESSION_PROCESS_SCRIPT);
+
+    if (NT_SUCCESS(WslRunCommand(FileName, &arguments->sr, &output)))
+    {
+        Session->Processes = WslParseFrameOutput(WslpGetSessionParser(Session->Name), output);
+        PhDereferenceObject(output);
+    }
+
+    PhDereferenceObject(arguments);
+}
+
+/**
+ * Stops tracking all sessions, e.g. when the tab is hidden, so CPU usage starts fresh.
+ */
+VOID WslResetSessionProcesses(
+    VOID
+    )
+{
+    if (!WslpSessionParsers)
+        return;
+
+    for (ULONG i = 0; i < WslpSessionParsers->Count; i++)
+    {
+        PWSL_SESSION_PARSER entry = WslpSessionParsers->Items[i];
+
+        WslDestroyFrameParser(entry->Parser);
+        PhDereferenceObject(entry->Name);
+        PhFree(entry);
+    }
+
+    PhClearList(WslpSessionParsers);
+}
+
+/**
  * Lists the running WSLC sessions and their containers.
  *
  * \return The sessions, or NULL if this WSL version has no wslc.exe or the session list
@@ -512,7 +649,12 @@ PPH_LIST WslQuerySessions(
     PhDereferenceObject(output);
 
     for (ULONG i = 0; i < sessions->Count; i++)
+    {
         WslpQuerySessionContainers(fileName, sessions->Items[i]);
+        WslpQuerySessionProcesses(fileName, sessions->Items[i]);
+    }
+
+    WslpPruneSessionParsers();
 
     return sessions;
 }

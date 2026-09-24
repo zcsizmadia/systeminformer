@@ -43,6 +43,7 @@ typedef struct _WSL_LINUX_PROCESS
     ULONG64 ResidentBytes;
     FLOAT CpuUsage; // Fraction of all host processors, as PH_PROCESS_ITEM.CpuUsage
     BOOLEAN HaveCpuUsage; // FALSE until the process has been seen in two frames
+    PPH_STRING ContainerId; // Full ID of the WSLC container it runs in, or NULL
 } WSL_LINUX_PROCESS, *PWSL_LINUX_PROCESS;
 
 // One sample of every process in a distribution.
@@ -58,6 +59,20 @@ typedef struct _WSL_PROCESS_FRAME
 } WSL_PROCESS_FRAME, *PWSL_PROCESS_FRAME;
 
 typedef struct _WSL_COLLECTOR *PWSL_COLLECTOR;
+typedef struct _WSL_FRAME_PARSER *PWSL_FRAME_PARSER;
+
+PWSL_FRAME_PARSER WslCreateFrameParser(
+    VOID
+    );
+
+VOID WslDestroyFrameParser(
+    _In_ PWSL_FRAME_PARSER Parser
+    );
+
+PWSL_PROCESS_FRAME WslParseFrameOutput(
+    _In_ PWSL_FRAME_PARSER Parser,
+    _In_ PPH_BYTES Output
+    );
 
 VOID WslInitializeProcessFrameType(
     VOID
@@ -113,6 +128,7 @@ typedef struct _WSL_SESSION
     BOOLEAN HaveStats;
     FLOAT CpuUsage; // Sum over running containers
     ULONG64 MemoryBytes; // Sum over running containers
+    PWSL_PROCESS_FRAME Processes; // Processes of the session VM, with their containers, or NULL
 } WSL_SESSION, *PWSL_SESSION;
 
 PPH_LIST WslQuerySessions(
@@ -121,6 +137,10 @@ PPH_LIST WslQuerySessions(
 
 VOID WslFreeSessions(
     _In_ PPH_LIST Sessions
+    );
+
+VOID WslResetSessionProcesses(
+    VOID
     );
 
 BOOLEAN WslIsSafeSessionName(
