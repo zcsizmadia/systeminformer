@@ -20,13 +20,18 @@
 #define ID_WSL_OPENFILELOCATION         40004
 #define ID_WSL_GOTOPROCESS              40005
 #define ID_WSL_COPY                     40006
+#define ID_WSL_CONTAINERSHELL           40007
+#define ID_WSL_CONTAINERLOGS            40008
+#define ID_WSL_CONTAINERSTOP            40009
+#define ID_WSL_CONTAINERRESTART         40010
+#define ID_WSL_CONTAINERKILL            40011
 
 // Next default values for new objects
 //
 #ifdef APSTUDIO_INVOKED
 #ifndef APSTUDIO_READONLY_SYMBOLS
 #define _APS_NEXT_RESOURCE_VALUE        103
-#define _APS_NEXT_COMMAND_VALUE         40007
+#define _APS_NEXT_COMMAND_VALUE         40012
 #define _APS_NEXT_CONTROL_VALUE         1011
 #define _APS_NEXT_SYMED_VALUE           101
 #endif

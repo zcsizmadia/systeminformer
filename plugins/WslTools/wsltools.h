@@ -80,6 +80,60 @@ PCPH_STRINGREF WslGetLinuxProcessStateText(
     _In_ WCHAR State
     );
 
+ULONG WslGetHostProcessorCount(
+    VOID
+    );
+
+// wslc.c
+
+typedef struct _WSL_CONTAINER
+{
+    PPH_STRING Id; // Short ID, as "wslc list" prints it
+    PPH_STRING Name;
+    PPH_STRING Image;
+    PPH_STRING State; // e.g. "running", "exited"
+    PPH_STRING Status; // e.g. "Up 5 minutes"
+    PPH_STRING Ports;
+    BOOLEAN Running;
+    BOOLEAN HaveStats;
+    FLOAT CpuUsage; // Fraction of all host processors, as PH_PROCESS_ITEM.CpuUsage
+    ULONG64 MemoryBytes; // Memory usage as wslc stats reports it
+    ULONG NumberOfProcesses;
+} WSL_CONTAINER, *PWSL_CONTAINER;
+
+typedef struct _WSL_SESSION
+{
+    ULONG Id;
+    PPH_STRING Name; // Display name; wslc addresses sessions by it
+    PPH_LIST Containers; // PWSL_CONTAINER
+    NTSTATUS QueryStatus; // Result of listing the containers
+    BOOLEAN HaveStats;
+    FLOAT CpuUsage; // Sum over running containers
+    ULONG64 MemoryBytes; // Sum over running containers
+} WSL_SESSION, *PWSL_SESSION;
+
+PPH_LIST WslQuerySessions(
+    VOID
+    );
+
+VOID WslFreeSessions(
+    _In_ PPH_LIST Sessions
+    );
+
+BOOLEAN WslIsSafeSessionName(
+    _In_ PPH_STRING Name
+    );
+
+BOOLEAN WslIsSafeContainerId(
+    _In_ PPH_STRING Id
+    );
+
+NTSTATUS WslStartContainerConsole(
+    _In_ PPH_STRING SessionName,
+    _In_ PPH_STRING ContainerId,
+    _In_ BOOLEAN Logs
+    );
+
 // wslutil.c
 
 typedef enum _WSL_DISTRO_STATE
@@ -109,6 +163,7 @@ typedef struct _WSL_SNAPSHOT
     PPH_LIST Distributions; // PWSL_DISTRO_ITEM
     // When the running query fails, every distribution is shown as unknown, not stopped.
     NTSTATUS RunningQueryStatus;
+    PPH_LIST Sessions; // PWSL_SESSION of running WSLC sessions, or NULL
 } WSL_SNAPSHOT, *PWSL_SNAPSHOT;
 
 BOOLEAN WslIsInstalled(
@@ -127,7 +182,16 @@ PCPH_STRINGREF WslGetDistroStateText(
     _In_ WSL_DISTRO_STATE State
     );
 
+PPH_STRING WslGetWslFileName(
+    VOID
+    );
+
+PPH_STRING WslGetWslcFileName(
+    VOID
+    );
+
 NTSTATUS WslCreateProcess(
+    _In_ PPH_STRING FileName,
     _In_ PCPH_STRINGREF Arguments,
     _Out_ PHANDLE ProcessHandle,
     _Out_ PHANDLE ReadHandle,
@@ -135,8 +199,9 @@ NTSTATUS WslCreateProcess(
     );
 
 NTSTATUS WslRunCommand(
+    _In_ PPH_STRING FileName,
     _In_ PCPH_STRINGREF Arguments,
-    _Out_opt_ PPH_STRING *Output
+    _Out_opt_ PPH_BYTES *Output
     );
 
 BOOLEAN WslIsSafeDistroName(

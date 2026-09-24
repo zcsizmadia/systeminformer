@@ -222,6 +222,10 @@ static NTSTATUS NTAPI WslpProviderThread(
             snapshot = WslQuerySnapshot(candidates != 0);
             WslpUpdateCollectors(snapshot);
 
+            // A WSLC session is a VM of its own, so without any VM process none can be running.
+            if (candidates != 0)
+                snapshot->Sessions = WslQuerySessions();
+
             // The GUI thread takes ownership of the snapshot reference.
             SystemInformer_Invoke(WslOnSnapshotUpdated, snapshot);
         }

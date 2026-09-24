@@ -68,6 +68,9 @@ VOID NTAPI WslpSnapshotDeleteProcedure(
     }
 
     PhDereferenceObject(snapshot->Distributions);
+
+    if (snapshot->Sessions)
+        WslFreeSessions(snapshot->Sessions);
 }
 
 /**
@@ -246,6 +249,7 @@ PWSL_SNAPSHOT WslQuerySnapshot(
     snapshot = PhCreateObject(sizeof(WSL_SNAPSHOT), WslpSnapshotType);
     snapshot->Distributions = PhCreateList(4);
     snapshot->RunningQueryStatus = STATUS_SUCCESS;
+    snapshot->Sessions = NULL;
 
     context.Distributions = snapshot->Distributions;
     context.DefaultId = NULL;
@@ -269,13 +273,16 @@ PWSL_SNAPSHOT WslQuerySnapshot(
 
     if (queryRunning)
     {
-        PPH_STRING output;
+        PPH_BYTES output;
 
-        snapshot->RunningQueryStatus = WslRunCommand(&runningArguments, &output);
+        snapshot->RunningQueryStatus = WslRunCommand(WslGetWslFileName(), &runningArguments, &output);
 
         if (NT_SUCCESS(snapshot->RunningQueryStatus))
         {
-            WslpApplyRunningList(snapshot->Distributions, output);
+            PPH_STRING text = PhConvertUtf8ToUtf16Ex(output->Buffer, output->Length);
+
+            WslpApplyRunningList(snapshot->Distributions, text);
+            PhDereferenceObject(text);
             PhDereferenceObject(output);
         }
     }
@@ -318,7 +325,7 @@ PCPH_STRINGREF WslGetDistroStateText(
  *
  * \return The path. The string is cached for the lifetime of the process.
  */
-static PPH_STRING WslpGetWslFileName(
+PPH_STRING WslGetWslFileName(
     VOID
     )
 {
@@ -343,8 +350,43 @@ static PPH_STRING WslpGetWslFileName(
 }
 
 /**
- * Starts wsl.exe hidden, with its stdout and stderr connected to a pipe.
+ * Gets the full path of wslc.exe, the WSL container CLI.
  *
+ * \return The path, or NULL if this WSL version has no wslc.exe. The result is cached for
+ * the lifetime of the process.
+ */
+PPH_STRING WslGetWslcFileName(
+    VOID
+    )
+{
+    static PH_INITONCE initOnce = PH_INITONCE_INIT;
+    static PPH_STRING fileName = NULL;
+
+    if (PhBeginInitOnce(&initOnce))
+    {
+        // wslc.exe is 64-bit only and lives in the native Program Files, which a 32-bit
+        // build can only name through ProgramW6432.
+        static CONST PH_STRINGREF path = PH_STRINGREF_INIT(L"%ProgramW6432%\\WSL\\wslc.exe");
+        PPH_STRING expanded;
+
+        if (expanded = PhExpandEnvironmentStrings(&path))
+        {
+            if (PhDoesFileExistWin32(expanded->Buffer))
+                fileName = expanded;
+            else
+                PhDereferenceObject(expanded);
+        }
+
+        PhEndInitOnce(&initOnce);
+    }
+
+    return fileName;
+}
+
+/**
+ * Starts wsl.exe or wslc.exe hidden, with its stdout and stderr connected to a pipe.
+ *
+ * \param FileName The executable, from WslGetWslFileName or WslGetWslcFileName.
  * \param Arguments The command line arguments, without the executable name.
  * \param ProcessHandle Receives a handle to the wsl.exe process.
  * \param ReadHandle Receives the read end of the output pipe. It reports end-of-file once
@@ -354,6 +396,7 @@ static PPH_STRING WslpGetWslFileName(
  * \return NTSTATUS code indicating success or failure.
  */
 NTSTATUS WslCreateProcess(
+    _In_ PPH_STRING FileName,
     _In_ PCPH_STRINGREF Arguments,
     _Out_ PHANDLE ProcessHandle,
     _Out_ PHANDLE ReadHandle,
@@ -365,7 +408,6 @@ NTSTATUS WslCreateProcess(
     static UNICODE_STRING utf8Name = RTL_CONSTANT_STRING(L"WSL_UTF8");
     static UNICODE_STRING utf8Value = RTL_CONSTANT_STRING(L"1");
     NTSTATUS status;
-    PPH_STRING fileName;
     PPH_STRING commandLine;
     PVOID environment = NULL;
     HANDLE readHandle = NULL;
@@ -378,8 +420,7 @@ NTSTATUS WslCreateProcess(
     OBJECT_HANDLE_FLAG_INFORMATION handleFlags;
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION jobLimits;
 
-    fileName = WslpGetWslFileName();
-    commandLine = PhConcatStringRef3(&quote, &fileName->sr, &quoteSpace);
+    commandLine = PhConcatStringRef3(&quote, &FileName->sr, &quoteSpace);
     PhMoveReference(&commandLine, PhConcatStringRef2(&commandLine->sr, Arguments));
 
     // Without WSL_UTF8 wsl.exe writes UTF-16 to a pipe, unless the user has set it globally.
@@ -424,7 +465,7 @@ NTSTATUS WslCreateProcess(
     startupInfo.lpAttributeList = attributeList;
 
     status = PhCreateProcessWin32Ex(
-        fileName->Buffer,
+        FileName->Buffer,
         commandLine->Buffer,
         environment,
         NULL,
@@ -480,8 +521,9 @@ CleanupExit:
 }
 
 /**
- * Runs wsl.exe hidden and captures its output.
+ * Runs wsl.exe or wslc.exe hidden and captures its output.
  *
+ * \param FileName The executable, from WslGetWslFileName or WslGetWslcFileName.
  * \param Arguments The command line arguments, without the executable name.
  * \param Output Receives the combined stdout and stderr text. The caller owns the string.
  * \return STATUS_SUCCESS if wsl.exe exited with code 0, STATUS_IO_TIMEOUT if it was killed
@@ -489,8 +531,9 @@ CleanupExit:
  * \remarks Must not be called on the GUI thread; it blocks until wsl.exe exits.
  */
 NTSTATUS WslRunCommand(
+    _In_ PPH_STRING FileName,
     _In_ PCPH_STRINGREF Arguments,
-    _Out_opt_ PPH_STRING *Output
+    _Out_opt_ PPH_BYTES *Output
     )
 {
     NTSTATUS status;
@@ -502,7 +545,7 @@ NTSTATUS WslRunCommand(
     ULONG64 startTickCount;
     PROCESS_BASIC_INFORMATION basicInfo;
 
-    if (!NT_SUCCESS(status = WslCreateProcess(Arguments, &processHandle, &readHandle, &jobHandle)))
+    if (!NT_SUCCESS(status = WslCreateProcess(FileName, Arguments, &processHandle, &readHandle, &jobHandle)))
         return status;
 
     PhInitializeBytesBuilder(&bytesBuilder, 256);
@@ -548,12 +591,11 @@ NTSTATUS WslRunCommand(
     status = basicInfo.ExitStatus == 0 ? STATUS_SUCCESS : STATUS_UNSUCCESSFUL;
 
 CleanupExit:
+    // Both tools write UTF-8: wsl.exe because WslCreateProcess sets WSL_UTF8, wslc.exe always.
     if (Output && NT_SUCCESS(status))
-    {
-        *Output = PhConvertUtf8ToUtf16Ex(bytesBuilder.Bytes->Buffer, bytesBuilder.Bytes->Length);
-    }
-
-    PhDeleteBytesBuilder(&bytesBuilder);
+        *Output = PhFinalBytesBuilderBytes(&bytesBuilder);
+    else
+        PhDeleteBytesBuilder(&bytesBuilder);
     NtClose(processHandle);
     NtClose(readHandle);
     NtClose(jobHandle);
@@ -605,7 +647,7 @@ NTSTATUS WslStartShell(
     if (!WslIsSafeDistroName(DistroName))
         return STATUS_INVALID_PARAMETER;
 
-    fileName = WslpGetWslFileName();
+    fileName = WslGetWslFileName();
     commandLine = PhFormatString(L"\"%s\" --distribution %s --cd ~", fileName->Buffer, DistroName->Buffer);
 
     status = PhCreateProcessWin32Ex(

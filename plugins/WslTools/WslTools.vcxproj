@@ -66,6 +66,7 @@
   </ImportGroup>
   <ItemGroup>
     <ClCompile Include="main.c" />
+    <ClCompile Include="wslc.c" />
     <ClCompile Include="wslproc.c" />
     <ClCompile Include="wslprv.c" />
     <ClCompile Include="wslsys.c" />

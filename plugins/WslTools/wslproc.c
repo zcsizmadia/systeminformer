@@ -133,7 +133,7 @@ VOID WslInitializeProcessFrameType(
  * (PhSystemProcessorInformation, which is not exported), so WSL rows use the same unit as
  * the VM row. PhSystemBasicInformation only covers the current processor group.
  */
-static ULONG WslpGetHostProcessorCount(
+ULONG WslGetHostProcessorCount(
     VOID
     )
 {
@@ -395,7 +395,7 @@ static VOID WslpCompleteFrame(
     if (Collector->HavePrevious && Collector->Uptime > Collector->PreviousUptime)
     {
         capacity = (Collector->Uptime - Collector->PreviousUptime) *
-            (DOUBLE)Collector->TicksPerSecond * WslpGetHostProcessorCount();
+            (DOUBLE)Collector->TicksPerSecond * WslGetHostProcessorCount();
     }
 
     // PhCreateObject does not zero the object.
@@ -633,7 +633,7 @@ PWSL_COLLECTOR WslStartCollector(
     collector->Entries = PhCreateList(64);
     collector->Running = TRUE;
 
-    status = WslCreateProcess(&arguments->sr, &collector->ProcessHandle, &collector->ReadHandle, &collector->JobHandle);
+    status = WslCreateProcess(WslGetWslFileName(), &arguments->sr, &collector->ProcessHandle, &collector->ReadHandle, &collector->JobHandle);
     PhDereferenceObject(arguments);
 
     if (NT_SUCCESS(status))
