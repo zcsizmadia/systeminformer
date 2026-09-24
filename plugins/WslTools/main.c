@@ -17,6 +17,8 @@ static PH_CALLBACK_REGISTRATION PluginUnloadCallbackRegistration;
 static PH_CALLBACK_REGISTRATION MainWindowShowingCallbackRegistration;
 static PH_CALLBACK_REGISTRATION ProcessesUpdatedCallbackRegistration;
 static PH_CALLBACK_REGISTRATION SystemInformationInitializingCallbackRegistration;
+static PH_CALLBACK_REGISTRATION ProcessMenuInitializingCallbackRegistration;
+static PH_CALLBACK_REGISTRATION PluginMenuItemCallbackRegistration;
 static BOOLEAN WslInstalled = FALSE;
 
 _Function_class_(PH_CALLBACK_FUNCTION)
@@ -81,6 +83,61 @@ static VOID NTAPI SystemInformationInitializingCallback(
         WslSystemInformationInitializing(Parameter);
 }
 
+_Function_class_(PH_CALLBACK_FUNCTION)
+static VOID NTAPI ProcessMenuInitializingCallback(
+    _In_opt_ PVOID Parameter,
+    _In_opt_ PVOID Context
+    )
+{
+    PPH_PLUGIN_MENU_INFORMATION menuInfo = Parameter;
+    PPH_PROCESS_ITEM processItem;
+    PPH_PROCESS_ITEM wslVmItem;
+    PPH_PROCESS_ITEM sessionVmItem;
+    WSL_VM_SELECTION selection = WslVmSelectionNone;
+    PPH_EMENU_ITEM propertiesItem;
+    ULONG index;
+
+    if (!WslInstalled || !menuInfo || menuInfo->u.Process.NumberOfProcesses != 1)
+        return;
+
+    processItem = menuInfo->u.Process.Processes[0];
+
+    // Only a vmmem the tab can show gets the item, using the same matching as the tab.
+    wslVmItem = WslReferenceVmProcessItem(NULL);
+    sessionVmItem = WslReferenceSessionVmProcessItem();
+
+    if (wslVmItem && wslVmItem->ProcessId == processItem->ProcessId)
+        selection = WslVmSelectionWsl;
+    else if (sessionVmItem && sessionVmItem->ProcessId == processItem->ProcessId)
+        selection = WslVmSelectionSession;
+
+    PhClearReference(&wslVmItem);
+    PhClearReference(&sessionVmItem);
+
+    if (selection == WslVmSelectionNone)
+        return;
+
+    // Place it just above Properties, or last if the menu has none.
+    index = ULONG_MAX;
+
+    if (propertiesItem = PhFindEMenuItem(menuInfo->Menu, 0, NULL, PHAPP_ID_PROCESS_PROPERTIES))
+        index = PhIndexOfEMenuItem(menuInfo->Menu, propertiesItem);
+
+    PhInsertEMenuItem(menuInfo->Menu, PhPluginCreateEMenuItem(PluginInstance, 0, ID_PROCESS_GOTOWSL, L"&Go to WSL", UlongToPtr(selection)), index);
+}
+
+_Function_class_(PH_CALLBACK_FUNCTION)
+static VOID NTAPI MenuItemCallback(
+    _In_opt_ PVOID Parameter,
+    _In_opt_ PVOID Context
+    )
+{
+    PPH_PLUGIN_MENU_ITEM menuItem = Parameter;
+
+    if (menuItem && menuItem->Id == ID_PROCESS_GOTOWSL)
+        WslSelectVmNode((WSL_VM_SELECTION)PtrToUlong(menuItem->Context));
+}
+
 LOGICAL DllMain(
     _In_ HINSTANCE Instance,
     _In_ ULONG Reason,
@@ -135,6 +192,18 @@ LOGICAL DllMain(
                 SystemInformationInitializingCallback,
                 NULL,
                 &SystemInformationInitializingCallbackRegistration
+                );
+            PhRegisterCallback(
+                PhGetGeneralCallback(GeneralCallbackProcessMenuInitializing),
+                ProcessMenuInitializingCallback,
+                NULL,
+                &ProcessMenuInitializingCallbackRegistration
+                );
+            PhRegisterCallback(
+                PhGetPluginCallback(PluginInstance, PluginCallbackMenuItem),
+                MenuItemCallback,
+                NULL,
+                &PluginMenuItemCallbackRegistration
                 );
 
             PhAddSettings(settings, RTL_NUMBER_OF(settings));

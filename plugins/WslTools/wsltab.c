@@ -96,6 +96,8 @@ static ULONG WslVmCandidates = 0;
 // The session VM process, only while exactly one session runs, because nothing links a
 // session VM to a session name.
 static PPH_PROCESS_ITEM WslSessionVmProcessItem = NULL;
+// A row asked for by "Go to WSL" before the tab had its rows; tried once on the next snapshot.
+static WSL_VM_SELECTION WslPendingVmSelection = WslVmSelectionNone;
 
 static CONST PH_STRINGREF WslPageText = PH_STRINGREF_INIT(L"WSL");
 static CONST PH_STRINGREF WslVmNodeText = PH_STRINGREF_INIT(L"WSL");
@@ -390,6 +392,36 @@ static VOID WslpUpdateSessionNodes(
 }
 
 /**
+ * Selects the row of a VM and scrolls it into view.
+ *
+ * \return FALSE if the row does not exist (yet).
+ */
+static BOOLEAN WslpSelectVmNode(
+    _In_ WSL_VM_SELECTION Selection
+    )
+{
+    PWSL_NODE node = NULL;
+
+    if (!WslTreeNewHandle)
+        return FALSE;
+
+    if (Selection == WslVmSelectionWsl)
+        node = WslVmNode;
+    else if (Selection == WslVmSelectionSession && WslSessionNodes->Count == 1)
+        node = WslSessionNodes->Items[0];
+
+    if (!node)
+        return FALSE;
+
+    TreeNew_DeselectRange(WslTreeNewHandle, 0, -1);
+    TreeNew_FocusMarkSelectNode(WslTreeNewHandle, &node->Node);
+    TreeNew_EnsureVisible(WslTreeNewHandle, &node->Node);
+    SetFocus(WslTreeNewHandle);
+
+    return TRUE;
+}
+
+/**
  * Applies a new snapshot from the provider. Runs on the GUI thread.
  *
  * \param Parameter The snapshot. This function takes ownership of the reference.
@@ -485,6 +517,32 @@ VOID NTAPI WslOnSnapshotUpdated(
         WslpInvalidateNode(WslDistroNodes->Items[i]);
 
     TreeNew_NodesStructured(WslTreeNewHandle);
+
+    // One attempt: if the VM's row is still missing, it has stopped since the request.
+    if (WslPendingVmSelection != WslVmSelectionNone)
+    {
+        WslpSelectVmNode(WslPendingVmSelection);
+        WslPendingVmSelection = WslVmSelectionNone;
+    }
+}
+
+/**
+ * Switches to the WSL tab and selects the row of a VM, for "Go to WSL" on a vmmem process.
+ *
+ * \param Selection Which row to select.
+ * \remarks When the tab has never been shown, its rows only exist after the first snapshot,
+ * so the selection is kept and tried when that snapshot arrives.
+ */
+VOID WslSelectVmNode(
+    _In_ WSL_VM_SELECTION Selection
+    )
+{
+    if (!WslPage)
+        return;
+
+    SystemInformer_SelectTabPage(WslPage->Index);
+
+    WslPendingVmSelection = WslpSelectVmNode(Selection) ? WslVmSelectionNone : Selection;
 }
 
 /**
