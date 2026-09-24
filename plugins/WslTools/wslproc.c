@@ -29,7 +29,8 @@
     L"s=1; " \
     L"while :; do " \
     L"read u i < /proc/uptime; " \
-    L"echo @ $u $t $p $$ $k; " \
+    L"m=0; a=0; while read -r n v r; do case $n in MemTotal:) m=$v ;; MemAvailable:) a=$v ;; esac; done < /proc/meminfo; " \
+    L"echo @ $u $t $p $$ $k $m $a; " \
     L"cat /proc/[0-9]*/stat 2>/dev/null; " \
     L"echo @end; " \
     L"sleep $s; " \
@@ -79,6 +80,8 @@ typedef struct _WSL_FRAME_PARSER
     ULONG64 PageSize;
     ULONG SelfProcessId;
     PPH_STRING KernelRelease;
+    ULONG64 MemoryTotal;
+    ULONG64 MemoryAvailable;
     BOOLEAN InFrame;
 } WSL_FRAME_PARSER, *PWSL_FRAME_PARSER;
 
@@ -211,7 +214,8 @@ PCPH_STRINGREF WslGetLinuxProcessStateText(
 }
 
 /**
- * Parses a frame header, "@ <uptime> <ticks per second> <page size> <shell pid> <kernel release>".
+ * Parses a frame header, "@ <uptime> <ticks per second> <page size> <shell pid> <kernel release>
+ * <MemTotal kB> <MemAvailable kB>".
  *
  * \remarks A process name can contain a newline, so a line that only starts like a header
  * can be the tail of a stat line. The rest of that stat line always follows the name on the
@@ -255,6 +259,20 @@ static BOOLEAN WslpParseHeader(
 
     if (!Parser->KernelRelease || !PhEqualStringRef(&Parser->KernelRelease->sr, &part, FALSE))
         PhMoveReference(&Parser->KernelRelease, PhCreateString2(&part));
+
+    // /proc/meminfo is in kB.
+    PhSplitStringRefAtChar(&Line, L' ', &part, &Line);
+
+    if (!PhStringToUInt64(&part, 10, &Parser->MemoryTotal))
+        return FALSE;
+
+    PhSplitStringRefAtChar(&Line, L' ', &part, &Line);
+
+    if (!PhStringToUInt64(&part, 10, &Parser->MemoryAvailable))
+        return FALSE;
+
+    Parser->MemoryTotal *= 1024;
+    Parser->MemoryAvailable *= 1024;
 
     return Line.Length == 0;
 }
@@ -423,6 +441,8 @@ static PWSL_PROCESS_FRAME WslpCompleteFrame(
     frame->Processes = PhCreateList(Parser->Entries->Count);
     frame->Uptime = Parser->Uptime;
     frame->TicksPerSecond = Parser->TicksPerSecond;
+    frame->MemoryTotal = Parser->MemoryTotal;
+    frame->MemoryAvailable = Parser->MemoryAvailable;
     PhSetReference(&frame->KernelRelease, Parser->KernelRelease);
     samples = PhCreateHashtable(sizeof(WSL_CPU_SAMPLE), WslpCpuSampleEqualFunction, WslpCpuSampleHashFunction, Parser->Entries->Count);
 

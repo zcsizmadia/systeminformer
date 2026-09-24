@@ -27,7 +27,8 @@
     L"p=$(getconf PAGESIZE 2>/dev/null || echo 4096); " \
     L"read -r k < /proc/sys/kernel/osrelease; " \
     L"read -r u i < /proc/uptime; " \
-    L"echo @ $u $t $p $$ $k; " \
+    L"m=0; a=0; while read -r n v r; do case $n in MemTotal:) m=$v ;; MemAvailable:) a=$v ;; esac; done < /proc/meminfo; " \
+    L"echo @ $u $t $p $$ $k $m $a; " \
     L"cat /proc/[0-9]*/stat 2>/dev/null; " \
     L"for d in /proc/[0-9]*; do read -r g < $d/cgroup 2>/dev/null && echo %${d#/proc/} $g; done; " \
     L"echo @end"
