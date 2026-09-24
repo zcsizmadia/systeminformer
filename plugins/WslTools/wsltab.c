@@ -2015,7 +2015,7 @@ static BOOLEAN WslpPageCallback(
             if (WslTabSelected)
                 WslOnProcessesUpdated();
 
-            WslSetProviderEnabled(WslTabSelected);
+            WslSetProviderEnabled(WSL_PROVIDER_TAB, WslTabSelected);
         }
         break;
     case MainTabPageExportContent:

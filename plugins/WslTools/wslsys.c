@@ -10,6 +10,7 @@
  */
 
 #include "wsltools.h"
+#include <svcsup.h>
 
 // The WSL section of System Information graphs the CPU usage and private bytes of the
 // WSL 2 VM process and, stacked on top, of the WSLC session VM process. The history comes
@@ -33,11 +34,39 @@ static HWND WslSysCpuGraphHandle = NULL;
 static HWND WslSysPrivateGraphHandle = NULL;
 static PH_GRAPH_STATE WslSysCpuGraphState;
 static PH_GRAPH_STATE WslSysPrivateGraphState;
+// The panel below the graphs has four boxes side by side, each with four label/value rows.
+#define WSL_SYS_BOXES 4
+#define WSL_SYS_ROWS 4
+
+typedef enum _WSL_SYS_BOX
+{
+    WslSysBoxWslVm,
+    WslSysBoxSessionVm,
+    WslSysBoxDistributions,
+    WslSysBoxService
+} WSL_SYS_BOX;
+
+static CONST PCWSTR WslSysBoxTitles[WSL_SYS_BOXES] =
+{
+    L"VM: WSL",
+    L"VM: WSLC session",
+    L"Distributions",
+    L"Service"
+};
+
+static CONST PCWSTR WslSysRowLabels[WSL_SYS_BOXES][WSL_SYS_ROWS] =
+{
+    { L"Process", L"CPU", L"Private bytes", L"Guest used / total" },
+    { L"Process", L"CPU", L"Private bytes", L"Containers" },
+    { L"Registered", L"Running", L"Default", L"VHD total" },
+    { L"wslservice", L"WSLC sessions", L"VM idle timeout", L"Memory reclaim" },
+};
+
 static HWND WslSysPanel = NULL;
-static HWND WslSysPanelStateLabel = NULL;
-static HWND WslSysPanelPidLabel = NULL;
-static HWND WslSysPanelCpuLabel = NULL;
-static HWND WslSysPanelPrivateLabel = NULL;
+static PH_STRINGREF WslpServiceName = PH_STRINGREF_INIT(L"WSLService");
+static HWND WslSysPanelBoxes[WSL_SYS_BOXES];
+static HWND WslSysPanelLabels[WSL_SYS_BOXES][WSL_SYS_ROWS];
+static HWND WslSysPanelValues[WSL_SYS_BOXES][WSL_SYS_ROWS];
 
 static PPH_PROCESS_ITEM WslSysVmProcessItem = NULL;
 static ULONG WslSysVmCandidates = 0;
@@ -429,26 +458,294 @@ static VOID WslpSysInvalidateGraphs(
 }
 
 /**
- * Updates the panel below the graphs.
+ * Gets the WSL version from the version resource of wslservice.exe, e.g. "2.9.12.0".
+ *
+ * \return The version, or NULL. The string is cached for the lifetime of the process.
+ * \remarks This reads a file instead of running "wsl --version", whose output is localized.
+ */
+static PPH_STRING WslpSysGetWslVersion(
+    VOID
+    )
+{
+    static PH_INITONCE initOnce = PH_INITONCE_INIT;
+    static PPH_STRING version = NULL;
+
+    if (PhBeginInitOnce(&initOnce))
+    {
+        static CONST PH_STRINGREF path = PH_STRINGREF_INIT(L"%ProgramW6432%\\WSL\\wslservice.exe");
+        PPH_STRING fileName;
+        PH_IMAGE_VERSION_INFO versionInfo;
+
+        if (fileName = PhExpandEnvironmentStrings(&path))
+        {
+            if (NT_SUCCESS(PhInitializeImageVersionInfo(&versionInfo, fileName->Buffer)))
+            {
+                PhSetReference(&version, versionInfo.FileVersion);
+                PhDeleteImageVersionInfo(&versionInfo);
+            }
+
+            PhDereferenceObject(fileName);
+        }
+
+        PhEndInitOnce(&initOnce);
+    }
+
+    return version;
+}
+
+/**
+ * Reads a setting from %USERPROFILE%\.wslconfig.
+ *
+ * \param Section The section, e.g. L"wsl2".
+ * \param Key The key, e.g. L"vmIdleTimeout".
+ * \return The value, or NULL when it is not set and WSL uses its default.
+ * \remarks .wslconfig is an INI file, so the profile API reads it.
+ */
+static PPH_STRING WslpSysGetWslConfigValue(
+    _In_ PCWSTR Section,
+    _In_ PCWSTR Key
+    )
+{
+    static CONST PH_STRINGREF path = PH_STRINGREF_INIT(L"%USERPROFILE%\\.wslconfig");
+    PPH_STRING fileName;
+    PPH_STRING value = NULL;
+    WCHAR buffer[64];
+
+    if (fileName = PhExpandEnvironmentStrings(&path))
+    {
+        if (GetPrivateProfileString(Section, Key, L"", buffer, RTL_NUMBER_OF(buffer), fileName->Buffer) != 0)
+            value = PhCreateString(buffer);
+
+        PhDereferenceObject(fileName);
+    }
+
+    return value;
+}
+
+/**
+ * Gets the latest process frame of a running WSL 2 distribution, for data of the whole VM
+ * such as its kernel and memory.
+ */
+static PWSL_PROCESS_FRAME WslpSysGetVmFrame(
+    _In_opt_ PWSL_SNAPSHOT Snapshot
+    )
+{
+    for (ULONG i = 0; Snapshot && i < Snapshot->Distributions->Count; i++)
+    {
+        PWSL_DISTRO_ITEM distro = Snapshot->Distributions->Items[i];
+
+        if (distro->Version == 2 && distro->Processes)
+            return distro->Processes;
+    }
+
+    return NULL;
+}
+
+/**
+ * Sets a value of the panel.
+ *
+ * \param Value The text. This function takes ownership of the string; NULL clears the value.
+ */
+static VOID WslpSysSetValue(
+    _In_ WSL_SYS_BOX Box,
+    _In_ ULONG Row,
+    _In_opt_ PPH_STRING Value
+    )
+{
+    PhSetWindowText(WslSysPanelValues[Box][Row], PhGetStringOrEmpty(Value));
+    PhClearReference(&Value);
+}
+
+/**
+ * Sets the process, CPU and private bytes rows of a VM box.
+ */
+static VOID WslpSysSetVmValues(
+    _In_ WSL_SYS_BOX Box,
+    _In_opt_ PPH_PROCESS_ITEM ProcessItem
+    )
+{
+    if (ProcessItem)
+    {
+        WslpSysSetValue(Box, 0, PhFormatString(L"%s (%lu)", PhGetStringOrEmpty(ProcessItem->ProcessName), HandleToUlong(ProcessItem->ProcessId)));
+        WslpSysSetValue(Box, 1, PhFormatString(L"%.2f%%", ProcessItem->CpuUsage * 100));
+        WslpSysSetValue(Box, 2, PhFormatSize(ProcessItem->VmCounters.PagefileUsage, ULONG_MAX));
+    }
+    else
+    {
+        WslpSysSetValue(Box, 0, NULL);
+        WslpSysSetValue(Box, 1, NULL);
+        WslpSysSetValue(Box, 2, NULL);
+    }
+}
+
+/**
+ * Updates the panel and the header.
+ *
+ * \remarks Distribution, session, kernel and guest memory values come from the provider's
+ * latest snapshot, which exists while this page (or the WSL tab) is visible; they stay empty
+ * until the first snapshot arrives.
  */
 static VOID WslpSysUpdatePanel(
     VOID
     )
 {
-    PhSetWindowText(WslSysPanelStateLabel, WslpSysGetVmStateText()->Buffer);
+    PWSL_SNAPSHOT snapshot = WslReferenceLatestSnapshot();
+    PWSL_PROCESS_FRAME vmFrame = WslpSysGetVmFrame(snapshot);
+    PWSL_SESSION session = snapshot && snapshot->Sessions && snapshot->Sessions->Count == 1 ? snapshot->Sessions->Items[0] : NULL;
+    PPH_SERVICE_ITEM serviceItem;
+    PPH_STRING value;
+    PPH_STRING version;
+    ULONG numberOfVms;
 
-    if (WslSysVmProcessItem)
+    // VM: WSL
+    WslpSysSetVmValues(WslSysBoxWslVm, WslSysVmProcessItem);
+
+    if (vmFrame && vmFrame->MemoryTotal != 0)
     {
-        PhSetWindowText(WslSysPanelPidLabel, PhaFormatUInt64(HandleToUlong(WslSysVmProcessItem->ProcessId), FALSE)->Buffer);
-        PhSetWindowText(WslSysPanelCpuLabel, PhaFormatString(L"%.2f%%", WslSysVmProcessItem->CpuUsage * 100)->Buffer);
-        PhSetWindowText(WslSysPanelPrivateLabel, PhaFormatSize(WslSysVmProcessItem->VmCounters.PagefileUsage, ULONG_MAX)->Buffer);
+        PPH_STRING used = PhFormatSize(vmFrame->MemoryTotal - min(vmFrame->MemoryAvailable, vmFrame->MemoryTotal), ULONG_MAX);
+        PPH_STRING total = PhFormatSize(vmFrame->MemoryTotal, ULONG_MAX);
+
+        WslpSysSetValue(WslSysBoxWslVm, 3, PhFormatString(L"%s / %s", used->Buffer, total->Buffer));
+        PhDereferenceObject(used);
+        PhDereferenceObject(total);
     }
     else
     {
-        PhSetWindowText(WslSysPanelPidLabel, L"");
-        PhSetWindowText(WslSysPanelCpuLabel, L"");
-        PhSetWindowText(WslSysPanelPrivateLabel, L"");
+        WslpSysSetValue(WslSysBoxWslVm, 3, NULL);
     }
+
+    // VM: session. The process is only attributed while exactly one session runs.
+    PhSetWindowText(WslSysPanelBoxes[WslSysBoxSessionVm], session ? PhaFormatString(L"VM: %s", session->Name->Buffer)->Buffer : WslSysBoxTitles[WslSysBoxSessionVm]);
+    WslpSysSetVmValues(WslSysBoxSessionVm, session ? WslSysSessionVmProcessItem : NULL);
+
+    if (session)
+    {
+        ULONG running = 0;
+
+        for (ULONG i = 0; i < session->Containers->Count; i++)
+            running += ((PWSL_CONTAINER)session->Containers->Items[i])->Running;
+
+        WslpSysSetValue(WslSysBoxSessionVm, 3, PhFormatString(L"%lu running, %lu exited", running, session->Containers->Count - running));
+    }
+    else
+    {
+        WslpSysSetValue(WslSysBoxSessionVm, 3, NULL);
+    }
+
+    // Distributions
+    if (snapshot)
+    {
+        PPH_STRING defaultName = NULL;
+        ULONG running = 0;
+        ULONG64 vhdTotal = 0;
+
+        for (ULONG i = 0; i < snapshot->Distributions->Count; i++)
+        {
+            PWSL_DISTRO_ITEM distro = snapshot->Distributions->Items[i];
+
+            running += distro->State == WslDistroStateRunning;
+            vhdTotal += distro->VhdSize;
+
+            if (distro->Default)
+                defaultName = distro->Name;
+        }
+
+        WslpSysSetValue(WslSysBoxDistributions, 0, PhFormatUInt64(snapshot->Distributions->Count, FALSE));
+        WslpSysSetValue(WslSysBoxDistributions, 1, NT_SUCCESS(snapshot->RunningQueryStatus) ? PhFormatUInt64(running, FALSE) : PhCreateString(L"Unknown"));
+        WslpSysSetValue(WslSysBoxDistributions, 2, defaultName ? PhReferenceObject(defaultName) : NULL);
+        WslpSysSetValue(WslSysBoxDistributions, 3, PhFormatSize(vhdTotal, ULONG_MAX));
+    }
+    else
+    {
+        for (ULONG i = 0; i < WSL_SYS_ROWS; i++)
+            WslpSysSetValue(WslSysBoxDistributions, i, NULL);
+    }
+
+    // Service
+    if (serviceItem = PhReferenceServiceItem(&WslpServiceName))
+    {
+        WslpSysSetValue(WslSysBoxService, 0, PhCreateString2(PhGetServiceStateString(serviceItem->State)));
+        PhDereferenceObject(serviceItem);
+    }
+    else
+    {
+        WslpSysSetValue(WslSysBoxService, 0, PhCreateString(L"Not installed"));
+    }
+
+    WslpSysSetValue(WslSysBoxService, 1, snapshot && snapshot->Sessions ? PhFormatUInt64(snapshot->Sessions->Count, FALSE) : NULL);
+
+    // Settings that .wslconfig does not set are shown as "default" rather than as a value this
+    // plugin would have to assume.
+    if (value = WslpSysGetWslConfigValue(L"wsl2", L"vmIdleTimeout"))
+        PhMoveReference(&value, PhFormatString(L"%s ms", value->Buffer));
+    WslpSysSetValue(WslSysBoxService, 2, value ? value : PhCreateString(L"default"));
+
+    if (!(value = WslpSysGetWslConfigValue(L"experimental", L"autoMemoryReclaim")))
+        value = WslpSysGetWslConfigValue(L"wsl2", L"autoMemoryReclaim");
+    WslpSysSetValue(WslSysBoxService, 3, value ? value : PhCreateString(L"default"));
+
+    // Header: "2 VMs · WSL 2.9.12.0 · kernel 6.18.40.1"
+    numberOfVms = (WslSysVmProcessItem ? 1 : 0) + (snapshot && snapshot->Sessions ? snapshot->Sessions->Count : (WslSysSessionVmProcessItem ? 1 : 0));
+    version = WslpSysGetWslVersion();
+
+    {
+        PPH_STRING versionText = version ? PhFormatString(L" \u00b7 WSL %s", version->Buffer) : PhReferenceEmptyString();
+        PPH_STRING kernelText = PhReferenceEmptyString();
+
+        if (vmFrame && vmFrame->KernelRelease)
+        {
+            PH_STRINGREF kernel;
+            PH_STRINGREF rest;
+
+            // "6.18.40.1-microsoft-standard-WSL2" is shown as "6.18.40.1".
+            PhSplitStringRefAtChar(&vmFrame->KernelRelease->sr, L'-', &kernel, &rest);
+            PhMoveReference(&kernelText, PhFormatString(L" \u00b7 kernel %.*s", (INT)(kernel.Length / sizeof(WCHAR)), kernel.Buffer));
+        }
+
+        value = PhFormatString(L"%lu %s%s%s", numberOfVms, numberOfVms == 1 ? L"VM" : L"VMs", versionText->Buffer, kernelText->Buffer);
+        PhSetWindowText(GetDlgItem(WslSysDialog, IDC_HEADER), value->Buffer);
+
+        PhDereferenceObject(value);
+        PhDereferenceObject(versionText);
+        PhDereferenceObject(kernelText);
+    }
+
+    PhClearReference(&snapshot);
+}
+
+/**
+ * Places the four boxes side by side over the width of the panel, with the rows of each box.
+ */
+static VOID WslpSysLayoutPanel(
+    _In_ HWND WindowHandle
+    )
+{
+    RECT clientRect;
+    LONG padding = PhScaleToDisplay(6, WslSysSection->Parameters->WindowDpi);
+    LONG rowHeight = PhScaleToDisplay(15, WslSysSection->Parameters->WindowDpi);
+    LONG topPadding = PhScaleToDisplay(16, WslSysSection->Parameters->WindowDpi);
+    LONG boxWidth;
+
+    PhGetClientRect(WindowHandle, &clientRect);
+    boxWidth = (clientRect.right - padding * (WSL_SYS_BOXES - 1)) / WSL_SYS_BOXES;
+
+    for (ULONG box = 0; box < WSL_SYS_BOXES; box++)
+    {
+        LONG left = box * (boxWidth + padding);
+        LONG innerWidth = boxWidth - padding * 2;
+
+        MoveWindow(WslSysPanelBoxes[box], left, 0, boxWidth, clientRect.bottom, FALSE);
+
+        for (ULONG row = 0; row < WSL_SYS_ROWS; row++)
+        {
+            LONG top = topPadding + row * rowHeight;
+
+            MoveWindow(WslSysPanelLabels[box][row], left + padding, top, innerWidth / 2, rowHeight, FALSE);
+            MoveWindow(WslSysPanelValues[box][row], left + padding + innerWidth / 2, top, innerWidth - innerWidth / 2, rowHeight, FALSE);
+        }
+    }
+
+    InvalidateRect(WindowHandle, NULL, TRUE);
 }
 
 static INT_PTR CALLBACK WslpSysPanelDialogProc(
@@ -462,17 +759,31 @@ static INT_PTR CALLBACK WslpSysPanelDialogProc(
     {
     case WM_INITDIALOG:
         {
-            HWND groupBoxHandle;
+            HFONT font = GetWindowFont(WindowHandle);
 
-            groupBoxHandle = GetDlgItem(WindowHandle, IDC_ZGROUPBOX_V);
-            PhSetWindowStyle(groupBoxHandle, WS_CLIPSIBLINGS, WS_CLIPSIBLINGS);
-            SetWindowPos(groupBoxHandle, HWND_BOTTOM, 0, 0, 0, 0, SWP_NOSIZE | SWP_NOMOVE | SWP_NOACTIVATE);
-            PhInitializeThemeWindowGroupBoxEx(groupBoxHandle);
+            // The controls are made here from the tables, rather than listed in the template.
+            for (ULONG box = 0; box < WSL_SYS_BOXES; box++)
+            {
+                WslSysPanelBoxes[box] = CreateWindow(L"BUTTON", WslSysBoxTitles[box], WS_CHILD | WS_VISIBLE | BS_GROUPBOX | WS_CLIPSIBLINGS, 0, 0, 0, 0, WindowHandle, NULL, NULL, NULL);
+                SetWindowFont(WslSysPanelBoxes[box], font, FALSE);
+                PhInitializeThemeWindowGroupBoxEx(WslSysPanelBoxes[box]);
 
-            WslSysPanelStateLabel = GetDlgItem(WindowHandle, IDC_ZSTATE_V);
-            WslSysPanelPidLabel = GetDlgItem(WindowHandle, IDC_ZPID_V);
-            WslSysPanelCpuLabel = GetDlgItem(WindowHandle, IDC_ZCPU_V);
-            WslSysPanelPrivateLabel = GetDlgItem(WindowHandle, IDC_ZPRIVATE_V);
+                for (ULONG row = 0; row < WSL_SYS_ROWS; row++)
+                {
+                    WslSysPanelLabels[box][row] = CreateWindow(L"STATIC", WslSysRowLabels[box][row], WS_CHILD | WS_VISIBLE | SS_LEFT | SS_ENDELLIPSIS, 0, 0, 0, 0, WindowHandle, NULL, NULL, NULL);
+                    WslSysPanelValues[box][row] = CreateWindow(L"STATIC", L"", WS_CHILD | WS_VISIBLE | SS_RIGHT | SS_ENDELLIPSIS, 0, 0, 0, 0, WindowHandle, NULL, NULL, NULL);
+                    SetWindowFont(WslSysPanelLabels[box][row], font, FALSE);
+                    SetWindowFont(WslSysPanelValues[box][row], font, FALSE);
+                }
+
+                // The group box is drawn behind its rows.
+                SetWindowPos(WslSysPanelBoxes[box], HWND_BOTTOM, 0, 0, 0, 0, SWP_NOSIZE | SWP_NOMOVE | SWP_NOACTIVATE);
+            }
+        }
+        break;
+    case WM_SIZE:
+        {
+            WslpSysLayoutPanel(WindowHandle);
         }
         break;
     case WM_CTLCOLORBTN:
@@ -510,6 +821,7 @@ static INT_PTR CALLBACK WslpSysDialogProc(
             PhInitializeLayoutManager(&WslSysLayoutManager, WindowHandle);
             graphItem = PhAddLayoutItem(&WslSysLayoutManager, GetDlgItem(WindowHandle, IDC_GRAPH_LAYOUT), NULL, PH_ANCHOR_ALL);
             panelItem = PhAddLayoutItem(&WslSysLayoutManager, GetDlgItem(WindowHandle, IDC_PANEL_LAYOUT), NULL, PH_ANCHOR_LEFT | PH_ANCHOR_RIGHT | PH_ANCHOR_BOTTOM);
+            PhAddLayoutItem(&WslSysLayoutManager, GetDlgItem(WindowHandle, IDC_HEADER), NULL, PH_ANCHOR_TOP | PH_ANCHOR_RIGHT);
             WslSysGraphMargin = graphItem->Margin;
             WslSysGraphMarginScaled = WslSysGraphMargin;
             PhGetMarginDpiValue(&WslSysGraphMarginScaled, WslSysSection->Parameters->WindowDpi, TRUE);
@@ -526,11 +838,15 @@ static INT_PTR CALLBACK WslpSysDialogProc(
             WslpSysCreateGraphs();
             WslpSysUpdatePanel();
 
+            // The panel needs distributions, sessions and guest data, which only the provider reads.
+            WslSetProviderEnabled(WSL_PROVIDER_SYSINFO, TRUE);
+
             PhInitializeWindowTheme(WindowHandle, !!PhGetIntegerSetting(SETTING_ENABLE_THEME_SUPPORT));
         }
         break;
     case WM_DESTROY:
         {
+            WslSetProviderEnabled(WSL_PROVIDER_SYSINFO, FALSE);
             PhDeleteLayoutManager(&WslSysLayoutManager);
         }
         break;

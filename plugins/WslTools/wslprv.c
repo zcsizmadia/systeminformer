@@ -12,8 +12,9 @@
 #include "wsltools.h"
 
 // The provider thread builds a snapshot every WSL_REFRESH_INTERVAL_MS while enabled, and
-// hands it to the GUI thread. It is enabled only while the WSL tab is visible, so a hidden
-// tab costs nothing: no registry reads, no wsl.exe and no process collectors.
+// hands it to the GUI thread. It is enabled only while the WSL tab or the WSL page of System
+// Information is visible, so otherwise it costs nothing: no registry reads, no wsl.exe and no
+// process collectors.
 
 typedef struct _WSL_COLLECTOR_ENTRY
 {
@@ -23,8 +24,10 @@ typedef struct _WSL_COLLECTOR_ENTRY
 
 static HANDLE WslpProviderThreadHandle = NULL;
 static HANDLE WslpProviderWakeEvent = NULL;
-static LONG WslpProviderEnabled = FALSE;
+static LONG WslpProviderEnabled = 0; // WSL_PROVIDER_* reasons it is enabled for
 static LONG WslpProviderStopping = FALSE;
+static PH_QUEUED_LOCK WslpLatestSnapshotLock = PH_QUEUED_LOCK_INIT;
+static PWSL_SNAPSHOT WslpLatestSnapshot = NULL; // For readers other than the tab, e.g. System Information
 static PPH_LIST WslpCollectors = NULL; // PWSL_COLLECTOR_ENTRY, used only by the provider thread
 
 static CONST PH_STRINGREF WslpVmProcessNameWin11 = PH_STRINGREF_INIT(L"vmmemWSL");
@@ -426,14 +429,23 @@ static NTSTATUS NTAPI WslpProviderThread(
             if (candidates != 0)
                 snapshot->Sessions = WslQuerySessions();
 
+            // The snapshot is complete and no longer changes, so other threads can read it.
+            PhAcquireQueuedLockExclusive(&WslpLatestSnapshotLock);
+            PhSetReference(&WslpLatestSnapshot, snapshot);
+            PhReleaseQueuedLockExclusive(&WslpLatestSnapshotLock);
+
             // The GUI thread takes ownership of the snapshot reference.
             SystemInformer_Invoke(WslOnSnapshotUpdated, snapshot);
         }
         else
         {
-            // Hidden: nothing is collected, and CPU usage starts fresh when the tab is shown again.
+            // Hidden: nothing is collected, and CPU usage starts fresh when shown again.
             WslpStopAllCollectors();
             WslResetSessionProcesses();
+
+            PhAcquireQueuedLockExclusive(&WslpLatestSnapshotLock);
+            PhClearReference(&WslpLatestSnapshot);
+            PhReleaseQueuedLockExclusive(&WslpLatestSnapshotLock);
         }
 
         NtWaitForSingleObject(WslpProviderWakeEvent, FALSE, &interval);
@@ -489,22 +501,50 @@ VOID WslStopProvider(
     NtClose(WslpProviderWakeEvent);
     WslpProviderWakeEvent = NULL;
     PhClearReference(&WslpCollectors);
+    PhClearReference(&WslpLatestSnapshot);
 }
 
 /**
- * Enables or disables snapshot collection.
+ * Enables or disables snapshot collection for one reason. The provider runs while any
+ * reason is enabled.
  *
- * \param Enabled TRUE while the WSL tab is visible.
+ * \param Reason WSL_PROVIDER_TAB or WSL_PROVIDER_SYSINFO.
+ * \param Enabled TRUE while that view is visible.
  */
 VOID WslSetProviderEnabled(
+    _In_ LONG Reason,
     _In_ BOOLEAN Enabled
     )
 {
-    WriteRelease(&WslpProviderEnabled, Enabled);
+    if (Enabled)
+        _InterlockedOr(&WslpProviderEnabled, Reason);
+    else
+        _InterlockedAnd(&WslpProviderEnabled, ~Reason);
 
     // Wake the thread either way: to refresh right away when the tab becomes visible, and to
     // stop the collectors right away when it is hidden.
     WslRefreshProvider();
+}
+
+/**
+ * Gets the latest snapshot, for readers on threads other than the GUI thread.
+ *
+ * \return The snapshot, or NULL while the provider is not running. The caller owns the reference.
+ */
+PWSL_SNAPSHOT WslReferenceLatestSnapshot(
+    VOID
+    )
+{
+    PWSL_SNAPSHOT snapshot;
+
+    PhAcquireQueuedLockShared(&WslpLatestSnapshotLock);
+
+    if (snapshot = WslpLatestSnapshot)
+        PhReferenceObject(snapshot);
+
+    PhReleaseQueuedLockShared(&WslpLatestSnapshotLock);
+
+    return snapshot;
 }
 
 /**

@@ -56,6 +56,8 @@ typedef struct _WSL_PROCESS_FRAME
     DOUBLE Uptime; // Seconds since the VM booted, when the frame was taken
     ULONG64 TicksPerSecond; // Unit of WSL_LINUX_PROCESS.StartTime
     PPH_STRING KernelRelease; // e.g. "6.18.40.1-microsoft-standard-WSL2"
+    ULONG64 MemoryTotal; // Memory of the whole VM, from /proc/meminfo
+    ULONG64 MemoryAvailable;
 } WSL_PROCESS_FRAME, *PWSL_PROCESS_FRAME;
 
 typedef struct _WSL_COLLECTOR *PWSL_COLLECTOR;
@@ -254,8 +256,17 @@ VOID WslStopProvider(
     VOID
     );
 
+// Reasons for WslSetProviderEnabled.
+#define WSL_PROVIDER_TAB 0x1
+#define WSL_PROVIDER_SYSINFO 0x2
+
 VOID WslSetProviderEnabled(
+    _In_ LONG Reason,
     _In_ BOOLEAN Enabled
+    );
+
+PWSL_SNAPSHOT WslReferenceLatestSnapshot(
+    VOID
     );
 
 VOID WslRefreshProvider(

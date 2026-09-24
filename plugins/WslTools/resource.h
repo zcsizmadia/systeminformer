@@ -10,13 +10,9 @@
 #define IDC_PANEL_LAYOUT                1003
 #define IDC_CPU_L                       1004
 #define IDC_PRIVATE_L                   1005
-#define IDC_ZGROUPBOX_V                 1006
-#define IDC_ZSTATE_V                    1007
-#define IDC_ZPID_V                      1008
-#define IDC_ZCPU_V                      1009
-#define IDC_ZPRIVATE_V                  1010
 #define IDC_INSPECT_TREE                1011
 #define IDC_COPYJSON                    1012
+#define IDC_HEADER                      1013
 #define ID_WSL_OPENSHELL                40001
 #define ID_WSL_TERMINATE                40002
 #define ID_WSL_SHUTDOWN                 40003
@@ -38,7 +34,7 @@
 #ifndef APSTUDIO_READONLY_SYMBOLS
 #define _APS_NEXT_RESOURCE_VALUE        104
 #define _APS_NEXT_COMMAND_VALUE         40015
-#define _APS_NEXT_CONTROL_VALUE         1013
+#define _APS_NEXT_CONTROL_VALUE         1014
 #define _APS_NEXT_SYMED_VALUE           101
 #endif
 #endif
