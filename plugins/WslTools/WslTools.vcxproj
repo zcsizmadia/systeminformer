@@ -67,6 +67,7 @@
   <ItemGroup>
     <ClCompile Include="main.c" />
     <ClCompile Include="wslc.c" />
+    <ClCompile Include="wsldock.c" />
     <ClCompile Include="wslinsp.c" />
     <ClCompile Include="wslproc.c" />
     <ClCompile Include="wslprv.c" />

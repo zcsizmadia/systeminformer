@@ -47,7 +47,7 @@ typedef struct _WSL_LINUX_PROCESS
     ULONG64 ResidentBytes;
     FLOAT CpuUsage; // Fraction of all host processors, as PH_PROCESS_ITEM.CpuUsage
     BOOLEAN HaveCpuUsage; // FALSE until the process has been seen in two frames
-    PPH_STRING ContainerId; // Full ID of the WSLC container it runs in, or NULL
+    PPH_STRING ContainerId; // Full ID of the WSLC or Docker API container it runs in, or NULL
 } WSL_LINUX_PROCESS, *PWSL_LINUX_PROCESS;
 
 // One sample of every process in a distribution.
@@ -118,20 +118,25 @@ typedef enum _WSL_DISTRO_STATE
 
 // wslc.c
 
+// A WSLC container, or a container of a Docker API engine (wsldock.c).
 typedef struct _WSL_CONTAINER
 {
-    PPH_STRING Id; // Short ID, as "wslc list" prints it
+    PPH_STRING Id; // Short ID as "wslc list" prints it, or the full ID from a Docker API
     PPH_STRING Name;
     PPH_STRING Image;
-    PPH_STRING State; // e.g. "running", "exited"
+    PPH_STRING State; // e.g. "Running", "Exited"
     PPH_STRING Status; // e.g. "Up 5 minutes"
-    PPH_STRING Ports;
+    PPH_STRING Ports; // e.g. "0.0.0.0:8080->80/tcp"
     BOOLEAN Running;
     BOOLEAN HaveStats;
     FLOAT CpuUsage; // Fraction of all host processors, as PH_PROCESS_ITEM.CpuUsage
-    ULONG64 MemoryBytes; // Memory usage as wslc stats reports it
+    ULONG64 MemoryBytes; // As wslc stats reports it, or the resident memory of its processes
     ULONG NumberOfProcesses;
 } WSL_CONTAINER, *PWSL_CONTAINER;
+
+VOID WslFreeContainer(
+    _In_ PWSL_CONTAINER Container
+    );
 
 typedef struct _WSL_SESSION
 {
@@ -166,10 +171,49 @@ BOOLEAN WslIsSafeContainerId(
     _In_ PPH_STRING Id
     );
 
-NTSTATUS WslStartContainerConsole(
-    _In_ PPH_STRING SessionName,
-    _In_ PPH_STRING ContainerId,
-    _In_ BOOLEAN Logs
+// wsldock.c
+
+// A container engine with a Docker API on a local named pipe, e.g. Docker Desktop, Skrog or
+// Podman, whose containers run in a WSL distribution.
+typedef struct _WSL_ENGINE
+{
+    PPH_STRING PipeName; // e.g. "docker_engine", without "\\.\pipe\"
+    PPH_STRING Label; // The product serving the pipe, e.g. "skrog"
+    PPH_STRING ServerText; // The Server header, e.g. "Docker/29.8.1 (linux)"
+    HANDLE ServerProcessId;
+    PPH_STRING DistroId; // The distribution its containers run in
+    PPH_LIST Containers; // PWSL_CONTAINER
+} WSL_ENGINE, *PWSL_ENGINE;
+
+struct _WSL_SNAPSHOT;
+
+PPH_LIST WslQueryEngines(
+    _In_ struct _WSL_SNAPSHOT *Snapshot
+    );
+
+VOID WslFreeEngines(
+    _In_ PPH_LIST Engines
+    );
+
+VOID WslResetEngines(
+    VOID
+    );
+
+NTSTATUS WslEngineRequest(
+    _In_ PPH_STRING PipeName,
+    _In_ PCSTR Method,
+    _In_ PCSTR Path,
+    _In_ ULONG TimeoutMs,
+    _Out_opt_ PULONG StatusCode,
+    _Out_opt_ PPH_BYTES *Body
+    );
+
+PPH_STRING WslGetEngineErrorMessage(
+    _In_opt_ PPH_BYTES Body
+    );
+
+BOOLEAN WslIsSafePipeName(
+    _In_ PPH_STRING Name
     );
 
 // wslutil.c
@@ -196,6 +240,7 @@ typedef struct _WSL_SNAPSHOT
     // When the running query fails, every distribution is shown as unknown, not stopped.
     NTSTATUS RunningQueryStatus;
     PPH_LIST Sessions; // PWSL_SESSION of running WSLC sessions, or NULL
+    PPH_LIST Engines; // PWSL_ENGINE placed in a running distribution, or NULL
 } WSL_SNAPSHOT, *PWSL_SNAPSHOT;
 
 BOOLEAN WslIsInstalled(
@@ -256,6 +301,12 @@ NTSTATUS WslStartShell(
 
 NTSTATUS WslShowContainerInspect(
     _In_ PPH_STRING SessionName,
+    _In_ PPH_STRING ContainerId,
+    _In_ PPH_STRING ContainerName
+    );
+
+NTSTATUS WslShowEngineContainerInspect(
+    _In_ PPH_STRING PipeName,
     _In_ PPH_STRING ContainerId,
     _In_ PPH_STRING ContainerName
     );
