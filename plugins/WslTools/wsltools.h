@@ -246,6 +246,10 @@ PPH_PROCESS_ITEM WslReferenceVmProcessItem(
     _Out_opt_ PULONG NumberOfCandidates
     );
 
+PPH_PROCESS_ITEM WslReferenceSessionVmProcessItem(
+    VOID
+    );
+
 // wslsys.c
 
 VOID WslSystemInformationInitializing(
