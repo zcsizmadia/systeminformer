@@ -63,6 +63,7 @@ VOID NTAPI WslpSnapshotDeleteProcedure(
         PhClearReference(&distro->Name);
         PhClearReference(&distro->BasePath);
         PhClearReference(&distro->VhdFileName);
+        PhClearReference(&distro->Processes);
         PhFree(distro);
     }
 
@@ -342,17 +343,21 @@ static PPH_STRING WslpGetWslFileName(
 }
 
 /**
- * Runs wsl.exe hidden and captures its output.
+ * Starts wsl.exe hidden, with its stdout and stderr connected to a pipe.
  *
  * \param Arguments The command line arguments, without the executable name.
- * \param Output Receives the combined stdout and stderr text. The caller owns the string.
- * \return STATUS_SUCCESS if wsl.exe exited with code 0, STATUS_IO_TIMEOUT if it was killed
- * after WSL_COMMAND_TIMEOUT_MS, or another error status.
- * \remarks Must not be called on the GUI thread; it blocks until wsl.exe exits.
+ * \param ProcessHandle Receives a handle to the wsl.exe process.
+ * \param ReadHandle Receives the read end of the output pipe. It reports end-of-file once
+ * wsl.exe exits.
+ * \param JobHandle Receives a kill-on-close job that contains wsl.exe and the helper processes
+ * it starts. Terminating or closing the job ends all of them, also if System Informer exits.
+ * \return NTSTATUS code indicating success or failure.
  */
-NTSTATUS WslRunCommand(
+NTSTATUS WslCreateProcess(
     _In_ PCPH_STRINGREF Arguments,
-    _Out_opt_ PPH_STRING *Output
+    _Out_ PHANDLE ProcessHandle,
+    _Out_ PHANDLE ReadHandle,
+    _Out_ PHANDLE JobHandle
     )
 {
     static CONST PH_STRINGREF quote = PH_STRINGREF_INIT(L"\"");
@@ -361,20 +366,17 @@ NTSTATUS WslRunCommand(
     static UNICODE_STRING utf8Value = RTL_CONSTANT_STRING(L"1");
     NTSTATUS status;
     PPH_STRING fileName;
-    PPH_STRING commandLine = NULL;
+    PPH_STRING commandLine;
     PVOID environment = NULL;
     HANDLE readHandle = NULL;
     HANDLE writeHandle = NULL;
     HANDLE processHandle = NULL;
+    HANDLE threadHandle = NULL;
+    HANDLE jobHandle = NULL;
     PPROC_THREAD_ATTRIBUTE_LIST attributeList = NULL;
     STARTUPINFOEX startupInfo;
     OBJECT_HANDLE_FLAG_INFORMATION handleFlags;
-    PH_BYTES_BUILDER bytesBuilder;
-    LARGE_INTEGER timeout;
-    ULONG64 startTickCount;
-    PROCESS_BASIC_INFORMATION basicInfo;
-
-    PhInitializeBytesBuilder(&bytesBuilder, 256);
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION jobLimits;
 
     fileName = WslpGetWslFileName();
     commandLine = PhConcatStringRef3(&quote, &fileName->sr, &quoteSpace);
@@ -385,6 +387,16 @@ NTSTATUS WslRunCommand(
     if (!NT_SUCCESS(status = RtlCreateEnvironment(TRUE, &environment)))
         goto CleanupExit;
     if (!NT_SUCCESS(status = RtlSetEnvironmentVariable(&environment, &utf8Name, &utf8Value)))
+        goto CleanupExit;
+
+    // wsl.exe starts a second wsl.exe and a wslhost.exe; the job ends them together.
+    if (!NT_SUCCESS(status = PhCreateJobObject(&jobHandle, JOB_OBJECT_ALL_ACCESS, NULL, NULL)))
+        goto CleanupExit;
+
+    memset(&jobLimits, 0, sizeof(JOBOBJECT_EXTENDED_LIMIT_INFORMATION));
+    jobLimits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+
+    if (!NT_SUCCESS(status = NtSetInformationJobObject(jobHandle, JobObjectExtendedLimitInformation, &jobLimits, sizeof(jobLimits))))
         goto CleanupExit;
 
     if (!NT_SUCCESS(status = PhCreatePipe(&readHandle, &writeHandle)))
@@ -418,19 +430,82 @@ NTSTATUS WslRunCommand(
         NULL,
         &startupInfo,
         PH_CREATE_PROCESS_INHERIT_HANDLES | PH_CREATE_PROCESS_UNICODE_ENVIRONMENT | PH_CREATE_PROCESS_NEW_CONSOLE |
-        PH_CREATE_PROCESS_DEFAULT_ERROR_MODE | PH_CREATE_PROCESS_EXTENDED_STARTUPINFO,
+        PH_CREATE_PROCESS_DEFAULT_ERROR_MODE | PH_CREATE_PROCESS_EXTENDED_STARTUPINFO | PH_CREATE_PROCESS_SUSPENDED,
         NULL,
         NULL,
         &processHandle,
-        NULL
+        &threadHandle
         );
-
-    // Close our copy of the write end so the read end reports end-of-file once wsl.exe exits.
-    NtClose(writeHandle);
-    writeHandle = NULL;
 
     if (!NT_SUCCESS(status))
         goto CleanupExit;
+
+    // Assign before the first instruction runs, so every process wsl.exe starts is in the job.
+    if (!NT_SUCCESS(status = NtAssignProcessToJobObject(jobHandle, processHandle)))
+    {
+        PhTerminateProcess(processHandle, status);
+        goto CleanupExit;
+    }
+
+    PhResumeThread(threadHandle, NULL);
+
+    *ProcessHandle = processHandle;
+    *ReadHandle = readHandle;
+    *JobHandle = jobHandle;
+    processHandle = NULL;
+    readHandle = NULL;
+    jobHandle = NULL;
+
+CleanupExit:
+    if (threadHandle)
+        NtClose(threadHandle);
+    if (processHandle)
+        NtClose(processHandle);
+    if (jobHandle)
+        NtClose(jobHandle);
+    // Our copy of the write end is always closed, so the read end reports end-of-file once wsl.exe exits.
+    if (writeHandle)
+        NtClose(writeHandle);
+    if (readHandle)
+        NtClose(readHandle);
+    // PhDeleteProcThreadAttributeList is not exported; the list is a PhAllocateZero allocation.
+    if (attributeList)
+        PhFree(attributeList);
+    if (environment)
+        RtlDestroyEnvironment(environment);
+
+    PhDereferenceObject(commandLine);
+
+    return status;
+}
+
+/**
+ * Runs wsl.exe hidden and captures its output.
+ *
+ * \param Arguments The command line arguments, without the executable name.
+ * \param Output Receives the combined stdout and stderr text. The caller owns the string.
+ * \return STATUS_SUCCESS if wsl.exe exited with code 0, STATUS_IO_TIMEOUT if it was killed
+ * after WSL_COMMAND_TIMEOUT_MS, or another error status.
+ * \remarks Must not be called on the GUI thread; it blocks until wsl.exe exits.
+ */
+NTSTATUS WslRunCommand(
+    _In_ PCPH_STRINGREF Arguments,
+    _Out_opt_ PPH_STRING *Output
+    )
+{
+    NTSTATUS status;
+    HANDLE processHandle;
+    HANDLE readHandle;
+    HANDLE jobHandle;
+    PH_BYTES_BUILDER bytesBuilder;
+    LARGE_INTEGER timeout;
+    ULONG64 startTickCount;
+    PROCESS_BASIC_INFORMATION basicInfo;
+
+    if (!NT_SUCCESS(status = WslCreateProcess(Arguments, &processHandle, &readHandle, &jobHandle)))
+        return status;
+
+    PhInitializeBytesBuilder(&bytesBuilder, 256);
 
     // Drain the pipe while waiting, so wsl.exe never blocks on a full pipe buffer, and give up
     // after the timeout so a hung WSL service cannot hang the caller.
@@ -461,7 +536,7 @@ NTSTATUS WslRunCommand(
 
         if (NtGetTickCount64() - startTickCount >= WSL_COMMAND_TIMEOUT_MS)
         {
-            PhTerminateProcess(processHandle, STATUS_IO_TIMEOUT);
+            NtTerminateJobObject(jobHandle, STATUS_IO_TIMEOUT);
             status = STATUS_IO_TIMEOUT;
             goto CleanupExit;
         }
@@ -479,22 +554,37 @@ CleanupExit:
     }
 
     PhDeleteBytesBuilder(&bytesBuilder);
-
-    if (processHandle)
-        NtClose(processHandle);
-    if (writeHandle)
-        NtClose(writeHandle);
-    if (readHandle)
-        NtClose(readHandle);
-    // PhDeleteProcThreadAttributeList is not exported; the list is a PhAllocateZero allocation.
-    if (attributeList)
-        PhFree(attributeList);
-    if (environment)
-        RtlDestroyEnvironment(environment);
-
-    PhClearReference(&commandLine);
+    NtClose(processHandle);
+    NtClose(readHandle);
+    NtClose(jobHandle);
 
     return status;
+}
+
+/**
+ * Determines whether a distribution name can be passed to wsl.exe as a plain argument.
+ *
+ * \param Name The distribution name.
+ * \return TRUE if the name has only letters, digits, '.', '_' and '-'.
+ * \remarks wsl.exe does not remove quotes from a distribution name, so names are passed
+ * unquoted, and this check keeps a name from splitting the command line.
+ */
+BOOLEAN WslIsSafeDistroName(
+    _In_ PPH_STRING Name
+    )
+{
+    if (Name->Length == 0)
+        return FALSE;
+
+    for (SIZE_T i = 0; i < Name->Length / sizeof(WCHAR); i++)
+    {
+        WCHAR c = Name->Buffer[i];
+
+        if (!((c >= L'a' && c <= L'z') || (c >= L'A' && c <= L'Z') || (c >= L'0' && c <= L'9') || c == L'.' || c == L'_' || c == L'-'))
+            return FALSE;
+    }
+
+    return TRUE;
 }
 
 /**
@@ -512,12 +602,11 @@ NTSTATUS WslStartShell(
     PPH_STRING fileName;
     PPH_STRING commandLine;
 
-    // Distribution names cannot contain quotes, but refuse one rather than build a broken command line.
-    if (PhFindCharInStringRef(&DistroName->sr, L'"', FALSE) != SIZE_MAX)
+    if (!WslIsSafeDistroName(DistroName))
         return STATUS_INVALID_PARAMETER;
 
     fileName = WslpGetWslFileName();
-    commandLine = PhFormatString(L"\"%s\" --distribution \"%s\" --cd ~", fileName->Buffer, DistroName->Buffer);
+    commandLine = PhFormatString(L"\"%s\" --distribution %s --cd ~", fileName->Buffer, DistroName->Buffer);
 
     status = PhCreateProcessWin32Ex(
         fileName->Buffer,

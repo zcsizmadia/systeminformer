@@ -11,8 +11,9 @@
 
 #include "wsltools.h"
 
-// The tab is a two-level tree: the WSL 2 virtual machine with its distributions below it,
-// and WSL 1 distributions at the root because they do not run in the VM.
+// The tab is a tree: the WSL 2 virtual machine with its distributions below it, and WSL 1
+// distributions at the root because they do not run in the VM. Each running distribution
+// lists its Linux processes below it.
 
 typedef enum _WSL_TREE_COLUMN
 {
@@ -22,6 +23,7 @@ typedef enum _WSL_TREE_COLUMN
     WSLTNC_PID,
     WSLTNC_CPU,
     WSLTNC_PRIVATEBYTES,
+    WSLTNC_RESIDENT,
     WSLTNC_VHDSIZE,
     WSLTNC_LOCATION,
     WSLTNC_MAXIMUM
@@ -30,7 +32,8 @@ typedef enum _WSL_TREE_COLUMN
 typedef enum _WSL_NODE_TYPE
 {
     WslNodeTypeVm,
-    WslNodeTypeDistro
+    WslNodeTypeDistro,
+    WslNodeTypeLinuxProcess
 } WSL_NODE_TYPE;
 
 typedef struct _WSL_NODE
@@ -38,15 +41,19 @@ typedef struct _WSL_NODE
     PH_TREENEW_NODE Node;
     WSL_NODE_TYPE Type;
     PPH_STRING Id; // Distribution id; NULL for the VM node
-    PWSL_DISTRO_ITEM Distro; // Owned by WslCurrentSnapshot; NULL for the VM node
+    PWSL_DISTRO_ITEM Distro; // Owned by WslCurrentSnapshot; distribution nodes only
+    PWSL_LINUX_PROCESS LinuxProcess; // Owned by the distribution's frame; process nodes only
     PPH_STRING NameText; // Distribution name, followed by " *" for the default one
-    PPH_LIST Children; // VM node only
+    // VM node: its distribution nodes, which WslDistroNodes owns.
+    // Distribution node: its process nodes, which it owns.
+    PPH_LIST Children;
     BOOLEAN Seen; // Scratch flag while a snapshot is applied
 
     PH_STRINGREF TextCache[WSLTNC_MAXIMUM];
     WCHAR PidText[PH_INT32_STR_LEN_1];
     WCHAR CpuText[PH_INT32_STR_LEN_1];
     WCHAR PrivateBytesText[PH_INT64_STR_LEN_1];
+    WCHAR ResidentText[PH_INT64_STR_LEN_1];
     WCHAR VhdSizeText[PH_INT64_STR_LEN_1];
     WCHAR VersionText[PH_INT32_STR_LEN_1];
 } WSL_NODE, *PWSL_NODE;
@@ -99,14 +106,14 @@ static PWSL_NODE WslpCreateNode(
 
     if (Id)
         PhSetReference(&node->Id, Id);
-    if (Type == WslNodeTypeVm)
+    if (Type != WslNodeTypeLinuxProcess)
         node->Children = PhCreateList(4);
 
     return node;
 }
 
 /**
- * Frees a tree node. Children are not freed; they are owned by WslDistroNodes.
+ * Frees a tree node, and the process nodes of a distribution node.
  *
  * \param Node The node.
  */
@@ -114,6 +121,12 @@ static VOID WslpDestroyNode(
     _In_ PWSL_NODE Node
     )
 {
+    if (Node->Type == WslNodeTypeDistro)
+    {
+        for (ULONG i = 0; i < Node->Children->Count; i++)
+            WslpDestroyNode(Node->Children->Items[i]);
+    }
+
     PhClearReference(&Node->Id);
     PhClearReference(&Node->NameText);
     PhClearReference(&Node->Children);
@@ -152,6 +165,62 @@ static VOID WslpInvalidateNode(
 {
     memset(Node->TextCache, 0, sizeof(Node->TextCache));
     PhInvalidateTreeNewNode(&Node->Node, TN_CACHE_COLOR);
+}
+
+/**
+ * Matches the process nodes of a distribution node to the processes of its latest frame.
+ *
+ * \param DistroNode The distribution node, already pointing at its new distribution item.
+ * \remarks Processes are matched by PID and start time, so a reused PID gets a new node and
+ * selection stays on the process it was on. The lists are small, so the matching is linear.
+ */
+static VOID WslpUpdateProcessNodes(
+    _In_ PWSL_NODE DistroNode
+    )
+{
+    PPH_LIST processes = DistroNode->Distro->Processes ? DistroNode->Distro->Processes->Processes : NULL;
+    PPH_LIST children = DistroNode->Children;
+
+    for (ULONG i = 0; i < children->Count; i++)
+        ((PWSL_NODE)children->Items[i])->Seen = FALSE;
+
+    for (ULONG i = 0; processes && i < processes->Count; i++)
+    {
+        PWSL_LINUX_PROCESS process = processes->Items[i];
+        PWSL_NODE node = NULL;
+
+        for (ULONG j = 0; j < children->Count; j++)
+        {
+            PWSL_NODE child = children->Items[j];
+
+            if (child->LinuxProcess->ProcessId == process->ProcessId && child->LinuxProcess->StartTime == process->StartTime)
+            {
+                node = child;
+                break;
+            }
+        }
+
+        if (!node)
+        {
+            node = WslpCreateNode(WslNodeTypeLinuxProcess, NULL);
+            PhAddItemList(children, node);
+        }
+
+        node->LinuxProcess = process;
+        node->Seen = TRUE;
+        WslpInvalidateNode(node);
+    }
+
+    for (ULONG i = children->Count; i != 0; i--)
+    {
+        PWSL_NODE node = children->Items[i - 1];
+
+        if (!node->Seen)
+        {
+            PhRemoveItemList(children, i - 1);
+            WslpDestroyNode(node);
+        }
+    }
 }
 
 /**
@@ -196,6 +265,8 @@ VOID NTAPI WslOnSnapshotUpdated(
         else
             PhSetReference(&node->NameText, distro->Name);
 
+        WslpUpdateProcessNodes(node);
+
         if (distro->Version == 2)
             hasWsl2 = TRUE;
     }
@@ -212,7 +283,7 @@ VOID NTAPI WslOnSnapshotUpdated(
         }
     }
 
-    // The previous snapshot owned the distribution items the nodes pointed to.
+    // The previous snapshot owned the distribution items and process frames the nodes pointed to.
     PhMoveReference(&WslCurrentSnapshot, snapshot);
 
     if (hasWsl2 && !WslVmNode)
@@ -265,8 +336,8 @@ VOID WslOnProcessesUpdated(
 }
 
 /**
- * Compares two nodes for the current sort column. The VM node always sorts first,
- * so only distribution nodes reach the column comparison.
+ * Compares two nodes for the current sort column. The VM node always sorts first; the other
+ * nodes are only ever compared with nodes of their own type, because they are siblings.
  */
 static int __cdecl WslpCompareNodes(
     _In_ void *Context,
@@ -276,31 +347,67 @@ static int __cdecl WslpCompareNodes(
 {
     PWSL_NODE node1 = *(PWSL_NODE *)Elem1;
     PWSL_NODE node2 = *(PWSL_NODE *)Elem2;
-    PWSL_DISTRO_ITEM distro1 = node1->Distro;
-    PWSL_DISTRO_ITEM distro2 = node2->Distro;
     int sortResult = 0;
 
     if (node1->Type != node2->Type)
         return node1->Type == WslNodeTypeVm ? -1 : 1;
 
-    switch (WslTreeNewSortColumn)
+    if (node1->Type == WslNodeTypeLinuxProcess)
     {
-    case WSLTNC_STATE:
-        sortResult = uintcmp(distro1->State, distro2->State);
-        break;
-    case WSLTNC_VERSION:
-        sortResult = uintcmp(distro1->Version, distro2->Version);
-        break;
-    case WSLTNC_VHDSIZE:
-        sortResult = uint64cmp(distro1->VhdSize, distro2->VhdSize);
-        break;
-    case WSLTNC_LOCATION:
-        sortResult = PhCompareStringWithNull(distro1->BasePath, distro2->BasePath, TRUE);
-        break;
-    }
+        PWSL_LINUX_PROCESS process1 = node1->LinuxProcess;
+        PWSL_LINUX_PROCESS process2 = node2->LinuxProcess;
 
-    if (sortResult == 0)
-        sortResult = PhCompareString(distro1->Name, distro2->Name, TRUE);
+        switch (WslTreeNewSortColumn)
+        {
+        case WSLTNC_STATE:
+            sortResult = uintcmp(process1->State, process2->State);
+            break;
+        case WSLTNC_PID:
+            sortResult = uintcmp(process1->ProcessId, process2->ProcessId);
+            break;
+        case WSLTNC_CPU:
+            sortResult = singlecmp(process1->CpuUsage, process2->CpuUsage);
+            break;
+        case WSLTNC_RESIDENT:
+            sortResult = uint64cmp(process1->ResidentBytes, process2->ResidentBytes);
+            break;
+        }
+
+        if (sortResult == 0)
+            sortResult = PhCompareString(process1->Name, process2->Name, TRUE);
+        if (sortResult == 0)
+            sortResult = uintcmp(process1->ProcessId, process2->ProcessId);
+    }
+    else if (node1->Type == WslNodeTypeDistro)
+    {
+        PWSL_DISTRO_ITEM distro1 = node1->Distro;
+        PWSL_DISTRO_ITEM distro2 = node2->Distro;
+
+        switch (WslTreeNewSortColumn)
+        {
+        case WSLTNC_STATE:
+            sortResult = uintcmp(distro1->State, distro2->State);
+            break;
+        case WSLTNC_VERSION:
+            sortResult = uintcmp(distro1->Version, distro2->Version);
+            break;
+        case WSLTNC_CPU:
+            sortResult = singlecmp(distro1->Processes ? distro1->Processes->CpuUsage : 0, distro2->Processes ? distro2->Processes->CpuUsage : 0);
+            break;
+        case WSLTNC_RESIDENT:
+            sortResult = uint64cmp(distro1->Processes ? distro1->Processes->ResidentBytes : 0, distro2->Processes ? distro2->Processes->ResidentBytes : 0);
+            break;
+        case WSLTNC_VHDSIZE:
+            sortResult = uint64cmp(distro1->VhdSize, distro2->VhdSize);
+            break;
+        case WSLTNC_LOCATION:
+            sortResult = PhCompareStringWithNull(distro1->BasePath, distro2->BasePath, TRUE);
+            break;
+        }
+
+        if (sortResult == 0)
+            sortResult = PhCompareString(distro1->Name, distro2->Name, TRUE);
+    }
 
     return PhModifySort(sortResult, WslTreeNewSortOrder);
 }
@@ -316,6 +423,69 @@ static VOID WslpSortNodes(
 }
 
 /**
+ * Formats a cell into a node buffer.
+ *
+ * \param GetCellText The cell request.
+ * \param Format The format items.
+ * \param Count The number of format items.
+ * \param Buffer The node buffer that keeps the text alive while the cell is cached.
+ * \param BufferLength The size of the buffer, in bytes.
+ */
+static VOID WslpSetCellText(
+    _Inout_ PPH_TREENEW_GET_CELL_TEXT GetCellText,
+    _In_reads_(Count) PPH_FORMAT Format,
+    _In_ ULONG Count,
+    _Out_writes_bytes_(BufferLength) PWSTR Buffer,
+    _In_ SIZE_T BufferLength
+    )
+{
+    SIZE_T returnLength;
+
+    if (PhFormatToBuffer(Format, Count, Buffer, BufferLength, &returnLength))
+    {
+        GetCellText->Text.Buffer = Buffer;
+        GetCellText->Text.Length = returnLength - sizeof(UNICODE_NULL);
+    }
+}
+
+/**
+ * Formats a CPU usage cell, leaving it empty for idle and unknown values.
+ */
+static VOID WslpSetCpuCellText(
+    _Inout_ PPH_TREENEW_GET_CELL_TEXT GetCellText,
+    _In_ PWSL_NODE Node,
+    _In_ FLOAT CpuUsage
+    )
+{
+    PH_FORMAT format;
+
+    if (CpuUsage >= 0.0001f)
+    {
+        PhInitFormatF(&format, CpuUsage * 100, 2);
+        WslpSetCellText(GetCellText, &format, 1, Node->CpuText, sizeof(Node->CpuText));
+    }
+}
+
+/**
+ * Formats a size cell, leaving it empty for zero.
+ */
+static VOID WslpSetSizeCellText(
+    _Inout_ PPH_TREENEW_GET_CELL_TEXT GetCellText,
+    _In_ ULONG64 Size,
+    _Out_writes_bytes_(BufferLength) PWSTR Buffer,
+    _In_ SIZE_T BufferLength
+    )
+{
+    PH_FORMAT format;
+
+    if (Size != 0)
+    {
+        PhInitFormatSize(&format, Size);
+        WslpSetCellText(GetCellText, &format, 1, Buffer, BufferLength);
+    }
+}
+
+/**
  * Formats the cell text of the VM node.
  */
 static VOID WslpGetVmCellText(
@@ -324,7 +494,6 @@ static VOID WslpGetVmCellText(
     )
 {
     PPH_PROCESS_ITEM processItem = WslVmProcessItem;
-    SIZE_T returnLength;
     PH_FORMAT format;
 
     switch (GetCellText->Id)
@@ -347,37 +516,16 @@ static VOID WslpGetVmCellText(
         if (processItem)
         {
             PhInitFormatU(&format, HandleToUlong(processItem->ProcessId));
-
-            if (PhFormatToBuffer(&format, 1, Node->PidText, sizeof(Node->PidText), &returnLength))
-            {
-                GetCellText->Text.Buffer = Node->PidText;
-                GetCellText->Text.Length = returnLength - sizeof(UNICODE_NULL);
-            }
+            WslpSetCellText(GetCellText, &format, 1, Node->PidText, sizeof(Node->PidText));
         }
         break;
     case WSLTNC_CPU:
-        if (processItem && processItem->CpuUsage >= 0.0001f)
-        {
-            PhInitFormatF(&format, processItem->CpuUsage * 100, 2);
-
-            if (PhFormatToBuffer(&format, 1, Node->CpuText, sizeof(Node->CpuText), &returnLength))
-            {
-                GetCellText->Text.Buffer = Node->CpuText;
-                GetCellText->Text.Length = returnLength - sizeof(UNICODE_NULL);
-            }
-        }
+        if (processItem)
+            WslpSetCpuCellText(GetCellText, Node, processItem->CpuUsage);
         break;
     case WSLTNC_PRIVATEBYTES:
         if (processItem)
-        {
-            PhInitFormatSize(&format, processItem->VmCounters.PagefileUsage);
-
-            if (PhFormatToBuffer(&format, 1, Node->PrivateBytesText, sizeof(Node->PrivateBytesText), &returnLength))
-            {
-                GetCellText->Text.Buffer = Node->PrivateBytesText;
-                GetCellText->Text.Length = returnLength - sizeof(UNICODE_NULL);
-            }
-        }
+            WslpSetSizeCellText(GetCellText, processItem->VmCounters.PagefileUsage, Node->PrivateBytesText, sizeof(Node->PrivateBytesText));
         break;
     }
 }
@@ -391,7 +539,6 @@ static VOID WslpGetDistroCellText(
     )
 {
     PWSL_DISTRO_ITEM distro = Node->Distro;
-    SIZE_T returnLength;
     PH_FORMAT format;
 
     switch (GetCellText->Id)
@@ -406,28 +553,55 @@ static VOID WslpGetDistroCellText(
         if (distro->Version != 0)
         {
             PhInitFormatU(&format, distro->Version);
-
-            if (PhFormatToBuffer(&format, 1, Node->VersionText, sizeof(Node->VersionText), &returnLength))
-            {
-                GetCellText->Text.Buffer = Node->VersionText;
-                GetCellText->Text.Length = returnLength - sizeof(UNICODE_NULL);
-            }
+            WslpSetCellText(GetCellText, &format, 1, Node->VersionText, sizeof(Node->VersionText));
         }
         break;
+    case WSLTNC_CPU:
+        if (distro->Processes && distro->Processes->HaveCpuUsage)
+            WslpSetCpuCellText(GetCellText, Node, distro->Processes->CpuUsage);
+        break;
+    case WSLTNC_RESIDENT:
+        if (distro->Processes)
+            WslpSetSizeCellText(GetCellText, distro->Processes->ResidentBytes, Node->ResidentText, sizeof(Node->ResidentText));
+        break;
     case WSLTNC_VHDSIZE:
-        if (distro->VhdSize != 0)
-        {
-            PhInitFormatSize(&format, distro->VhdSize);
-
-            if (PhFormatToBuffer(&format, 1, Node->VhdSizeText, sizeof(Node->VhdSizeText), &returnLength))
-            {
-                GetCellText->Text.Buffer = Node->VhdSizeText;
-                GetCellText->Text.Length = returnLength - sizeof(UNICODE_NULL);
-            }
-        }
+        WslpSetSizeCellText(GetCellText, distro->VhdSize, Node->VhdSizeText, sizeof(Node->VhdSizeText));
         break;
     case WSLTNC_LOCATION:
         GetCellText->Text = PhGetStringRef(distro->BasePath);
+        break;
+    }
+}
+
+/**
+ * Formats the cell text of a Linux process node.
+ */
+static VOID WslpGetProcessCellText(
+    _In_ PWSL_NODE Node,
+    _Inout_ PPH_TREENEW_GET_CELL_TEXT GetCellText
+    )
+{
+    PWSL_LINUX_PROCESS process = Node->LinuxProcess;
+    PH_FORMAT format;
+
+    switch (GetCellText->Id)
+    {
+    case WSLTNC_NAME:
+        GetCellText->Text = PhGetStringRef(process->Name);
+        break;
+    case WSLTNC_STATE:
+        GetCellText->Text = *WslGetLinuxProcessStateText(process->State);
+        break;
+    case WSLTNC_PID:
+        PhInitFormatU(&format, process->ProcessId);
+        WslpSetCellText(GetCellText, &format, 1, Node->PidText, sizeof(Node->PidText));
+        break;
+    case WSLTNC_CPU:
+        if (process->HaveCpuUsage)
+            WslpSetCpuCellText(GetCellText, Node, process->CpuUsage);
+        break;
+    case WSLTNC_RESIDENT:
+        WslpSetSizeCellText(GetCellText, process->ResidentBytes, Node->ResidentText, sizeof(Node->ResidentText));
         break;
     }
 }
@@ -561,9 +735,11 @@ static VOID WslpHandleCommand(
             if (!node || !node->Distro)
                 break;
 
-            // Names are validated by WSL; quotes are rejected so the argument cannot be split.
-            if (PhFindCharInStringRef(&node->Distro->Name->sr, L'"', FALSE) != SIZE_MAX)
+            if (!WslIsSafeDistroName(node->Distro->Name))
+            {
+                PhShowStatus(WindowHandle, L"Unable to terminate the distribution.", STATUS_INVALID_PARAMETER, 0);
                 break;
+            }
 
             if (PhShowConfirmMessage(
                 WindowHandle,
@@ -574,7 +750,7 @@ static VOID WslpHandleCommand(
                 ))
             {
                 WslpStartAction(
-                    PhFormatString(L"--terminate \"%s\"", node->Distro->Name->Buffer),
+                    PhFormatString(L"--terminate %s", node->Distro->Name->Buffer),
                     L"Unable to terminate the distribution."
                     );
             }
@@ -659,7 +835,7 @@ static VOID WslpShowContextMenu(
         if (!WslVmProcessItem)
             PhEnableEMenuItem(menu, ID_WSL_GOTOPROCESS, FALSE);
     }
-    else
+    else if (node->Type == WslNodeTypeDistro)
     {
         PhInsertEMenuItem(menu, PhCreateEMenuItem(0, ID_WSL_OPENSHELL, L"Open &shell", NULL, NULL), ULONG_MAX);
         PhInsertEMenuItem(menu, PhCreateEMenuItem(0, ID_WSL_TERMINATE, L"&Terminate", NULL, NULL), ULONG_MAX);
@@ -672,7 +848,10 @@ static VOID WslpShowContextMenu(
             PhEnableEMenuItem(menu, ID_WSL_OPENFILELOCATION, FALSE);
     }
 
-    PhInsertEMenuItem(menu, PhCreateEMenuSeparator(), ULONG_MAX);
+    // A Linux process only offers Copy, so it needs no separator.
+    if (node->Type != WslNodeTypeLinuxProcess)
+        PhInsertEMenuItem(menu, PhCreateEMenuSeparator(), ULONG_MAX);
+
     PhInsertEMenuItem(menu, PhCreateEMenuItem(0, ID_WSL_COPY, L"&Copy\bCtrl+C", NULL, NULL), ULONG_MAX);
     PhInsertCopyCellEMenuItem(menu, ID_WSL_COPY, WindowHandle, ContextMenuEvent->Column);
 
@@ -712,7 +891,7 @@ static BOOLEAN NTAPI WslpTreeNewCallback(
 
             if (!node)
                 children = WslRootNodes;
-            else if (node->Type == WslNodeTypeVm)
+            else if (node->Children)
                 children = node->Children;
             else
                 return FALSE;
@@ -727,7 +906,7 @@ static BOOLEAN NTAPI WslpTreeNewCallback(
             PPH_TREENEW_IS_LEAF isLeaf = Parameter1;
             PWSL_NODE node = (PWSL_NODE)isLeaf->Node;
 
-            isLeaf->IsLeaf = node->Type != WslNodeTypeVm || node->Children->Count == 0;
+            isLeaf->IsLeaf = !node->Children || node->Children->Count == 0;
         }
         return TRUE;
     case TreeNewGetCellText:
@@ -737,8 +916,10 @@ static BOOLEAN NTAPI WslpTreeNewCallback(
 
             if (node->Type == WslNodeTypeVm)
                 WslpGetVmCellText(node, getCellText);
-            else
+            else if (node->Type == WslNodeTypeDistro)
                 WslpGetDistroCellText(node, getCellText);
+            else
+                WslpGetProcessCellText(node, getCellText);
 
             getCellText->Flags = TN_CACHE;
         }
@@ -752,8 +933,10 @@ static BOOLEAN NTAPI WslpTreeNewCallback(
             // Grey out what is not running, so the busy parts of WSL stand out.
             if (node->Type == WslNodeTypeVm)
                 stopped = !WslVmProcessItem;
-            else
+            else if (node->Type == WslNodeTypeDistro)
                 stopped = node->Distro->State != WslDistroStateRunning;
+            else
+                stopped = FALSE;
 
             if (stopped)
                 getNodeColor->ForeColor = GetSysColor(COLOR_GRAYTEXT);
@@ -856,8 +1039,9 @@ static VOID WslpInitializeTreeList(
     PhAddTreeNewColumn(WindowHandle, WSLTNC_PID, TRUE, L"PID", 50, PH_ALIGN_RIGHT, 3, DT_RIGHT);
     PhAddTreeNewColumn(WindowHandle, WSLTNC_CPU, TRUE, L"CPU", 45, PH_ALIGN_RIGHT, 4, DT_RIGHT);
     PhAddTreeNewColumn(WindowHandle, WSLTNC_PRIVATEBYTES, TRUE, L"Private bytes", 80, PH_ALIGN_RIGHT, 5, DT_RIGHT);
-    PhAddTreeNewColumn(WindowHandle, WSLTNC_VHDSIZE, TRUE, L"Disk file size", 80, PH_ALIGN_RIGHT, 6, DT_RIGHT);
-    PhAddTreeNewColumn(WindowHandle, WSLTNC_LOCATION, TRUE, L"Location", 300, PH_ALIGN_LEFT, 7, DT_PATH_ELLIPSIS);
+    PhAddTreeNewColumn(WindowHandle, WSLTNC_RESIDENT, TRUE, L"Resident set", 80, PH_ALIGN_RIGHT, 6, DT_RIGHT);
+    PhAddTreeNewColumn(WindowHandle, WSLTNC_VHDSIZE, TRUE, L"Disk file size", 80, PH_ALIGN_RIGHT, 7, DT_RIGHT);
+    PhAddTreeNewColumn(WindowHandle, WSLTNC_LOCATION, TRUE, L"Location", 300, PH_ALIGN_LEFT, 8, DT_PATH_ELLIPSIS);
 
     TreeNew_SetTriState(WindowHandle, TRUE);
     TreeNew_SetSort(WindowHandle, WSLTNC_NAME, AscendingSortOrder);

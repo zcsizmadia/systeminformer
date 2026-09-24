@@ -18,6 +18,7 @@ source_group("Resource Files" FILES ${RESOURCES})
 
 set(SOURCES
     "main.c"
+    "wslproc.c"
     "wslprv.c"
     "wslsys.c"
     "wsltab.c"
