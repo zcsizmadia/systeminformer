@@ -580,7 +580,7 @@ VOID WslOnProcessesUpdated(
     if (!WslTreeNewHandle || !WslTabSelected)
         return;
 
-    PhMoveReference(&WslVmProcessItem, WslReferenceVmProcessItem(&WslVmCandidates));
+    PhMoveReference(&WslVmProcessItem, WslReferenceVmProcessItem(&WslVmCandidates, NULL));
     PhMoveReference(&WslSessionVmProcessItem, WslSessionNodes->Count == 1 ? WslReferenceSessionVmProcessItem() : NULL);
 
     if (WslVmNode)
@@ -1194,8 +1194,7 @@ static VOID WslpGetSessionCellText(
         PhInitializeStringRef(&GetCellText->Text, L"Container VM");
         break;
     case WSLTNC_STATE:
-        // wslc only lists running sessions.
-        GetCellText->Text = *WslGetDistroStateText(WslDistroStateRunning);
+        GetCellText->Text = *WslGetDistroStateText(session->State);
         break;
     case WSLTNC_CPU:
         // The VM's CPU usage includes the session's own processes, not only the containers'.
@@ -1860,6 +1859,8 @@ static BOOLEAN NTAPI WslpTreeNewCallback(
                 stopped = WslpGetVmState() != WslDistroStateRunning;
             else if (node->Type == WslNodeTypeDistro)
                 stopped = node->Distro->State != WslDistroStateRunning;
+            else if (node->Type == WslNodeTypeSession)
+                stopped = node->Session->State != WslDistroStateRunning;
             else if (node->Type == WslNodeTypeContainer)
                 stopped = !node->Container->Running;
             else

@@ -676,19 +676,25 @@ VOID WslResetSessionProcesses(
 }
 
 /**
- * Lists the running WSLC sessions and their containers.
+ * Lists the WSLC sessions, and the containers of those whose VM is running.
  *
+ * \param NumberOfSessionVms The number of running session VM processes.
  * \return The sessions, or NULL if this WSL version has no wslc.exe or the session list
  * could not be read. Free the list with WslFreeSessions.
+ * \remarks A session stays listed after its VM stopped on idle, and any "--session" command
+ * starts that VM again, so containers are only queried while every session's VM is running.
+ * Nothing links a VM process to a session, so with fewer session VMs than sessions none of
+ * them is queried and their state is unknown.
  */
 PPH_LIST WslQuerySessions(
-    VOID
+    _In_ ULONG NumberOfSessionVms
     )
 {
     static CONST PH_STRINGREF sessionListArguments = PH_STRINGREF_INIT(L"system session list");
     PPH_STRING fileName;
     PPH_BYTES output;
     PPH_LIST sessions;
+    WSL_DISTRO_STATE state;
 
     if (!(fileName = WslGetWslcFileName()))
         return NULL;
@@ -699,10 +705,24 @@ PPH_LIST WslQuerySessions(
     sessions = WslpParseSessionList(output);
     PhDereferenceObject(output);
 
+    if (NumberOfSessionVms == 0)
+        state = WslDistroStateStopped;
+    else if (NumberOfSessionVms >= sessions->Count)
+        state = WslDistroStateRunning;
+    else
+        state = WslDistroStateUnknown;
+
     for (ULONG i = 0; i < sessions->Count; i++)
     {
-        WslpQuerySessionContainers(fileName, sessions->Items[i]);
-        WslpQuerySessionProcesses(fileName, sessions->Items[i]);
+        PWSL_SESSION session = sessions->Items[i];
+
+        session->State = state;
+
+        if (state != WslDistroStateRunning)
+            continue;
+
+        WslpQuerySessionContainers(fileName, session);
+        WslpQuerySessionProcesses(fileName, session);
     }
 
     WslpPruneSessionParsers();

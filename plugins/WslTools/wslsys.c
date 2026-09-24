@@ -620,7 +620,7 @@ static VOID WslpSysUpdatePanel(
     PhSetWindowText(WslSysPanelBoxes[WslSysBoxSessionVm], session ? PhaFormatString(L"VM: %s", session->Name->Buffer)->Buffer : WslSysBoxTitles[WslSysBoxSessionVm]);
     WslpSysSetVmValues(WslSysBoxSessionVm, session ? WslSysSessionVmProcessItem : NULL);
 
-    if (session)
+    if (session && session->State == WslDistroStateRunning)
     {
         ULONG running = 0;
 
@@ -628,6 +628,11 @@ static VOID WslpSysUpdatePanel(
             running += ((PWSL_CONTAINER)session->Containers->Items[i])->Running;
 
         WslpSysSetValue(WslSysBoxSessionVm, 3, PhFormatString(L"%lu running, %lu exited", running, session->Containers->Count - running));
+    }
+    else if (session)
+    {
+        // Containers are not queried while the session VM is stopped, as that would start it.
+        WslpSysSetValue(WslSysBoxSessionVm, 3, PhCreateString2(WslGetDistroStateText(session->State)));
     }
     else
     {
@@ -916,7 +921,7 @@ static BOOLEAN WslpSysSectionCallback(
     case SysInfoTick:
         {
             // The VM process comes and goes with WSL, so look it up again on every tick.
-            PhMoveReference(&WslSysVmProcessItem, WslReferenceVmProcessItem(&WslSysVmCandidates));
+            PhMoveReference(&WslSysVmProcessItem, WslReferenceVmProcessItem(&WslSysVmCandidates, NULL));
             PhMoveReference(&WslSysSessionVmProcessItem, WslReferenceSessionVmProcessItem());
 
             if (WslSysDialog)

@@ -108,6 +108,14 @@ ULONG WslGetHostProcessorCount(
     VOID
     );
 
+// The state of a distribution, or of the VM of a WSLC session.
+typedef enum _WSL_DISTRO_STATE
+{
+    WslDistroStateUnknown,
+    WslDistroStateStopped,
+    WslDistroStateRunning
+} WSL_DISTRO_STATE;
+
 // wslc.c
 
 typedef struct _WSL_CONTAINER
@@ -129,6 +137,7 @@ typedef struct _WSL_SESSION
 {
     ULONG Id;
     PPH_STRING Name; // Display name; wslc addresses sessions by it
+    WSL_DISTRO_STATE State; // Of the session VM; containers are only queried while it runs
     PPH_LIST Containers; // PWSL_CONTAINER
     NTSTATUS QueryStatus; // Result of listing the containers
     BOOLEAN HaveStats;
@@ -138,7 +147,7 @@ typedef struct _WSL_SESSION
 } WSL_SESSION, *PWSL_SESSION;
 
 PPH_LIST WslQuerySessions(
-    VOID
+    _In_ ULONG NumberOfSessionVms
     );
 
 VOID WslFreeSessions(
@@ -164,13 +173,6 @@ NTSTATUS WslStartContainerConsole(
     );
 
 // wslutil.c
-
-typedef enum _WSL_DISTRO_STATE
-{
-    WslDistroStateUnknown,
-    WslDistroStateStopped,
-    WslDistroStateRunning
-} WSL_DISTRO_STATE;
 
 typedef struct _WSL_DISTRO_ITEM
 {
@@ -290,7 +292,8 @@ BOOLEAN WslIsVmProcessName(
     );
 
 PPH_PROCESS_ITEM WslReferenceVmProcessItem(
-    _Out_opt_ PULONG NumberOfCandidates
+    _Out_opt_ PULONG NumberOfCandidates,
+    _Out_opt_ PULONG NumberOfSessionVms
     );
 
 PPH_PROCESS_ITEM WslReferenceSessionVmProcessItem(
