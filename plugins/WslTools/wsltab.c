@@ -23,9 +23,10 @@ typedef enum _WSL_TREE_COLUMN
     WSLTNC_PID,
     WSLTNC_CPU,
     WSLTNC_PRIVATEBYTES,
-    WSLTNC_RESIDENT,
     WSLTNC_VHDSIZE,
     WSLTNC_LOCATION,
+    // New columns go last: the IDs are stored in the saved column layout and sort.
+    WSLTNC_RESIDENT,
     WSLTNC_MAXIMUM
 } WSL_TREE_COLUMN;
 
@@ -62,6 +63,7 @@ typedef struct _WSL_ACTION_CONTEXT
 {
     PPH_STRING Arguments;
     PPH_STRING Description;
+    NTSTATUS Status;
 } WSL_ACTION_CONTEXT, *PWSL_ACTION_CONTEXT;
 
 static PPH_MAIN_TAB_PAGE WslPage = NULL;
@@ -108,6 +110,10 @@ static PWSL_NODE WslpCreateNode(
         PhSetReference(&node->Id, Id);
     if (Type != WslNodeTypeLinuxProcess)
         node->Children = PhCreateList(4);
+
+    // A distribution can have hundreds of processes; start collapsed to keep the overview.
+    if (Type == WslNodeTypeDistro)
+        node->Node.Expanded = FALSE;
 
     return node;
 }
@@ -167,12 +173,35 @@ static VOID WslpInvalidateNode(
     PhInvalidateTreeNewNode(&Node->Node, TN_CACHE_COLOR);
 }
 
+_Function_class_(PH_HASHTABLE_EQUAL_FUNCTION)
+static BOOLEAN NTAPI WslpProcessNodeEqualFunction(
+    _In_ PVOID Entry1,
+    _In_ PVOID Entry2
+    )
+{
+    PWSL_LINUX_PROCESS process1 = (*(PWSL_NODE *)Entry1)->LinuxProcess;
+    PWSL_LINUX_PROCESS process2 = (*(PWSL_NODE *)Entry2)->LinuxProcess;
+
+    return process1->ProcessId == process2->ProcessId && process1->StartTime == process2->StartTime;
+}
+
+_Function_class_(PH_HASHTABLE_HASH_FUNCTION)
+static ULONG NTAPI WslpProcessNodeHashFunction(
+    _In_ PVOID Entry
+    )
+{
+    PWSL_LINUX_PROCESS process = (*(PWSL_NODE *)Entry)->LinuxProcess;
+
+    return PhHashInt32(process->ProcessId) ^ PhHashInt64(process->StartTime);
+}
+
 /**
  * Matches the process nodes of a distribution node to the processes of its latest frame.
  *
  * \param DistroNode The distribution node, already pointing at its new distribution item.
  * \remarks Processes are matched by PID and start time, so a reused PID gets a new node and
- * selection stays on the process it was on. The lists are small, so the matching is linear.
+ * selection stays on the process it was on. The nodes still point at the previous frame,
+ * which the previous snapshot keeps alive until the update is done.
  */
 static VOID WslpUpdateProcessNodes(
     _In_ PWSL_NODE DistroNode
@@ -180,25 +209,30 @@ static VOID WslpUpdateProcessNodes(
 {
     PPH_LIST processes = DistroNode->Distro->Processes ? DistroNode->Distro->Processes->Processes : NULL;
     PPH_LIST children = DistroNode->Children;
+    PPH_HASHTABLE nodeTable;
+
+    nodeTable = PhCreateHashtable(sizeof(PWSL_NODE), WslpProcessNodeEqualFunction, WslpProcessNodeHashFunction, children->Count + 1);
 
     for (ULONG i = 0; i < children->Count; i++)
-        ((PWSL_NODE)children->Items[i])->Seen = FALSE;
+    {
+        PWSL_NODE child = children->Items[i];
+
+        child->Seen = FALSE;
+        PhAddEntryHashtable(nodeTable, &child);
+    }
 
     for (ULONG i = 0; processes && i < processes->Count; i++)
     {
         PWSL_LINUX_PROCESS process = processes->Items[i];
+        WSL_NODE lookupNode;
+        PWSL_NODE lookupNodePtr = &lookupNode;
+        PWSL_NODE *entry;
         PWSL_NODE node = NULL;
 
-        for (ULONG j = 0; j < children->Count; j++)
-        {
-            PWSL_NODE child = children->Items[j];
+        lookupNode.LinuxProcess = process;
 
-            if (child->LinuxProcess->ProcessId == process->ProcessId && child->LinuxProcess->StartTime == process->StartTime)
-            {
-                node = child;
-                break;
-            }
-        }
+        if (entry = PhFindEntryHashtable(nodeTable, &lookupNodePtr))
+            node = *entry;
 
         if (!node)
         {
@@ -210,6 +244,8 @@ static VOID WslpUpdateProcessNodes(
         node->Seen = TRUE;
         WslpInvalidateNode(node);
     }
+
+    PhDereferenceObject(nodeTable);
 
     for (ULONG i = children->Count; i != 0; i--)
     {
@@ -643,7 +679,7 @@ static VOID NTAPI WslpShowActionError(
 {
     PWSL_ACTION_CONTEXT context = Parameter;
 
-    PhShowStatus(SystemInformer_GetWindowHandle(), PhGetString(context->Description), STATUS_UNSUCCESSFUL, 0);
+    PhShowStatus(SystemInformer_GetWindowHandle(), PhGetString(context->Description), context->Status, 0);
 
     PhDereferenceObject(context->Arguments);
     PhDereferenceObject(context->Description);
@@ -662,6 +698,7 @@ static NTSTATUS NTAPI WslpActionThread(
     NTSTATUS status;
 
     status = WslRunCommand(&context->Arguments->sr, NULL);
+    context->Status = status;
 
     WslRefreshProvider();
 
