@@ -52,6 +52,9 @@ typedef struct _WSL_PROCESS_FRAME
     FLOAT CpuUsage; // Whole distribution, including processes that exited since the previous frame
     BOOLEAN HaveCpuUsage;
     ULONG64 ResidentBytes; // Sum over processes, so pages shared between processes count more than once
+    DOUBLE Uptime; // Seconds since the VM booted, when the frame was taken
+    ULONG64 TicksPerSecond; // Unit of WSL_LINUX_PROCESS.StartTime
+    PPH_STRING KernelRelease; // e.g. "6.18.40.1-microsoft-standard-WSL2"
 } WSL_PROCESS_FRAME, *PWSL_PROCESS_FRAME;
 
 typedef struct _WSL_COLLECTOR *PWSL_COLLECTOR;
@@ -149,6 +152,7 @@ typedef struct _WSL_DISTRO_ITEM
     PPH_STRING Name;
     PPH_STRING BasePath; // Win32 path of the distribution folder
     PPH_STRING VhdFileName; // Win32 path of the ext4 virtual disk (WSL 2 only)
+    PPH_STRING OsName; // e.g. "Ubuntu 26.04", from the Flavor and OsVersion values
     ULONG Version;
     BOOLEAN Default;
     WSL_DISTRO_STATE State;

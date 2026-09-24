@@ -63,6 +63,7 @@ VOID NTAPI WslpSnapshotDeleteProcedure(
         PhClearReference(&distro->Name);
         PhClearReference(&distro->BasePath);
         PhClearReference(&distro->VhdFileName);
+        PhClearReference(&distro->OsName);
         PhClearReference(&distro->Processes);
         PhFree(distro);
     }
@@ -152,6 +153,23 @@ static BOOLEAN NTAPI WslpEnumerateDistroCallback(
     distro->Version = PhQueryRegistryUlongZ(keyHandle, L"Version");
     distro->Default = context->DefaultId && PhEqualStringRef(&context->DefaultId->sr, &keyName, TRUE);
     distro->State = WslDistroStateUnknown;
+
+    // Flavor is lower case, e.g. "ubuntu"; show it the way the distribution names itself.
+    {
+        PPH_STRING flavor = PhQueryRegistryStringZ(keyHandle, L"Flavor");
+        PPH_STRING osVersion = PhQueryRegistryStringZ(keyHandle, L"OsVersion");
+
+        if (!PhIsNullOrEmptyString(flavor))
+        {
+            static CONST PH_STRINGREF space = PH_STRINGREF_INIT(L" ");
+
+            distro->OsName = PhIsNullOrEmptyString(osVersion) ? PhDuplicateString(flavor) : PhConcatStringRef3(&flavor->sr, &space, &osVersion->sr);
+            distro->OsName->Buffer[0] = RtlUpcaseUnicodeChar(distro->OsName->Buffer[0]);
+        }
+
+        PhClearReference(&flavor);
+        PhClearReference(&osVersion);
+    }
 
     if (basePath = PhQueryRegistryStringZ(keyHandle, L"BasePath"))
     {

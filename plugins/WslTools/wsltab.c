@@ -19,17 +19,19 @@
 typedef enum _WSL_TREE_COLUMN
 {
     WSLTNC_NAME,
+    WSLTNC_PID, // Windows PID of a VM process
+    WSLTNC_LINUXPID,
+    WSLTNC_TYPE,
     WSLTNC_STATE,
-    WSLTNC_VERSION,
-    WSLTNC_PID,
     WSLTNC_CPU,
-    WSLTNC_PRIVATEBYTES,
-    WSLTNC_VHDSIZE,
+    WSLTNC_MEMORY, // What it measures depends on the row; see WslpGetMemoryTooltip
+    WSLTNC_IMAGE, // Container image, distribution OS or VM kernel
+    WSLTNC_PORTS,
+    WSLTNC_DISK,
+    WSLTNC_STATUS, // Uptime, or a container's status
+    WSLTNC_VERSION,
     WSLTNC_LOCATION,
     // New columns go last: the IDs are stored in the saved column layout and sort.
-    WSLTNC_RESIDENT,
-    WSLTNC_MEMORY,
-    WSLTNC_IMAGE,
     WSLTNC_MAXIMUM
 } WSL_TREE_COLUMN;
 
@@ -49,10 +51,14 @@ typedef struct _WSL_NODE
     PPH_STRING Id; // Distribution id; NULL for the VM node
     PWSL_DISTRO_ITEM Distro; // Owned by WslCurrentSnapshot; distribution nodes only
     PWSL_LINUX_PROCESS LinuxProcess; // Owned by the distribution's frame; process nodes only
+    PWSL_PROCESS_FRAME Frame; // The frame LinuxProcess belongs to; process nodes only
     PWSL_SESSION Session; // Owned by WslCurrentSnapshot; session and container nodes
     PWSL_CONTAINER Container; // Owned by WslCurrentSnapshot; container nodes only
     PPH_STRING NameText; // Distribution name, followed by " *" for the default one
-    PPH_STRING TooltipText; // Container status and ports
+    PPH_STRING TooltipText; // Cached name column tooltip
+    PPH_STRING StateText; // Cached state of a container that exited, e.g. "Exited (137)"
+    PPH_STRING ImageText; // Cached "kernel <version>" of the VM
+    PPH_STRING StatusText; // Cached uptime or container status
     // VM node: its distribution nodes, which WslDistroNodes owns.
     // Distribution and session nodes: their process and container nodes, which they own.
     PPH_LIST Children;
@@ -61,8 +67,6 @@ typedef struct _WSL_NODE
     PH_STRINGREF TextCache[WSLTNC_MAXIMUM];
     WCHAR PidText[PH_INT32_STR_LEN_1];
     WCHAR CpuText[PH_INT32_STR_LEN_1];
-    WCHAR PrivateBytesText[PH_INT64_STR_LEN_1];
-    WCHAR ResidentText[PH_INT64_STR_LEN_1];
     WCHAR MemoryText[PH_INT64_STR_LEN_1];
     WCHAR VhdSizeText[PH_INT64_STR_LEN_1];
     WCHAR VersionText[PH_INT32_STR_LEN_1];
@@ -91,7 +95,7 @@ static PPH_PROCESS_ITEM WslVmProcessItem = NULL;
 static ULONG WslVmCandidates = 0;
 
 static CONST PH_STRINGREF WslPageText = PH_STRINGREF_INIT(L"WSL");
-static CONST PH_STRINGREF WslVmNodeText = PH_STRINGREF_INIT(L"WSL 2 virtual machine");
+static CONST PH_STRINGREF WslVmNodeText = PH_STRINGREF_INIT(L"WSL");
 static CONST PH_STRINGREF WslEmptyText = PH_STRINGREF_INIT(L"No WSL distributions are registered for this user.");
 static CONST PH_STRINGREF WslAmbiguousVmText = PH_STRINGREF_INIT(L"Several virtual machine processes exist; the WSL one cannot be identified.");
 static CONST PH_STRINGREF WslDefaultMarker = PH_STRINGREF_INIT(L" *");
@@ -147,6 +151,9 @@ static VOID WslpDestroyNode(
     PhClearReference(&Node->Id);
     PhClearReference(&Node->NameText);
     PhClearReference(&Node->TooltipText);
+    PhClearReference(&Node->StateText);
+    PhClearReference(&Node->ImageText);
+    PhClearReference(&Node->StatusText);
     PhClearReference(&Node->Children);
     PhFree(Node);
 }
@@ -183,6 +190,9 @@ static VOID WslpInvalidateNode(
 {
     memset(Node->TextCache, 0, sizeof(Node->TextCache));
     PhClearReference(&Node->TooltipText);
+    PhClearReference(&Node->StateText);
+    PhClearReference(&Node->ImageText);
+    PhClearReference(&Node->StatusText);
     PhInvalidateTreeNewNode(&Node->Node, TN_CACHE_COLOR);
 }
 
@@ -254,6 +264,7 @@ static VOID WslpUpdateProcessNodes(
         }
 
         node->LinuxProcess = process;
+        node->Frame = DistroNode->Distro->Processes;
         node->Seen = TRUE;
         WslpInvalidateNode(node);
     }
@@ -310,6 +321,13 @@ static VOID WslpUpdateSessionNodes(
 
         sessionNode->Session = session;
         sessionNode->Seen = TRUE;
+
+        if (!sessionNode->NameText)
+        {
+            static CONST PH_STRINGREF prefix = PH_STRINGREF_INIT(L"WSLC: ");
+
+            sessionNode->NameText = PhConcatStringRef2(&prefix, &session->Name->sr);
+        }
         WslpInvalidateNode(sessionNode);
 
         for (ULONG j = 0; j < sessionNode->Children->Count; j++)
@@ -486,6 +504,153 @@ VOID WslOnProcessesUpdated(
 }
 
 /**
+ * Gets the memory value of a node for the Memory column.
+ */
+static ULONG64 WslpGetNodeMemory(
+    _In_ PWSL_NODE Node
+    )
+{
+    switch (Node->Type)
+    {
+    case WslNodeTypeVm:
+        return WslVmProcessItem ? WslVmProcessItem->VmCounters.PagefileUsage : 0;
+    case WslNodeTypeDistro:
+        return Node->Distro->Processes ? Node->Distro->Processes->ResidentBytes : 0;
+    case WslNodeTypeLinuxProcess:
+        return Node->LinuxProcess->ResidentBytes;
+    case WslNodeTypeSession:
+        return Node->Session->HaveStats ? Node->Session->MemoryBytes : 0;
+    case WslNodeTypeContainer:
+        return Node->Container->HaveStats ? Node->Container->MemoryBytes : 0;
+    }
+
+    return 0;
+}
+
+/**
+ * Gets what the Memory column measures for a node, for its tooltip.
+ */
+static PCPH_STRINGREF WslpGetMemoryTooltip(
+    _In_ PWSL_NODE Node
+    )
+{
+    static CONST PH_STRINGREF vmText = PH_STRINGREF_INIT(L"Private bytes of the VM process: the memory the VM holds on the host.");
+    static CONST PH_STRINGREF distroText = PH_STRINGREF_INIT(L"Sum of the resident sets of the distribution's processes. Shared pages are counted once per process.");
+    static CONST PH_STRINGREF processText = PH_STRINGREF_INIT(L"Resident set of the Linux process.");
+    static CONST PH_STRINGREF containerText = PH_STRINGREF_INIT(L"Memory usage as reported by wslc stats.");
+    static CONST PH_STRINGREF sessionText = PH_STRINGREF_INIT(L"Sum of the memory usage of the session's running containers.");
+
+    switch (Node->Type)
+    {
+    case WslNodeTypeVm:
+        return &vmText;
+    case WslNodeTypeDistro:
+        return &distroText;
+    case WslNodeTypeLinuxProcess:
+        return &processText;
+    case WslNodeTypeSession:
+        return &sessionText;
+    default:
+        return &containerText;
+    }
+}
+
+/**
+ * Gets how long a Linux process has been running.
+ *
+ * \param Frame The frame the process is from.
+ * \param StartTime The process start time, in clock ticks after boot.
+ * \return The run time in PH ticks (100 ns), or 0 if unknown.
+ */
+static ULONG64 WslpGetLinuxRunTime(
+    _In_ PWSL_PROCESS_FRAME Frame,
+    _In_ ULONG64 StartTime
+    )
+{
+    DOUBLE seconds;
+
+    if (Frame->TicksPerSecond == 0)
+        return 0;
+
+    seconds = Frame->Uptime - (DOUBLE)StartTime / Frame->TicksPerSecond;
+
+    return seconds > 0 ? (ULONG64)(seconds * PH_TICKS_PER_SEC) : 0;
+}
+
+/**
+ * Gets how long a distribution has been running, from the start time of its init (PID 1).
+ */
+static ULONG64 WslpGetDistroRunTime(
+    _In_ PWSL_DISTRO_ITEM Distro
+    )
+{
+    if (!Distro->Processes || Distro->State != WslDistroStateRunning)
+        return 0;
+
+    for (ULONG i = 0; i < Distro->Processes->Processes->Count; i++)
+    {
+        PWSL_LINUX_PROCESS process = Distro->Processes->Processes->Items[i];
+
+        if (process->ProcessId == 1)
+            return WslpGetLinuxRunTime(Distro->Processes, process->StartTime);
+    }
+
+    return 0;
+}
+
+/**
+ * Gets the display state of a container. An exited container shows its exit code, which
+ * wslc only puts in the status text, e.g. "Exited (137) 2 days ago".
+ */
+static PPH_STRING WslpGetContainerStateText(
+    _In_ PWSL_CONTAINER Container
+    )
+{
+    static CONST PH_STRINGREF exitedPrefix = PH_STRINGREF_INIT(L"Exited (");
+    ULONG_PTR close;
+
+    if (!Container->Running && Container->Status &&
+        PhStartsWithStringRef(&Container->Status->sr, &exitedPrefix, TRUE) &&
+        (close = PhFindCharInStringRef(&Container->Status->sr, L')', FALSE)) != SIZE_MAX)
+    {
+        PH_STRINGREF state;
+
+        state.Buffer = Container->Status->Buffer;
+        state.Length = (close + 1) * sizeof(WCHAR);
+
+        return PhCreateString2(&state);
+    }
+
+    return Container->State ? PhReferenceObject(Container->State) : PhReferenceEmptyString();
+}
+
+/**
+ * Gets the kernel version shown for the VM, e.g. "kernel 6.18.40.1", from the kernel release
+ * a process collector reported. The suffix after the version ("-microsoft-standard-WSL2")
+ * is left out.
+ */
+static PPH_STRING WslpGetKernelText(
+    VOID
+    )
+{
+    for (ULONG i = 0; i < WslDistroNodes->Count; i++)
+    {
+        PWSL_DISTRO_ITEM distro = ((PWSL_NODE)WslDistroNodes->Items[i])->Distro;
+        PH_STRINGREF version;
+        PH_STRINGREF rest;
+
+        if (distro->Version != 2 || !distro->Processes || !distro->Processes->KernelRelease)
+            continue;
+
+        PhSplitStringRefAtChar(&distro->Processes->KernelRelease->sr, L'-', &version, &rest);
+
+        return PhCreateString2(&version);
+    }
+
+    return NULL;
+}
+
+/**
  * Compares two nodes for the current sort column.
  *
  * \remarks Siblings of different types, e.g. the VM, WSL 1 distributions and sessions at the
@@ -504,7 +669,11 @@ static int __cdecl WslpCompareNodes(
     if (node1->Type != node2->Type)
         return intcmp(node1->Type, node2->Type);
 
-    if (node1->Type == WslNodeTypeLinuxProcess)
+    if (WslTreeNewSortColumn == WSLTNC_MEMORY)
+    {
+        sortResult = uint64cmp(WslpGetNodeMemory(node1), WslpGetNodeMemory(node2));
+    }
+    else if (node1->Type == WslNodeTypeLinuxProcess)
     {
         PWSL_LINUX_PROCESS process1 = node1->LinuxProcess;
         PWSL_LINUX_PROCESS process2 = node2->LinuxProcess;
@@ -514,14 +683,15 @@ static int __cdecl WslpCompareNodes(
         case WSLTNC_STATE:
             sortResult = uintcmp(process1->State, process2->State);
             break;
-        case WSLTNC_PID:
+        case WSLTNC_LINUXPID:
             sortResult = uintcmp(process1->ProcessId, process2->ProcessId);
             break;
         case WSLTNC_CPU:
             sortResult = singlecmp(process1->CpuUsage, process2->CpuUsage);
             break;
-        case WSLTNC_RESIDENT:
-            sortResult = uint64cmp(process1->ResidentBytes, process2->ResidentBytes);
+        case WSLTNC_STATUS:
+            // Longest running first in ascending order, like the other uptime columns.
+            sortResult = uint64cmp(process2->StartTime, process1->StartTime);
             break;
         }
 
@@ -540,17 +710,21 @@ static int __cdecl WslpCompareNodes(
         case WSLTNC_STATE:
             sortResult = uintcmp(distro1->State, distro2->State);
             break;
+        case WSLTNC_TYPE:
         case WSLTNC_VERSION:
             sortResult = uintcmp(distro1->Version, distro2->Version);
             break;
         case WSLTNC_CPU:
             sortResult = singlecmp(distro1->Processes ? distro1->Processes->CpuUsage : 0, distro2->Processes ? distro2->Processes->CpuUsage : 0);
             break;
-        case WSLTNC_RESIDENT:
-            sortResult = uint64cmp(distro1->Processes ? distro1->Processes->ResidentBytes : 0, distro2->Processes ? distro2->Processes->ResidentBytes : 0);
+        case WSLTNC_IMAGE:
+            sortResult = PhCompareStringWithNull(distro1->OsName, distro2->OsName, TRUE);
             break;
-        case WSLTNC_VHDSIZE:
+        case WSLTNC_DISK:
             sortResult = uint64cmp(distro1->VhdSize, distro2->VhdSize);
+            break;
+        case WSLTNC_STATUS:
+            sortResult = uint64cmp(WslpGetDistroRunTime(distro1), WslpGetDistroRunTime(distro2));
             break;
         case WSLTNC_LOCATION:
             sortResult = PhCompareStringWithNull(distro1->BasePath, distro2->BasePath, TRUE);
@@ -573,11 +747,14 @@ static int __cdecl WslpCompareNodes(
         case WSLTNC_CPU:
             sortResult = singlecmp(container1->CpuUsage, container2->CpuUsage);
             break;
-        case WSLTNC_MEMORY:
-            sortResult = uint64cmp(container1->MemoryBytes, container2->MemoryBytes);
-            break;
         case WSLTNC_IMAGE:
             sortResult = PhCompareStringWithNull(container1->Image, container2->Image, TRUE);
+            break;
+        case WSLTNC_PORTS:
+            sortResult = PhCompareStringWithNull(container1->Ports, container2->Ports, TRUE);
+            break;
+        case WSLTNC_STATUS:
+            sortResult = PhCompareStringWithNull(container1->Status, container2->Status, TRUE);
             break;
         }
 
@@ -629,6 +806,21 @@ static VOID WslpSetCellText(
 }
 
 /**
+ * Formats a number cell, e.g. a PID.
+ */
+static VOID WslpSetNumberCellText(
+    _Inout_ PPH_TREENEW_GET_CELL_TEXT GetCellText,
+    _In_ PWSL_NODE Node,
+    _In_ ULONG Number
+    )
+{
+    PH_FORMAT format;
+
+    PhInitFormatU(&format, Number);
+    WslpSetCellText(GetCellText, &format, 1, Node->PidText, sizeof(Node->PidText));
+}
+
+/**
  * Formats a CPU usage cell, leaving it empty for idle and unknown values.
  */
 static VOID WslpSetCpuCellText(
@@ -666,11 +858,55 @@ static VOID WslpSetSizeCellText(
 }
 
 /**
+ * Formats an uptime cell in one unit, e.g. "15 minutes", leaving it empty when unknown.
+ *
+ * \remarks One unit, as in the container status that wslc prints ("Up 3 minutes"), so the
+ * column reads the same for every row.
+ */
+static VOID WslpSetUptimeCellText(
+    _Inout_ PPH_TREENEW_GET_CELL_TEXT GetCellText,
+    _In_ PWSL_NODE Node,
+    _In_ ULONG64 RunTime
+    )
+{
+    ULONG64 seconds = RunTime / PH_TICKS_PER_SEC;
+    ULONG64 value;
+    PCWSTR unit;
+
+    if (RunTime == 0)
+        return;
+
+    if (seconds < 60)
+    {
+        value = seconds;
+        unit = value == 1 ? L"second" : L"seconds";
+    }
+    else if (seconds < 60 * 60)
+    {
+        value = seconds / 60;
+        unit = value == 1 ? L"minute" : L"minutes";
+    }
+    else if (seconds < 48 * 60 * 60)
+    {
+        value = seconds / (60 * 60);
+        unit = value == 1 ? L"hour" : L"hours";
+    }
+    else
+    {
+        value = seconds / (24 * 60 * 60);
+        unit = L"days";
+    }
+
+    PhMoveReference(&Node->StatusText, PhFormatString(L"%I64u %s", value, unit));
+    GetCellText->Text = Node->StatusText->sr;
+}
+
+/**
  * Gets the state of the WSL 2 VM.
  *
- * \remarks With a single VM process, that process decides. On Windows 10 every VM process,
- * WSLC sessions included, is called vmmem, so with several of them the VM is running exactly
- * when a WSL 2 distribution is, and otherwise its state is unknown.
+ * \remarks With the VM process identified, that process decides. Otherwise the VM is running
+ * exactly when a WSL 2 distribution is, and its state is unknown when several VM processes
+ * exist that could not be told apart.
  */
 static WSL_DISTRO_STATE WslpGetVmState(
     VOID
@@ -699,33 +935,54 @@ static VOID WslpGetVmCellText(
     )
 {
     PPH_PROCESS_ITEM processItem = WslVmProcessItem;
-    PH_FORMAT format;
 
     switch (GetCellText->Id)
     {
     case WSLTNC_NAME:
         GetCellText->Text = WslVmNodeText;
         break;
-    case WSLTNC_STATE:
-        GetCellText->Text = *WslGetDistroStateText(WslpGetVmState());
-        break;
-    case WSLTNC_VERSION:
-        PhInitializeStringRef(&GetCellText->Text, L"2");
-        break;
     case WSLTNC_PID:
         if (processItem)
-        {
-            PhInitFormatU(&format, HandleToUlong(processItem->ProcessId));
-            WslpSetCellText(GetCellText, &format, 1, Node->PidText, sizeof(Node->PidText));
-        }
+            WslpSetNumberCellText(GetCellText, Node, HandleToUlong(processItem->ProcessId));
+        break;
+    case WSLTNC_TYPE:
+        PhInitializeStringRef(&GetCellText->Text, L"Utility VM");
+        break;
+    case WSLTNC_STATE:
+        GetCellText->Text = *WslGetDistroStateText(WslpGetVmState());
         break;
     case WSLTNC_CPU:
         if (processItem)
             WslpSetCpuCellText(GetCellText, Node, processItem->CpuUsage);
         break;
-    case WSLTNC_PRIVATEBYTES:
+    case WSLTNC_MEMORY:
+        WslpSetSizeCellText(GetCellText, WslpGetNodeMemory(Node), Node->MemoryText, sizeof(Node->MemoryText));
+        break;
+    case WSLTNC_IMAGE:
+        {
+            PPH_STRING kernel;
+
+            if (WslpGetVmState() == WslDistroStateRunning && (kernel = WslpGetKernelText()))
+            {
+                static CONST PH_STRINGREF prefix = PH_STRINGREF_INIT(L"kernel ");
+
+                PhMoveReference(&Node->ImageText, PhConcatStringRef2(&prefix, &kernel->sr));
+                GetCellText->Text = Node->ImageText->sr;
+                PhDereferenceObject(kernel);
+            }
+        }
+        break;
+    case WSLTNC_STATUS:
         if (processItem)
-            WslpSetSizeCellText(GetCellText, processItem->VmCounters.PagefileUsage, Node->PrivateBytesText, sizeof(Node->PrivateBytesText));
+        {
+            LARGE_INTEGER now;
+
+            PhQuerySystemTime(&now);
+            WslpSetUptimeCellText(GetCellText, Node, now.QuadPart > processItem->CreateTime.QuadPart ? now.QuadPart - processItem->CreateTime.QuadPart : 0);
+        }
+        break;
+    case WSLTNC_VERSION:
+        PhInitializeStringRef(&GetCellText->Text, L"2");
         break;
     }
 }
@@ -746,8 +1003,30 @@ static VOID WslpGetDistroCellText(
     case WSLTNC_NAME:
         GetCellText->Text = PhGetStringRef(Node->NameText);
         break;
+    case WSLTNC_TYPE:
+        if (distro->Version == 1)
+            PhInitializeStringRef(&GetCellText->Text, L"Distribution (WSL 1)");
+        else
+            PhInitializeStringRef(&GetCellText->Text, L"Distribution");
+        break;
     case WSLTNC_STATE:
         GetCellText->Text = *WslGetDistroStateText(distro->State);
+        break;
+    case WSLTNC_CPU:
+        if (distro->Processes && distro->Processes->HaveCpuUsage)
+            WslpSetCpuCellText(GetCellText, Node, distro->Processes->CpuUsage);
+        break;
+    case WSLTNC_MEMORY:
+        WslpSetSizeCellText(GetCellText, WslpGetNodeMemory(Node), Node->MemoryText, sizeof(Node->MemoryText));
+        break;
+    case WSLTNC_IMAGE:
+        GetCellText->Text = PhGetStringRef(distro->OsName);
+        break;
+    case WSLTNC_DISK:
+        WslpSetSizeCellText(GetCellText, distro->VhdSize, Node->VhdSizeText, sizeof(Node->VhdSizeText));
+        break;
+    case WSLTNC_STATUS:
+        WslpSetUptimeCellText(GetCellText, Node, WslpGetDistroRunTime(distro));
         break;
     case WSLTNC_VERSION:
         if (distro->Version != 0)
@@ -755,17 +1034,6 @@ static VOID WslpGetDistroCellText(
             PhInitFormatU(&format, distro->Version);
             WslpSetCellText(GetCellText, &format, 1, Node->VersionText, sizeof(Node->VersionText));
         }
-        break;
-    case WSLTNC_CPU:
-        if (distro->Processes && distro->Processes->HaveCpuUsage)
-            WslpSetCpuCellText(GetCellText, Node, distro->Processes->CpuUsage);
-        break;
-    case WSLTNC_RESIDENT:
-        if (distro->Processes)
-            WslpSetSizeCellText(GetCellText, distro->Processes->ResidentBytes, Node->ResidentText, sizeof(Node->ResidentText));
-        break;
-    case WSLTNC_VHDSIZE:
-        WslpSetSizeCellText(GetCellText, distro->VhdSize, Node->VhdSizeText, sizeof(Node->VhdSizeText));
         break;
     case WSLTNC_LOCATION:
         GetCellText->Text = PhGetStringRef(distro->BasePath);
@@ -778,30 +1046,35 @@ static VOID WslpGetDistroCellText(
  */
 static VOID WslpGetProcessCellText(
     _In_ PWSL_NODE Node,
+    _In_ PWSL_PROCESS_FRAME Frame,
     _Inout_ PPH_TREENEW_GET_CELL_TEXT GetCellText
     )
 {
     PWSL_LINUX_PROCESS process = Node->LinuxProcess;
-    PH_FORMAT format;
 
     switch (GetCellText->Id)
     {
     case WSLTNC_NAME:
         GetCellText->Text = PhGetStringRef(process->Name);
         break;
+    case WSLTNC_LINUXPID:
+        WslpSetNumberCellText(GetCellText, Node, process->ProcessId);
+        break;
+    case WSLTNC_TYPE:
+        PhInitializeStringRef(&GetCellText->Text, L"Linux process");
+        break;
     case WSLTNC_STATE:
         GetCellText->Text = *WslGetLinuxProcessStateText(process->State);
-        break;
-    case WSLTNC_PID:
-        PhInitFormatU(&format, process->ProcessId);
-        WslpSetCellText(GetCellText, &format, 1, Node->PidText, sizeof(Node->PidText));
         break;
     case WSLTNC_CPU:
         if (process->HaveCpuUsage)
             WslpSetCpuCellText(GetCellText, Node, process->CpuUsage);
         break;
-    case WSLTNC_RESIDENT:
-        WslpSetSizeCellText(GetCellText, process->ResidentBytes, Node->ResidentText, sizeof(Node->ResidentText));
+    case WSLTNC_MEMORY:
+        WslpSetSizeCellText(GetCellText, process->ResidentBytes, Node->MemoryText, sizeof(Node->MemoryText));
+        break;
+    case WSLTNC_STATUS:
+        WslpSetUptimeCellText(GetCellText, Node, WslpGetLinuxRunTime(Frame, process->StartTime));
         break;
     }
 }
@@ -819,22 +1092,21 @@ static VOID WslpGetSessionCellText(
     switch (GetCellText->Id)
     {
     case WSLTNC_NAME:
-        GetCellText->Text = PhGetStringRef(session->Name);
+        GetCellText->Text = PhGetStringRef(Node->NameText);
+        break;
+    case WSLTNC_TYPE:
+        PhInitializeStringRef(&GetCellText->Text, L"Container VM");
         break;
     case WSLTNC_STATE:
         // wslc only lists running sessions.
         GetCellText->Text = *WslGetDistroStateText(WslDistroStateRunning);
-        break;
-    case WSLTNC_VERSION:
-        PhInitializeStringRef(&GetCellText->Text, L"WSLC");
         break;
     case WSLTNC_CPU:
         if (session->HaveStats)
             WslpSetCpuCellText(GetCellText, Node, session->CpuUsage);
         break;
     case WSLTNC_MEMORY:
-        if (session->HaveStats)
-            WslpSetSizeCellText(GetCellText, session->MemoryBytes, Node->MemoryText, sizeof(Node->MemoryText));
+        WslpSetSizeCellText(GetCellText, WslpGetNodeMemory(Node), Node->MemoryText, sizeof(Node->MemoryText));
         break;
     }
 }
@@ -854,19 +1126,28 @@ static VOID WslpGetContainerCellText(
     case WSLTNC_NAME:
         GetCellText->Text = PhGetStringRef(container->Name);
         break;
+    case WSLTNC_TYPE:
+        PhInitializeStringRef(&GetCellText->Text, L"Container");
+        break;
     case WSLTNC_STATE:
-        GetCellText->Text = PhGetStringRef(container->State);
+        PhMoveReference(&Node->StateText, WslpGetContainerStateText(container));
+        GetCellText->Text = Node->StateText->sr;
         break;
     case WSLTNC_CPU:
         if (container->HaveStats)
             WslpSetCpuCellText(GetCellText, Node, container->CpuUsage);
         break;
     case WSLTNC_MEMORY:
-        if (container->HaveStats)
-            WslpSetSizeCellText(GetCellText, container->MemoryBytes, Node->MemoryText, sizeof(Node->MemoryText));
+        WslpSetSizeCellText(GetCellText, WslpGetNodeMemory(Node), Node->MemoryText, sizeof(Node->MemoryText));
         break;
     case WSLTNC_IMAGE:
         GetCellText->Text = PhGetStringRef(container->Image);
+        break;
+    case WSLTNC_PORTS:
+        GetCellText->Text = PhGetStringRef(container->Ports);
+        break;
+    case WSLTNC_STATUS:
+        GetCellText->Text = PhGetStringRef(container->Status);
         break;
     }
 }
@@ -1251,7 +1532,7 @@ static BOOLEAN NTAPI WslpTreeNewCallback(
             else if (node->Type == WslNodeTypeDistro)
                 WslpGetDistroCellText(node, getCellText);
             else if (node->Type == WslNodeTypeLinuxProcess)
-                WslpGetProcessCellText(node, getCellText);
+                WslpGetProcessCellText(node, node->Frame, getCellText);
             else if (node->Type == WslNodeTypeSession)
                 WslpGetSessionCellText(node, getCellText);
             else
@@ -1286,6 +1567,14 @@ static BOOLEAN NTAPI WslpTreeNewCallback(
         {
             PPH_TREENEW_GET_CELL_TOOLTIP getCellTooltip = Parameter1;
             PWSL_NODE node = (PWSL_NODE)getCellTooltip->Node;
+
+            if (getCellTooltip->Column->Id == WSLTNC_MEMORY)
+            {
+                getCellTooltip->Text = *WslpGetMemoryTooltip(node);
+                getCellTooltip->Unfolding = FALSE;
+                getCellTooltip->MaximumWidth = ULONG_MAX;
+                return TRUE;
+            }
 
             if (getCellTooltip->Column->Id != WSLTNC_NAME)
                 return FALSE;
@@ -1392,16 +1681,18 @@ static VOID WslpInitializeTreeList(
     TreeNew_SetEmptyText(WindowHandle, &WslEmptyText, 0);
 
     PhAddTreeNewColumn(WindowHandle, WSLTNC_NAME, TRUE, L"Name", 200, PH_ALIGN_LEFT, 0, 0);
-    PhAddTreeNewColumn(WindowHandle, WSLTNC_STATE, TRUE, L"State", 70, PH_ALIGN_LEFT, 1, 0);
-    PhAddTreeNewColumn(WindowHandle, WSLTNC_VERSION, TRUE, L"Version", 50, PH_ALIGN_RIGHT, 2, DT_RIGHT);
-    PhAddTreeNewColumn(WindowHandle, WSLTNC_PID, TRUE, L"PID", 50, PH_ALIGN_RIGHT, 3, DT_RIGHT);
-    PhAddTreeNewColumn(WindowHandle, WSLTNC_CPU, TRUE, L"CPU", 45, PH_ALIGN_RIGHT, 4, DT_RIGHT);
-    PhAddTreeNewColumn(WindowHandle, WSLTNC_PRIVATEBYTES, TRUE, L"Private bytes", 80, PH_ALIGN_RIGHT, 5, DT_RIGHT);
-    PhAddTreeNewColumn(WindowHandle, WSLTNC_RESIDENT, TRUE, L"Resident set", 80, PH_ALIGN_RIGHT, 6, DT_RIGHT);
-    PhAddTreeNewColumn(WindowHandle, WSLTNC_MEMORY, TRUE, L"Memory", 80, PH_ALIGN_RIGHT, 7, DT_RIGHT);
-    PhAddTreeNewColumn(WindowHandle, WSLTNC_IMAGE, TRUE, L"Image", 120, PH_ALIGN_LEFT, 8, 0);
-    PhAddTreeNewColumn(WindowHandle, WSLTNC_VHDSIZE, TRUE, L"Disk file size", 80, PH_ALIGN_RIGHT, 9, DT_RIGHT);
-    PhAddTreeNewColumn(WindowHandle, WSLTNC_LOCATION, TRUE, L"Location", 300, PH_ALIGN_LEFT, 10, DT_PATH_ELLIPSIS);
+    PhAddTreeNewColumn(WindowHandle, WSLTNC_PID, TRUE, L"PID", 50, PH_ALIGN_RIGHT, 1, DT_RIGHT);
+    PhAddTreeNewColumn(WindowHandle, WSLTNC_LINUXPID, TRUE, L"PID (Linux)", 75, PH_ALIGN_RIGHT, 2, DT_RIGHT);
+    PhAddTreeNewColumn(WindowHandle, WSLTNC_TYPE, TRUE, L"Type", 90, PH_ALIGN_LEFT, 3, 0);
+    PhAddTreeNewColumn(WindowHandle, WSLTNC_STATE, TRUE, L"State", 90, PH_ALIGN_LEFT, 4, 0);
+    PhAddTreeNewColumn(WindowHandle, WSLTNC_CPU, TRUE, L"CPU", 45, PH_ALIGN_RIGHT, 5, DT_RIGHT);
+    PhAddTreeNewColumn(WindowHandle, WSLTNC_MEMORY, TRUE, L"Memory", 80, PH_ALIGN_RIGHT, 6, DT_RIGHT);
+    PhAddTreeNewColumn(WindowHandle, WSLTNC_IMAGE, TRUE, L"Image / OS", 120, PH_ALIGN_LEFT, 7, 0);
+    PhAddTreeNewColumn(WindowHandle, WSLTNC_PORTS, TRUE, L"Ports", 130, PH_ALIGN_LEFT, 8, 0);
+    PhAddTreeNewColumn(WindowHandle, WSLTNC_DISK, TRUE, L"Disk", 70, PH_ALIGN_RIGHT, 9, DT_RIGHT);
+    PhAddTreeNewColumn(WindowHandle, WSLTNC_STATUS, TRUE, L"Uptime / Status", 120, PH_ALIGN_LEFT, 10, 0);
+    PhAddTreeNewColumn(WindowHandle, WSLTNC_VERSION, FALSE, L"Version", 50, PH_ALIGN_RIGHT, ULONG_MAX, DT_RIGHT);
+    PhAddTreeNewColumn(WindowHandle, WSLTNC_LOCATION, FALSE, L"Location", 300, PH_ALIGN_LEFT, ULONG_MAX, DT_PATH_ELLIPSIS);
 
     TreeNew_SetTriState(WindowHandle, TRUE);
     TreeNew_SetSort(WindowHandle, WSLTNC_NAME, AscendingSortOrder);

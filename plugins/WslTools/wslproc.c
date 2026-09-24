@@ -25,10 +25,11 @@
 #define WSL_PROCESS_SCRIPT \
     L"t=$(getconf CLK_TCK 2>/dev/null || echo 100); " \
     L"p=$(getconf PAGESIZE 2>/dev/null || echo 4096); " \
+    L"read k < /proc/sys/kernel/osrelease; " \
     L"s=1; " \
     L"while :; do " \
     L"read u i < /proc/uptime; " \
-    L"echo @ $u $t $p $$; " \
+    L"echo @ $u $t $p $$ $k; " \
     L"cat /proc/[0-9]*/stat 2>/dev/null; " \
     L"echo @end; " \
     L"sleep $s; " \
@@ -88,6 +89,7 @@ typedef struct _WSL_COLLECTOR
     ULONG64 TicksPerSecond;
     ULONG64 PageSize;
     ULONG SelfProcessId;
+    PPH_STRING KernelRelease;
     ULONG FrameCount; // Complete frames so far, counted up to 2
     BOOLEAN InFrame;
 } WSL_COLLECTOR, *PWSL_COLLECTOR;
@@ -114,6 +116,7 @@ static VOID NTAPI WslpProcessFrameDeleteProcedure(
     }
 
     PhDereferenceObject(frame->Processes);
+    PhClearReference(&frame->KernelRelease);
 }
 
 /**
@@ -201,7 +204,7 @@ PCPH_STRINGREF WslGetLinuxProcessStateText(
 }
 
 /**
- * Parses a frame header, "@ <uptime> <ticks per second> <page size> <shell pid>".
+ * Parses a frame header, "@ <uptime> <ticks per second> <page size> <shell pid> <kernel release>".
  *
  * \remarks A process name can contain a newline, so a line that only starts like a header
  * can be the tail of a stat line. The rest of that stat line always follows the name on the
@@ -237,6 +240,14 @@ static BOOLEAN WslpParseHeader(
         return FALSE;
 
     Collector->SelfProcessId = (ULONG)value;
+
+    PhSplitStringRefAtChar(&Line, L' ', &part, &Line);
+
+    if (part.Length == 0)
+        return FALSE;
+
+    if (!Collector->KernelRelease || !PhEqualStringRef(&Collector->KernelRelease->sr, &part, FALSE))
+        PhMoveReference(&Collector->KernelRelease, PhCreateString2(&part));
 
     return Line.Length == 0;
 }
@@ -402,6 +413,9 @@ static VOID WslpCompleteFrame(
     frame = PhCreateObject(sizeof(WSL_PROCESS_FRAME), WslpProcessFrameType);
     memset(frame, 0, sizeof(WSL_PROCESS_FRAME));
     frame->Processes = PhCreateList(Collector->Entries->Count);
+    frame->Uptime = Collector->Uptime;
+    frame->TicksPerSecond = Collector->TicksPerSecond;
+    PhSetReference(&frame->KernelRelease, Collector->KernelRelease);
     samples = PhCreateHashtable(sizeof(WSL_CPU_SAMPLE), WslpCpuSampleEqualFunction, WslpCpuSampleHashFunction, Collector->Entries->Count);
 
     for (ULONG i = 0; i < Collector->Entries->Count; i++)
@@ -691,6 +705,7 @@ VOID WslStopCollector(
     PhClearReference(&Collector->Frame);
     PhClearReference(&Collector->PreviousSamples);
     PhClearReference(&Collector->Entries);
+    PhClearReference(&Collector->KernelRelease);
     PhClearReference(&Collector->DistroName);
     PhFree(Collector);
 }
