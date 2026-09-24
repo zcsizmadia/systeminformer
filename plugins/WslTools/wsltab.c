@@ -1359,6 +1359,17 @@ static VOID WslpHandleCommand(
                 PhShowStatus(WindowHandle, Id == ID_WSL_CONTAINERLOGS ? L"Unable to show the container logs." : L"Unable to open a shell.", status, 0);
         }
         break;
+    case ID_WSL_CONTAINERINSPECT:
+        {
+            NTSTATUS status;
+
+            if (!node || !node->Container)
+                break;
+
+            if (!NT_SUCCESS(status = WslShowContainerInspect(node->Session->Name, node->Container->Id, node->Container->Name)))
+                PhShowStatus(WindowHandle, L"Unable to inspect the container.", status, 0);
+        }
+        break;
     case ID_WSL_CONTAINERSTOP:
     case ID_WSL_CONTAINERRESTART:
     case ID_WSL_CONTAINERKILL:
@@ -1436,6 +1447,7 @@ static VOID WslpShowContextMenu(
     {
         PhInsertEMenuItem(menu, PhCreateEMenuItem(0, ID_WSL_CONTAINERSHELL, L"Open &shell", NULL, NULL), ULONG_MAX);
         PhInsertEMenuItem(menu, PhCreateEMenuItem(0, ID_WSL_CONTAINERLOGS, L"&Logs", NULL, NULL), ULONG_MAX);
+        PhInsertEMenuItem(menu, PhCreateEMenuItem(0, ID_WSL_CONTAINERINSPECT, L"&Inspect...", NULL, NULL), ULONG_MAX);
         PhInsertEMenuItem(menu, PhCreateEMenuSeparator(), ULONG_MAX);
         PhInsertEMenuItem(menu, PhCreateEMenuItem(0, ID_WSL_CONTAINERSTOP, L"S&top", NULL, NULL), ULONG_MAX);
         PhInsertEMenuItem(menu, PhCreateEMenuItem(0, ID_WSL_CONTAINERRESTART, L"&Restart", NULL, NULL), ULONG_MAX);

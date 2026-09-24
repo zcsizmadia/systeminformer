@@ -216,6 +216,14 @@ NTSTATUS WslStartShell(
     _In_ PPH_STRING DistroName
     );
 
+// wslinsp.c
+
+NTSTATUS WslShowContainerInspect(
+    _In_ PPH_STRING SessionName,
+    _In_ PPH_STRING ContainerId,
+    _In_ PPH_STRING ContainerName
+    );
+
 // wslprv.c
 
 VOID WslStartProvider(

@@ -21,6 +21,9 @@
     <ClCompile Include="wslc.c">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="wslinsp.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="wslproc.c">
       <Filter>Source Files</Filter>
     </ClCompile>
