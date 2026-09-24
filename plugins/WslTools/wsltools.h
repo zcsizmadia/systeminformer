@@ -178,7 +178,8 @@ BOOLEAN WslIsSafeContainerId(
 typedef struct _WSL_ENGINE
 {
     PPH_STRING PipeName; // e.g. "docker_engine", without "\\.\pipe\"
-    PPH_STRING Label; // The product serving the pipe, e.g. "skrog"
+    PPH_STRING ProductText; // The product, e.g. "Docker Desktop 4.92.0", "Podman 5.2.0" or "Skrog"
+    PPH_STRING EngineText; // The engine, e.g. "Docker 29.8.1", or NULL when ProductText names it
     PPH_STRING ServerText; // The Server header, e.g. "Docker/29.8.1 (linux)"
     HANDLE ServerProcessId;
     PPH_STRING DistroId; // The distribution its containers run in
@@ -295,6 +296,18 @@ BOOLEAN WslIsSafeDistroName(
 
 NTSTATUS WslStartShell(
     _In_ PPH_STRING DistroName
+    );
+
+PPH_STRING WslFormatDisplayVersion(
+    _In_ PCPH_STRINGREF Version
+    );
+
+PPH_STRING WslGetWslVersion(
+    VOID
+    );
+
+PPH_STRING WslGetWslcVersion(
+    VOID
     );
 
 // wslinsp.c

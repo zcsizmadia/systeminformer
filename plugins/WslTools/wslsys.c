@@ -460,42 +460,6 @@ static VOID WslpSysInvalidateGraphs(
 }
 
 /**
- * Gets the WSL version from the version resource of wslservice.exe, e.g. "2.9.12.0".
- *
- * \return The version, or NULL. The string is cached for the lifetime of the process.
- * \remarks This reads a file instead of running "wsl --version", whose output is localized.
- */
-static PPH_STRING WslpSysGetWslVersion(
-    VOID
-    )
-{
-    static PH_INITONCE initOnce = PH_INITONCE_INIT;
-    static PPH_STRING version = NULL;
-
-    if (PhBeginInitOnce(&initOnce))
-    {
-        static CONST PH_STRINGREF path = PH_STRINGREF_INIT(L"%ProgramW6432%\\WSL\\wslservice.exe");
-        PPH_STRING fileName;
-        PH_IMAGE_VERSION_INFO versionInfo;
-
-        if (fileName = PhExpandEnvironmentStrings(&path))
-        {
-            if (NT_SUCCESS(PhInitializeImageVersionInfo(&versionInfo, fileName->Buffer)))
-            {
-                PhSetReference(&version, versionInfo.FileVersion);
-                PhDeleteImageVersionInfo(&versionInfo);
-            }
-
-            PhDereferenceObject(fileName);
-        }
-
-        PhEndInitOnce(&initOnce);
-    }
-
-    return version;
-}
-
-/**
  * Reads a setting from %USERPROFILE%\.wslconfig.
  *
  * \param Section The section, e.g. L"wsl2".
@@ -693,7 +657,7 @@ static VOID WslpSysUpdatePanel(
 
     // Header: "2 VMs, WSL 2.9.12.0, kernel 6.18.40.1", separated by middle dots.
     numberOfVms = (WslSysVmProcessItem ? 1 : 0) + (snapshot && snapshot->Sessions ? snapshot->Sessions->Count : (WslSysSessionVmProcessItem ? 1 : 0));
-    version = WslpSysGetWslVersion();
+    version = WslGetWslVersion();
 
     {
         PPH_STRING versionText = version ? PhFormatString(L" \u00b7 WSL %s", version->Buffer) : PhReferenceEmptyString();

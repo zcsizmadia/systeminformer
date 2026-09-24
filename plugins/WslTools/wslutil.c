@@ -346,6 +346,107 @@ PCPH_STRINGREF WslGetDistroStateText(
 }
 
 /**
+ * Formats a file version for display, e.g. "2.9.12" for "2.9.12.0".
+ *
+ * \param Version The file version.
+ * \return The version without a zero fourth part; "2.9.12.1" stays as it is. The caller owns
+ * the string.
+ */
+PPH_STRING WslFormatDisplayVersion(
+    _In_ PCPH_STRINGREF Version
+    )
+{
+    static CONST PH_STRINGREF zeroRevision = PH_STRINGREF_INIT(L".0");
+    PH_STRINGREF text = *Version;
+    ULONG dots = 0;
+
+    for (SIZE_T i = 0; i < text.Length / sizeof(WCHAR); i++)
+        dots += text.Buffer[i] == L'.';
+
+    if (dots == 3 && PhEndsWithStringRef(&text, &zeroRevision, FALSE))
+        text.Length -= zeroRevision.Length;
+
+    return PhCreateString2(&text);
+}
+
+/**
+ * Gets the version of a file for display, e.g. "2.9.12" for a file version of "2.9.12.0".
+ *
+ * \param FileName The file, with environment variables.
+ * \return The version, or NULL if the file has none. The caller owns the string.
+ */
+static PPH_STRING WslpGetFileDisplayVersion(
+    _In_ PCPH_STRINGREF FileName
+    )
+{
+    PPH_STRING fileName;
+    PPH_STRING version = NULL;
+    PH_IMAGE_VERSION_INFO versionInfo;
+
+    if (!(fileName = PhExpandEnvironmentStrings(FileName)))
+        return NULL;
+
+    if (NT_SUCCESS(PhInitializeImageVersionInfo(&versionInfo, fileName->Buffer)))
+    {
+        if (!PhIsNullOrEmptyString(versionInfo.FileVersion))
+            version = WslFormatDisplayVersion(&versionInfo.FileVersion->sr);
+
+        PhDeleteImageVersionInfo(&versionInfo);
+    }
+
+    PhDereferenceObject(fileName);
+
+    return version;
+}
+
+/**
+ * Gets the version of WSL, from wslservice.exe, e.g. "2.9.12".
+ *
+ * \return The version, or NULL if it cannot be read. The string is cached; do not free it.
+ * \remarks The in-box wsl.exe of Windows 10 has the Windows version, not the WSL version.
+ */
+PPH_STRING WslGetWslVersion(
+    VOID
+    )
+{
+    static PH_INITONCE initOnce = PH_INITONCE_INIT;
+    static PPH_STRING version = NULL;
+
+    if (PhBeginInitOnce(&initOnce))
+    {
+        static CONST PH_STRINGREF path = PH_STRINGREF_INIT(L"%ProgramW6432%\\WSL\\wslservice.exe");
+
+        version = WslpGetFileDisplayVersion(&path);
+        PhEndInitOnce(&initOnce);
+    }
+
+    return version;
+}
+
+/**
+ * Gets the version of wslc.exe, e.g. "2.9.12".
+ *
+ * \return The version, or NULL if wslc.exe is missing. The string is cached; do not free it.
+ */
+PPH_STRING WslGetWslcVersion(
+    VOID
+    )
+{
+    static PH_INITONCE initOnce = PH_INITONCE_INIT;
+    static PPH_STRING version = NULL;
+
+    if (PhBeginInitOnce(&initOnce))
+    {
+        static CONST PH_STRINGREF path = PH_STRINGREF_INIT(L"%ProgramW6432%\\WSL\\wslc.exe");
+
+        version = WslpGetFileDisplayVersion(&path);
+        PhEndInitOnce(&initOnce);
+    }
+
+    return version;
+}
+
+/**
  * Gets the full path of wsl.exe.
  *
  * \return The path. The string is cached for the lifetime of the process.

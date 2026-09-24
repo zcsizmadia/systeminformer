@@ -34,6 +34,10 @@ typedef struct _WSL_ENGINE_PLACEMENT
 {
     PPH_STRING PipeName;
     PPH_STRING DistroId;
+    // From GET /version, asked again only when another process serves the pipe.
+    HANDLE ServerProcessId;
+    PPH_STRING ProductText;
+    PPH_STRING EngineText;
 } WSL_ENGINE_PLACEMENT, *PWSL_ENGINE_PLACEMENT;
 
 static PPH_LIST WslpEnginePlacements = NULL;
@@ -972,7 +976,8 @@ static VOID WslpFreeEngine(
 
     PhDereferenceObject(Engine->Containers);
     PhClearReference(&Engine->PipeName);
-    PhClearReference(&Engine->Label);
+    PhClearReference(&Engine->ProductText);
+    PhClearReference(&Engine->EngineText);
     PhClearReference(&Engine->ServerText);
     PhClearReference(&Engine->DistroId);
     PhFree(Engine);
@@ -992,39 +997,155 @@ VOID WslFreeEngines(
 }
 
 /**
- * Gets the name of the product that serves an engine's pipe, e.g. "skrog".
+ * Gets the product that serves an engine's pipe from the version resource of the server
+ * process, e.g. "Rancher Desktop 1.16.0", or from its name, e.g. "Skrog" for skrog.exe.
  *
- * \return The file description of the server process, or its name without the extension.
+ * \return The product, or NULL if the process is gone.
  */
-static PPH_STRING WslpGetEngineLabel(
+static PPH_STRING WslpGetServerProductText(
     _In_ HANDLE ServerProcessId
     )
 {
     PPH_PROCESS_ITEM processItem;
-    PPH_STRING label = NULL;
+    PPH_STRING text = NULL;
+    PPH_STRING name;
 
     if (!ServerProcessId || !(processItem = PhReferenceProcessItem(ServerProcessId)))
         return NULL;
 
-    if (!PhIsNullOrEmptyString(processItem->VersionInfo.FileDescription))
+    name = !PhIsNullOrEmptyString(processItem->VersionInfo.ProductName) ? processItem->VersionInfo.ProductName : processItem->VersionInfo.FileDescription;
+
+    if (!PhIsNullOrEmptyString(name))
     {
-        PhSetReference(&label, processItem->VersionInfo.FileDescription);
+        if (!PhIsNullOrEmptyString(processItem->VersionInfo.FileVersion))
+        {
+            PPH_STRING version = WslFormatDisplayVersion(&processItem->VersionInfo.FileVersion->sr);
+
+            text = PhFormatString(L"%s %s", name->Buffer, version->Buffer);
+            PhDereferenceObject(version);
+        }
+        else
+        {
+            PhSetReference(&text, name);
+        }
     }
-    else if (processItem->ProcessName)
+    else if (processItem->ProcessName && processItem->ProcessName->Length != 0)
     {
-        PH_STRINGREF name = processItem->ProcessName->sr;
+        PH_STRINGREF baseName = processItem->ProcessName->sr;
         PH_STRINGREF extension;
-        PH_STRINGREF baseName;
 
-        if (PhSplitStringRefAtLastChar(&name, L'.', &baseName, &extension))
-            name = baseName;
-
-        label = PhCreateString2(&name);
+        // Without a version resource the name is all there is, e.g. "skrog.exe".
+        PhSplitStringRefAtLastChar(&processItem->ProcessName->sr, L'.', &baseName, &extension);
+        text = PhCreateString2(&baseName);
+        text->Buffer[0] = RtlUpcaseUnicodeChar(text->Buffer[0]);
     }
 
     PhDereferenceObject(processItem);
 
-    return label;
+    return text;
+}
+
+/**
+ * Gets the product and the engine of an engine from GET /version.
+ *
+ * \param Engine The engine.
+ * \param ProductText Receives the product, e.g. "Docker Desktop 4.92.0" from Platform.Name,
+ * "Podman 5.2.0" from its "Podman Engine" component, or else that of the pipe's server process.
+ * \param EngineText Receives the engine, e.g. "Docker 29.8.1", or NULL for Podman.
+ */
+static VOID WslpQueryEngineVersion(
+    _In_ PWSL_ENGINE Engine,
+    _Out_ PPH_STRING *ProductText,
+    _Out_ PPH_STRING *EngineText
+    )
+{
+    static CONST PH_STRINGREF podmanComponent = PH_STRINGREF_INIT(L"Podman Engine");
+    static CONST PH_STRINGREF plainPlatform = PH_STRINGREF_INIT(L"Docker Engine");
+    ULONG statusCode;
+    PPH_BYTES body;
+    PVOID object;
+    PPH_STRING platformName = NULL;
+    PPH_STRING version = NULL;
+    PPH_STRING podmanVersion = NULL;
+
+    *ProductText = NULL;
+    *EngineText = NULL;
+
+    if (NT_SUCCESS(WslEngineRequest(Engine->PipeName, "GET", "/version", WSL_ENGINE_TIMEOUT_MS, &statusCode, &body)))
+    {
+        if (statusCode == 200 && body && NT_SUCCESS(PhCreateJsonParserEx(&object, body, FALSE)) && object)
+        {
+            PVOID platform;
+            PVOID components;
+
+            if (PhGetJsonObjectType(object) == PH_JSON_OBJECT_TYPE_OBJECT)
+            {
+                if (platform = PhGetJsonObject(object, "Platform"))
+                    platformName = PhGetJsonValueAsString(platform, "Name");
+
+                version = PhGetJsonValueAsString(object, "Version");
+
+                if ((components = PhGetJsonObject(object, "Components")) && PhGetJsonObjectType(components) == PH_JSON_OBJECT_TYPE_ARRAY)
+                {
+                    for (ULONG i = 0; i < PhGetJsonArrayLength(components) && !podmanVersion; i++)
+                    {
+                        PVOID component = PhGetJsonArrayIndexObject(components, i);
+                        PPH_STRING componentName;
+
+                        if (!component || !(componentName = PhGetJsonValueAsString(component, "Name")))
+                            continue;
+
+                        if (PhEqualStringRef(&componentName->sr, &podmanComponent, TRUE))
+                            podmanVersion = PhGetJsonValueAsString(component, "Version");
+
+                        PhDereferenceObject(componentName);
+                    }
+                }
+            }
+
+            PhFreeJsonObject(object);
+        }
+
+        PhClearReference(&body);
+    }
+
+    if (!PhIsNullOrEmptyString(podmanVersion))
+    {
+        // Podman is the engine itself.
+        *ProductText = PhFormatString(L"Podman %s", podmanVersion->Buffer);
+    }
+    else
+    {
+        // Docker Desktop names itself, e.g. "Docker Desktop 4.92.0 (240144)"; the build number
+        // is left out. A plain "Docker Engine - Community" says nothing about the product.
+        if (!PhIsNullOrEmptyString(platformName) && !PhStartsWithStringRef(&platformName->sr, &plainPlatform, TRUE))
+        {
+            PH_STRINGREF name = platformName->sr;
+            PH_STRINGREF build;
+            PH_STRINGREF firstPart;
+
+            if (PhSplitStringRefAtLastChar(&name, L'(', &firstPart, &build) && firstPart.Length != 0)
+            {
+                static CONST PH_STRINGREF whitespace = PH_STRINGREF_INIT(L" ");
+
+                PhTrimStringRef(&firstPart, &whitespace, 0);
+                name = firstPart;
+            }
+
+            *ProductText = PhCreateString2(&name);
+        }
+        else
+        {
+            *ProductText = WslpGetServerProductText(Engine->ServerProcessId);
+        }
+
+        if (!PhIsNullOrEmptyString(version))
+            *EngineText = PhFormatString(L"Docker %s", version->Buffer);
+    }
+
+    PhClearReference(&platformName);
+    PhClearReference(&version);
+    PhClearReference(&podmanVersion);
 }
 
 /**
@@ -1062,7 +1183,6 @@ static PWSL_ENGINE WslpQueryEngine(
             engine->ServerText = server;
             server = NULL;
             engine->ServerProcessId = serverProcessId;
-            engine->Label = WslpGetEngineLabel(serverProcessId);
             engine->Containers = PhCreateList(max(count, 1));
 
             for (ULONG i = 0; i < count; i++)
@@ -1238,7 +1358,7 @@ static PWSL_ENGINE_PLACEMENT WslpFindEnginePlacement(
 /**
  * Remembers where an engine is placed.
  */
-static VOID WslpSetEnginePlacement(
+static PWSL_ENGINE_PLACEMENT WslpSetEnginePlacement(
     _In_ PPH_STRING PipeName,
     _In_ PPH_STRING DistroId
     )
@@ -1256,6 +1376,8 @@ static VOID WslpSetEnginePlacement(
     }
 
     PhSetReference(&placement->DistroId, DistroId);
+
+    return placement;
 }
 
 /**
@@ -1274,6 +1396,8 @@ VOID WslResetEngines(
 
         PhDereferenceObject(placement->PipeName);
         PhDereferenceObject(placement->DistroId);
+        PhClearReference(&placement->ProductText);
+        PhClearReference(&placement->EngineText);
         PhFree(placement);
     }
 
@@ -1443,7 +1567,19 @@ PPH_LIST WslQueryEngines(
     {
         PWSL_ENGINE engine = engines->Items[i];
 
-        WslpSetEnginePlacement(engine->PipeName, engine->DistroId);
+        PWSL_ENGINE_PLACEMENT placement = WslpSetEnginePlacement(engine->PipeName, engine->DistroId);
+
+        // The product and version only change with the process that serves the pipe.
+        if (!placement->ProductText || placement->ServerProcessId != engine->ServerProcessId)
+        {
+            PhClearReference(&placement->ProductText);
+            PhClearReference(&placement->EngineText);
+            WslpQueryEngineVersion(engine, &placement->ProductText, &placement->EngineText);
+            placement->ServerProcessId = engine->ServerProcessId;
+        }
+
+        PhSetReference(&engine->ProductText, placement->ProductText);
+        PhSetReference(&engine->EngineText, placement->EngineText);
         WslpUpdateEngineStats(engine, WslpFindSnapshotDistro(Snapshot, engine->DistroId));
     }
 
