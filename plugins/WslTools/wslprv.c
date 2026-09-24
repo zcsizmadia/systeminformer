@@ -192,6 +192,7 @@ static WSLP_VM_KIND WslpGetVmKind(
  * \param SessionVm Receives the session VM process item, or NULL when there is none or
  * several could be meant. The caller owns the reference.
  * \param NumberOfCandidates Receives the number of processes that could be the WSL VM.
+ * \param NumberOfSessionVms Receives the number of processes identified as session VMs.
  * \remarks Windows 11 names the WSL VM process "vmmemWSL". Windows 10 names every VM
  * process "vmmem", including Hyper-V and WSLC session VMs, which WslpGetVmKind tells apart.
  * A single vmmem of unknown kind is taken for the WSL VM, as before WSLC existed.
@@ -199,7 +200,8 @@ static WSLP_VM_KIND WslpGetVmKind(
 static VOID WslpFindVmProcessItems(
     _Out_opt_ PPH_PROCESS_ITEM *WslVm,
     _Out_opt_ PPH_PROCESS_ITEM *SessionVm,
-    _Out_opt_ PULONG NumberOfCandidates
+    _Out_opt_ PULONG NumberOfCandidates,
+    _Out_opt_ PULONG NumberOfSessionVms
     )
 {
     PPH_PROCESS_ITEM *processItems;
@@ -266,6 +268,8 @@ static VOID WslpFindVmProcessItems(
         *SessionVm = sessionVmItem ? PhReferenceObject(sessionVmItem) : NULL;
     if (NumberOfCandidates)
         *NumberOfCandidates = wslVmItem && candidates->Count == 0 ? 1 : candidates->Count;
+    if (NumberOfSessionVms)
+        *NumberOfSessionVms = sessionCandidates;
 
     PhDereferenceObject(candidates);
     PhDereferenceObjects(processItems, numberOfProcessItems);
@@ -276,16 +280,18 @@ static VOID WslpFindVmProcessItems(
  * Finds the process that hosts the WSL 2 virtual machine.
  *
  * \param NumberOfCandidates Receives the number of processes that could be the WSL VM.
+ * \param NumberOfSessionVms Receives the number of processes identified as session VMs.
  * \return The VM process item, or NULL if there is none or it cannot be identified. The
  * caller owns the reference.
  */
 PPH_PROCESS_ITEM WslReferenceVmProcessItem(
-    _Out_opt_ PULONG NumberOfCandidates
+    _Out_opt_ PULONG NumberOfCandidates,
+    _Out_opt_ PULONG NumberOfSessionVms
     )
 {
     PPH_PROCESS_ITEM vmProcessItem;
 
-    WslpFindVmProcessItems(&vmProcessItem, NULL, NumberOfCandidates);
+    WslpFindVmProcessItems(&vmProcessItem, NULL, NumberOfCandidates, NumberOfSessionVms);
 
     return vmProcessItem;
 }
@@ -304,7 +310,7 @@ PPH_PROCESS_ITEM WslReferenceSessionVmProcessItem(
 {
     PPH_PROCESS_ITEM vmProcessItem;
 
-    WslpFindVmProcessItems(NULL, &vmProcessItem, NULL);
+    WslpFindVmProcessItems(NULL, &vmProcessItem, NULL, NULL);
 
     return vmProcessItem;
 }
@@ -447,11 +453,12 @@ static NTSTATUS NTAPI WslpProviderThread(
         {
             PPH_PROCESS_ITEM vmProcessItem;
             ULONG candidates;
+            ULONG sessionVms;
             PWSL_SNAPSHOT snapshot;
 
             // Any candidate VM process is enough to allow the running query; a false positive
             // only costs one wsl.exe call, which does not start the VM.
-            vmProcessItem = WslReferenceVmProcessItem(&candidates);
+            vmProcessItem = WslReferenceVmProcessItem(&candidates, &sessionVms);
             PhClearReference(&vmProcessItem);
 
             snapshot = WslQuerySnapshot(candidates != 0);
@@ -467,7 +474,7 @@ static NTSTATUS NTAPI WslpProviderThread(
 
             // A WSLC session is a VM of its own, so without any VM process none can be running.
             if (candidates != 0)
-                snapshot->Sessions = WslQuerySessions();
+                snapshot->Sessions = WslQuerySessions(sessionVms);
 
             if (ReadAcquire(&WslpProviderStopping))
             {

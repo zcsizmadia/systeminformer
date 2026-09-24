@@ -110,7 +110,7 @@ static VOID NTAPI ProcessMenuInitializingCallback(
         return;
 
     // Only a vmmem the tab can show gets the item, using the same matching as the tab.
-    wslVmItem = WslReferenceVmProcessItem(NULL);
+    wslVmItem = WslReferenceVmProcessItem(NULL, NULL);
     sessionVmItem = WslReferenceSessionVmProcessItem();
 
     if (wslVmItem && wslVmItem->ProcessId == processItem->ProcessId)
