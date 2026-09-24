@@ -10,6 +10,7 @@
  */
 
 #include "wsltools.h"
+#include <toolstatusintf.h>
 
 // The tab is a tree: the WSL 2 virtual machine with its distributions below it, and WSL 1
 // distributions at the root because they do not run in the VM. Each running distribution
@@ -101,13 +102,23 @@ static PPH_PROCESS_ITEM WslSessionVmProcessItem = NULL;
 // A row asked for by "Go to WSL" before the tab had its rows; tried once on the next snapshot.
 static WSL_VM_SELECTION WslPendingVmSelection = WslVmSelectionNone;
 
+// The ToolStatus search box, or NULL when that plugin is not loaded.
+static PTOOLSTATUS_INTERFACE WslToolStatusInterface = NULL;
+static PH_CALLBACK_REGISTRATION WslSearchChangedRegistration;
+
 static CONST PH_STRINGREF WslPageText = PH_STRINGREF_INIT(L"WSL");
+static CONST PH_STRINGREF WslSearchBannerText = PH_STRINGREF_INIT(L"Search WSL");
 static CONST PH_STRINGREF WslVmNodeText = PH_STRINGREF_INIT(L"WSL");
 static CONST PH_STRINGREF WslEmptyText = PH_STRINGREF_INIT(L"No WSL distributions are registered for this user.");
 static CONST PH_STRINGREF WslAmbiguousVmText = PH_STRINGREF_INIT(L"Several virtual machine processes exist; the WSL one cannot be identified.");
 static CONST PH_STRINGREF WslDefaultMarker = PH_STRINGREF_INIT(L" *");
 static CONST PH_STRINGREF WslDefaultTooltipText = PH_STRINGREF_INIT(L"Default distribution");
 static CONST PH_STRINGREF WslGuestUptimeTooltipText = PH_STRINGREF_INIT(L"Time the VM has been running since the start, from the VM's own clock. It leaves out time the VM was paused, e.g. while the host was asleep.");
+
+static BOOLEAN WslpFilterNodes(
+    _In_ PPH_LIST Nodes,
+    _In_ BOOLEAN Expand
+    );
 
 /**
  * Creates a tree node.
@@ -541,6 +552,8 @@ VOID NTAPI WslOnSnapshotUpdated(
     for (ULONG i = 0; i < WslDistroNodes->Count; i++)
         WslpInvalidateNode(WslDistroNodes->Items[i]);
 
+    // New nodes start shown, so the search is applied again after every refresh.
+    WslpFilterNodes(WslRootNodes, FALSE);
     TreeNew_NodesStructured(WslTreeNewHandle);
 
     // One attempt: if the VM's row is still missing, it has stopped since the request.
@@ -1260,6 +1273,141 @@ static VOID WslpGetContainerCellText(
 }
 
 /**
+ * Gets the text of a cell of any node type.
+ */
+static VOID WslpGetNodeCellText(
+    _In_ PWSL_NODE Node,
+    _Inout_ PPH_TREENEW_GET_CELL_TEXT GetCellText
+    )
+{
+    if (Node->Type == WslNodeTypeVm)
+        WslpGetVmCellText(Node, GetCellText);
+    else if (Node->Type == WslNodeTypeDistro)
+        WslpGetDistroCellText(Node, GetCellText);
+    else if (Node->Type == WslNodeTypeLinuxProcess)
+        WslpGetProcessCellText(Node, Node->Frame, GetCellText);
+    else if (Node->Type == WslNodeTypeSession)
+        WslpGetSessionCellText(Node, GetCellText);
+    else
+        WslpGetContainerCellText(Node, GetCellText);
+}
+
+/**
+ * Determines whether a node matches the text in the ToolStatus search box.
+ *
+ * \return TRUE if there is no search, or the text matches one of the text columns of the
+ * node, or a container's id.
+ */
+static BOOLEAN WslpNodeMatchesSearch(
+    _In_ PWSL_NODE Node
+    )
+{
+    static CONST ULONG columns[] = { WSLTNC_NAME, WSLTNC_PID, WSLTNC_LINUXPID, WSLTNC_TYPE, WSLTNC_STATE, WSLTNC_IMAGE, WSLTNC_PORTS, WSLTNC_STATUS };
+
+    if (!WslToolStatusInterface || !WslToolStatusInterface->GetSearchMatchHandle())
+        return TRUE;
+
+    // The rows show the short container id; a search for the full one should match too.
+    if (Node->Type == WslNodeTypeContainer && WslToolStatusInterface->WordMatch(&Node->Id->sr))
+        return TRUE;
+
+    for (ULONG i = 0; i < RTL_NUMBER_OF(columns); i++)
+    {
+        PH_TREENEW_GET_CELL_TEXT getCellText;
+
+        memset(&getCellText, 0, sizeof(PH_TREENEW_GET_CELL_TEXT));
+        getCellText.Node = &Node->Node;
+        getCellText.Id = columns[i];
+        WslpGetNodeCellText(Node, &getCellText);
+
+        if (getCellText.Text.Length != 0 && WslToolStatusInterface->WordMatch(&getCellText.Text))
+            return TRUE;
+    }
+
+    return FALSE;
+}
+
+/**
+ * Shows the nodes that match the search, and the nodes above them.
+ *
+ * \param Nodes The nodes of one level of the tree.
+ * \param Expand TRUE to expand a node whose children match, so that the matches can be seen.
+ * \return TRUE if any of the nodes is shown.
+ * \remarks TreeNew moves the children of a hidden node to the top level, so a node stays
+ * shown whenever one of its descendants is.
+ */
+static BOOLEAN WslpFilterNodes(
+    _In_ PPH_LIST Nodes,
+    _In_ BOOLEAN Expand
+    )
+{
+    BOOLEAN anyVisible = FALSE;
+
+    for (ULONG i = 0; i < Nodes->Count; i++)
+    {
+        PWSL_NODE node = Nodes->Items[i];
+        BOOLEAN childVisible = node->Children ? WslpFilterNodes(node->Children, Expand) : FALSE;
+
+        if (childVisible && Expand)
+            node->Node.Expanded = TRUE;
+
+        node->Node.Visible = childVisible || WslpNodeMatchesSearch(node);
+        anyVisible |= node->Node.Visible;
+    }
+
+    return anyVisible;
+}
+
+/**
+ * Applies the search when its text changes. Runs on the GUI thread.
+ */
+_Function_class_(PH_CALLBACK_FUNCTION)
+static VOID NTAPI WslpSearchChangedHandler(
+    _In_opt_ PVOID Parameter,
+    _In_opt_ PVOID Context
+    )
+{
+    if (!WslTreeNewHandle || !WslRootNodes)
+        return;
+
+    // Expand only here, not on every refresh, so rows the user collapses stay collapsed.
+    WslpFilterNodes(WslRootNodes, !!WslToolStatusInterface->GetSearchMatchHandle());
+    TreeNew_NodesStructured(WslTreeNewHandle);
+}
+
+/**
+ * Focuses the tree when Enter or Down is pressed in the search box, selecting the first row
+ * if asked to.
+ */
+_Function_class_(TOOLSTATUS_TAB_ACTIVATE_CONTENT)
+static VOID NTAPI WslpToolStatusActivateContent(
+    _In_ BOOLEAN Select
+    )
+{
+    SetFocus(WslTreeNewHandle);
+
+    if (Select && TreeNew_GetFlatNodeCount(WslTreeNewHandle) > 0)
+    {
+        PPH_TREENEW_NODE node = TreeNew_GetFlatNode(WslTreeNewHandle, 0);
+
+        TreeNew_DeselectRange(WslTreeNewHandle, 0, -1);
+        TreeNew_FocusMarkSelectNode(WslTreeNewHandle, node);
+        TreeNew_EnsureVisible(WslTreeNewHandle, node);
+    }
+}
+
+/**
+ * Gives ToolStatus the tree, e.g. for the search box to focus.
+ */
+_Function_class_(TOOLSTATUS_GET_TREENEW_HANDLE)
+static HWND NTAPI WslpToolStatusGetTreeNewHandle(
+    VOID
+    )
+{
+    return WslTreeNewHandle;
+}
+
+/**
  * Gets the selected node, or NULL if nothing or more than one node is selected.
  */
 static PWSL_NODE WslpGetSelectedNode(
@@ -1834,17 +1982,7 @@ static BOOLEAN NTAPI WslpTreeNewCallback(
             PPH_TREENEW_GET_CELL_TEXT getCellText = Parameter1;
             PWSL_NODE node = (PWSL_NODE)getCellText->Node;
 
-            if (node->Type == WslNodeTypeVm)
-                WslpGetVmCellText(node, getCellText);
-            else if (node->Type == WslNodeTypeDistro)
-                WslpGetDistroCellText(node, getCellText);
-            else if (node->Type == WslNodeTypeLinuxProcess)
-                WslpGetProcessCellText(node, node->Frame, getCellText);
-            else if (node->Type == WslNodeTypeSession)
-                WslpGetSessionCellText(node, getCellText);
-            else
-                WslpGetContainerCellText(node, getCellText);
-
+            WslpGetNodeCellText(node, getCellText);
             getCellText->Flags = TN_CACHE;
         }
         return TRUE;
@@ -2186,4 +2324,16 @@ VOID WslInitializeTab(
     page.Name = WslPageText;
     page.Callback = WslpPageCallback;
     WslPage = PhPluginCreateTabPage(&page);
+
+    // ToolStatus enables its search box only for tabs that register with it.
+    if (WslPage && (WslToolStatusInterface = PhGetPluginInterfaceZ(TOOLSTATUS_INTERFACE_NAME, TOOLSTATUS_INTERFACE_VERSION)))
+    {
+        PTOOLSTATUS_TAB_INFO tabInfo;
+
+        tabInfo = WslToolStatusInterface->RegisterTabInfo(WslPage->Index, &WslSearchBannerText);
+        tabInfo->ActivateContent = WslpToolStatusActivateContent;
+        tabInfo->GetTreeNewHandle = WslpToolStatusGetTreeNewHandle;
+
+        PhRegisterCallback(WslToolStatusInterface->SearchChangedEvent, WslpSearchChangedHandler, NULL, &WslSearchChangedRegistration);
+    }
 }
