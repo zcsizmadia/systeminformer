@@ -299,8 +299,12 @@ PWSL_SNAPSHOT WslQuerySnapshot(
         {
             PPH_STRING text = PhConvertUtf8ToUtf16Ex(output->Buffer, output->Length);
 
-            WslpApplyRunningList(snapshot->Distributions, text);
-            PhDereferenceObject(text);
+            if (text)
+            {
+                WslpApplyRunningList(snapshot->Distributions, text);
+                PhDereferenceObject(text);
+            }
+
             PhDereferenceObject(output);
         }
     }
@@ -576,7 +580,7 @@ NTSTATUS WslRunCommand(
     _Out_opt_ PPH_BYTES *Output
     )
 {
-    return WslRunCommandEx(FileName, Arguments, Output, FALSE);
+    return WslRunCommandEx(FileName, Arguments, WSL_COMMAND_TIMEOUT_MS, Output, FALSE);
 }
 
 /**
@@ -584,17 +588,18 @@ NTSTATUS WslRunCommand(
  *
  * \param FileName The executable, from WslGetWslFileName or WslGetWslcFileName.
  * \param Arguments The command line arguments, without the executable name.
- * \param Output Receives the combined stdout and stderr text. The caller owns the string.
+ * \param TimeoutMs How long the tool may run before it is killed.
+ * \param Output Receives the combined stdout and stderr text, or NULL. The caller owns the string.
  * \param OutputOnFailure TRUE to also return the output when the tool exits with a non-zero code
  * (STATUS_UNSUCCESSFUL), so its error message can be shown.
  * \return STATUS_SUCCESS if wsl.exe exited with code 0, STATUS_UNSUCCESSFUL if it exited with
- * another code, STATUS_IO_TIMEOUT if it was killed after WSL_COMMAND_TIMEOUT_MS, or another
- * error status.
+ * another code, STATUS_IO_TIMEOUT if it was killed after TimeoutMs, or another error status.
  * \remarks Must not be called on the GUI thread; it blocks until wsl.exe exits.
  */
 NTSTATUS WslRunCommandEx(
     _In_ PPH_STRING FileName,
     _In_ PCPH_STRINGREF Arguments,
+    _In_ ULONG TimeoutMs,
     _Out_opt_ PPH_BYTES *Output,
     _In_ BOOLEAN OutputOnFailure
     )
@@ -607,6 +612,9 @@ NTSTATUS WslRunCommandEx(
     LARGE_INTEGER timeout;
     ULONG64 startTickCount;
     PROCESS_BASIC_INFORMATION basicInfo;
+
+    if (Output)
+        *Output = NULL;
 
     if (!NT_SUCCESS(status = WslCreateProcess(FileName, Arguments, &processHandle, &readHandle, &jobHandle)))
         return status;
@@ -640,7 +648,7 @@ NTSTATUS WslRunCommandEx(
         if (exited)
             break;
 
-        if (NtGetTickCount64() - startTickCount >= WSL_COMMAND_TIMEOUT_MS)
+        if (NtGetTickCount64() - startTickCount >= TimeoutMs)
         {
             NtTerminateJobObject(jobHandle, STATUS_IO_TIMEOUT);
             status = STATUS_IO_TIMEOUT;
@@ -711,7 +719,8 @@ NTSTATUS WslStartShell(
         return STATUS_INVALID_PARAMETER;
 
     fileName = WslGetWslFileName();
-    commandLine = PhFormatString(L"\"%s\" --distribution %s --cd ~", fileName->Buffer, DistroName->Buffer);
+    if (!(commandLine = PhFormatString(L"\"%s\" --distribution %s --cd ~", fileName->Buffer, DistroName->Buffer)))
+        return STATUS_NO_MEMORY;
 
     status = PhCreateProcessWin32Ex(
         fileName->Buffer,

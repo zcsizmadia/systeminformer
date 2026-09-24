@@ -55,13 +55,14 @@ typedef struct _WSL_CONTAINER_STATS
  * Determines whether a session name can be passed to wslc.exe inside double quotes.
  *
  * \param Name The session display name. It can contain spaces, e.g. from the user name.
- * \return TRUE if the name is not empty and has no double quote or control character.
+ * \return TRUE if the name is not empty, has no double quote or control character, and does not
+ * end with a backslash, which would escape the closing quote.
  */
 BOOLEAN WslIsSafeSessionName(
     _In_ PPH_STRING Name
     )
 {
-    if (Name->Length == 0)
+    if (Name->Length == 0 || Name->Buffer[Name->Length / sizeof(WCHAR) - 1] == L'\\')
         return FALSE;
 
     for (SIZE_T i = 0; i < Name->Length / sizeof(WCHAR); i++)
@@ -172,19 +173,51 @@ static VOID WslpForEachLine(
 }
 
 /**
+ * Finds where the third column starts in the header of "wslc system session list".
+ *
+ * \param Header The header line, e.g. "ID   Creator PID   Display Name".
+ * \return The character index of the column, or SIZE_MAX if the header has fewer than three
+ * columns separated by two or more spaces.
+ */
+static ULONG_PTR WslpGetSessionNameColumn(
+    _In_ PCPH_STRINGREF Header
+    )
+{
+    SIZE_T count = Header->Length / sizeof(WCHAR);
+    ULONG separators = 0;
+
+    for (SIZE_T i = 0; i + 1 < count; i++)
+    {
+        if (Header->Buffer[i] != L' ' || Header->Buffer[i + 1] != L' ')
+            continue;
+
+        // Skip the whole run of spaces; the next column starts after it.
+        while (i < count && Header->Buffer[i] == L' ')
+            i++;
+
+        if (++separators == 2)
+            return i < count ? i : SIZE_MAX;
+    }
+
+    return SIZE_MAX;
+}
+
+/**
  * Parses the table printed by "wslc system session list":
  *
  *     ID   Creator PID   Display Name
  *     1    14132         wslc-cli-...
  *
  * \remarks The display name can contain spaces, so it is taken from the column where its
- * header starts to the end of the line, rather than by splitting on spaces.
+ * header starts to the end of the line, rather than by splitting on spaces. The command has no
+ * JSON format. The header text can be localized, so the column is found from the layout instead:
+ * columns are separated by two or more spaces, and the name is the third column. Nothing
+ * follows the name on a line, so it is not trimmed; a trailing space is part of the name.
  */
 static PPH_LIST WslpParseSessionList(
     _In_ PPH_BYTES Output
     )
 {
-    static CONST PH_STRINGREF nameHeader = PH_STRINGREF_INIT(L"Display Name");
     PPH_LIST sessions;
     PPH_STRING text;
     PH_STRINGREF remaining;
@@ -192,7 +225,10 @@ static PPH_LIST WslpParseSessionList(
     ULONG_PTR nameColumn = SIZE_MAX;
 
     sessions = PhCreateList(2);
-    text = PhConvertUtf8ToUtf16Ex(Output->Buffer, Output->Length);
+
+    if (!(text = PhConvertUtf8ToUtf16Ex(Output->Buffer, Output->Length)))
+        return sessions;
+
     remaining = text->sr;
 
     while (remaining.Length != 0)
@@ -204,7 +240,12 @@ static PPH_LIST WslpParseSessionList(
 
         if (nameColumn == SIZE_MAX)
         {
-            nameColumn = PhFindStringInStringRef(&line, &nameHeader, FALSE);
+            nameColumn = WslpGetSessionNameColumn(&line);
+
+            // Without a recognizable header no line can be parsed.
+            if (nameColumn == SIZE_MAX)
+                break;
+
             continue;
         }
 
@@ -218,7 +259,6 @@ static PPH_LIST WslpParseSessionList(
             PhSplitStringRefAtChar(&line, L' ', &idPart, &rest);
             namePart.Buffer = line.Buffer + nameColumn;
             namePart.Length = line.Length - nameColumn * sizeof(WCHAR);
-            PhTrimStringRef(&namePart, &WslpSpace, 0);
 
             if (PhStringToUInt64(&idPart, 10, &id) && namePart.Length != 0)
             {
@@ -401,7 +441,12 @@ static VOID WslpQuerySessionContainers(
     }
 
     // --all also lists stopped containers; they are shown greyed out.
-    arguments = PhFormatString(L"--session \"%s\" list --all --format json", Session->Name->Buffer);
+    if (!(arguments = PhFormatString(L"--session \"%s\" list --all --format json", Session->Name->Buffer)))
+    {
+        Session->QueryStatus = STATUS_NO_MEMORY;
+        return;
+    }
+
     Session->QueryStatus = WslRunCommand(FileName, &arguments->sr, &output);
     PhDereferenceObject(arguments);
 
@@ -417,7 +462,8 @@ static VOID WslpQuerySessionContainers(
     if (!anyRunning)
         return;
 
-    arguments = PhFormatString(L"--session \"%s\" stats --format json", Session->Name->Buffer);
+    if (!(arguments = PhFormatString(L"--session \"%s\" stats --format json", Session->Name->Buffer)))
+        return;
 
     if (!NT_SUCCESS(WslRunCommand(FileName, &arguments->sr, &output)))
     {
@@ -492,6 +538,9 @@ NTSTATUS WslStartContainerConsole(
         SessionName->Buffer,
         ContainerId->Buffer
         );
+
+    if (!commandLine)
+        return STATUS_NO_MEMORY;
 
     status = PhCreateProcessWin32Ex(
         fileName->Buffer,
@@ -592,7 +641,8 @@ static VOID WslpQuerySessionProcesses(
     if (!anyRunning || !WslIsSafeSessionName(Session->Name))
         return;
 
-    arguments = PhFormatString(L"--session \"%s\" system session run /bin/sh -c \"%s\"", Session->Name->Buffer, WSL_SESSION_PROCESS_SCRIPT);
+    if (!(arguments = PhFormatString(L"--session \"%s\" system session run /bin/sh -c \"%s\"", Session->Name->Buffer, WSL_SESSION_PROCESS_SCRIPT)))
+        return;
 
     if (NT_SUCCESS(WslRunCommand(FileName, &arguments->sr, &output)))
     {

@@ -142,11 +142,11 @@ static PPH_STRING WslpGetJsonValueText(
 /**
  * Creates the node of one JSON value, with nodes for its members or elements.
  *
- * \param Name The member name or "[index]".
+ * \param Name The member name or "[index]". The node takes ownership; NULL gives an empty name.
  * \param Object The JSON value.
  */
 static PWSL_INSPECT_NODE WslpCreateInspectNode(
-    _In_ PPH_STRING Name,
+    _In_opt_ PPH_STRING Name,
     _In_ PVOID Object
     )
 {
@@ -157,7 +157,7 @@ static PWSL_INSPECT_NODE WslpCreateInspectNode(
     PhInitializeTreeNewNode(&node->Node);
     node->Node.TextCache = node->TextCache;
     node->Node.TextCacheSize = WSLICNC_MAXIMUM;
-    node->Name = Name;
+    node->Name = Name ? Name : PhReferenceEmptyString();
     node->Value = WslpGetJsonValueText(Object);
     node->Children = PhCreateList(1);
 
@@ -353,8 +353,11 @@ static INT_PTR CALLBACK WslpInspectDialogProc(
                 {
                     PPH_STRING text = PhConvertUtf8ToUtf16Ex(context->Output->Buffer, context->Output->Length);
 
-                    PhSetClipboardString(WindowHandle, &text->sr);
-                    PhDereferenceObject(text);
+                    if (text)
+                    {
+                        PhSetClipboardString(WindowHandle, &text->sr);
+                        PhDereferenceObject(text);
+                    }
                 }
                 break;
             }
@@ -409,9 +412,15 @@ static NTSTATUS NTAPI WslpInspectThread(
     PWSL_INSPECT_CONTEXT context = Parameter;
     PPH_STRING arguments;
 
-    arguments = PhFormatString(L"--session \"%s\" inspect %s", context->SessionName->Buffer, context->ContainerId->Buffer);
-    context->Status = WslRunCommand(WslGetWslcFileName(), &arguments->sr, &context->Output);
-    PhDereferenceObject(arguments);
+    if (arguments = PhFormatString(L"--session \"%s\" inspect %s", context->SessionName->Buffer, context->ContainerId->Buffer))
+    {
+        context->Status = WslRunCommand(WslGetWslcFileName(), &arguments->sr, &context->Output);
+        PhDereferenceObject(arguments);
+    }
+    else
+    {
+        context->Status = STATUS_NO_MEMORY;
+    }
 
     SystemInformer_Invoke(WslpShowInspectWindow, context);
 
