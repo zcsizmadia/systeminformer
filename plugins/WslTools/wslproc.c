@@ -590,7 +590,10 @@ static PWSL_PROCESS_FRAME WslpProcessLine(
     if (Length != 0 && Buffer[Length - 1] == '\r')
         Length--;
 
-    line = PhConvertUtf8ToUtf16Ex(Buffer, Length);
+    // A line that does not convert is skipped like any other line that does not parse.
+    if (!(line = PhConvertUtf8ToUtf16Ex(Buffer, Length)))
+        return NULL;
+
     lineRef = line->sr;
 
     if (PhEqualStringRef2(&lineRef, L"@end", FALSE))
@@ -801,9 +804,14 @@ PWSL_COLLECTOR WslStartCollector(
 
     // The script is one double-quoted argument, so it must not contain double quotes itself.
     // --cd / keeps the shell off the Windows drives that are mounted in the distribution.
-    script = PhFormatString(WSL_PROCESS_SCRIPT, WSL_REFRESH_INTERVAL_MS / 1000);
+    if (!(script = PhFormatString(WSL_PROCESS_SCRIPT, WSL_REFRESH_INTERVAL_MS / 1000)))
+        return NULL;
+
     arguments = PhFormatString(L"--distribution %s --cd / --exec /bin/sh -c \"%s\"", DistroName->Buffer, script->Buffer);
     PhDereferenceObject(script);
+
+    if (!arguments)
+        return NULL;
 
     collector = PhAllocateZero(sizeof(WSL_COLLECTOR));
     PhSetReference(&collector->DistroName, DistroName);

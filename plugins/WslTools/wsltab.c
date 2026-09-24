@@ -86,6 +86,7 @@ static HWND WslTreeNewHandle = NULL;
 static ULONG WslTreeNewSortColumn = WSLTNC_NAME;
 static PH_SORT_ORDER WslTreeNewSortOrder = AscendingSortOrder;
 static BOOLEAN WslTabSelected = FALSE;
+static BOOLEAN WslUpdateAutomatically = TRUE; // View > Update automatically
 
 static PWSL_SNAPSHOT WslCurrentSnapshot = NULL;
 static PWSL_NODE WslVmNode = NULL;
@@ -178,6 +179,29 @@ static PWSL_NODE WslpFindDistroNode(
     for (ULONG i = 0; i < WslDistroNodes->Count; i++)
     {
         PWSL_NODE node = WslDistroNodes->Items[i];
+
+        if (PhEqualString(node->Id, Id, TRUE))
+            return node;
+    }
+
+    return NULL;
+}
+
+/**
+ * Finds a child node, e.g. the node of a container under its session.
+ *
+ * \param Parent The parent node.
+ * \param Id The child's id, e.g. the container id.
+ * \return The node, or NULL if there is none.
+ */
+static PWSL_NODE WslpFindChildNode(
+    _In_ PWSL_NODE Parent,
+    _In_ PPH_STRING Id
+    )
+{
+    for (ULONG i = 0; i < Parent->Children->Count; i++)
+    {
+        PWSL_NODE node = Parent->Children->Items[i];
 
         if (PhEqualString(node->Id, Id, TRUE))
             return node;
@@ -352,18 +376,7 @@ static VOID WslpUpdateSessionNodes(
         for (ULONG j = 0; j < session->Containers->Count; j++)
         {
             PWSL_CONTAINER container = session->Containers->Items[j];
-            PWSL_NODE containerNode = NULL;
-
-            for (ULONG k = 0; k < sessionNode->Children->Count; k++)
-            {
-                PWSL_NODE node = sessionNode->Children->Items[k];
-
-                if (PhEqualString(node->Id, container->Id, TRUE))
-                {
-                    containerNode = node;
-                    break;
-                }
-            }
+            PWSL_NODE containerNode = WslpFindChildNode(sessionNode, container->Id);
 
             if (!containerNode)
             {
@@ -923,7 +936,7 @@ static VOID WslpSetCpuCellText(
 static VOID WslpSetSizeCellText(
     _Inout_ PPH_TREENEW_GET_CELL_TEXT GetCellText,
     _In_ ULONG64 Size,
-    _Out_writes_bytes_(BufferLength) PWSTR Buffer,
+    _Inout_updates_bytes_(BufferLength) PWSTR Buffer,
     _In_ SIZE_T BufferLength
     )
 {
@@ -1354,7 +1367,7 @@ static NTSTATUS NTAPI WslpActionThread(
     NTSTATUS status;
     PPH_BYTES output = NULL;
 
-    status = WslRunCommandEx(context->FileName, &context->Arguments->sr, &output, TRUE);
+    status = WslRunCommandEx(context->FileName, &context->Arguments->sr, WSL_ACTION_TIMEOUT_MS, &output, TRUE);
     context->Status = status;
 
     if (output)
@@ -1385,16 +1398,20 @@ static NTSTATUS NTAPI WslpActionThread(
  * Starts a wsl.exe or wslc.exe action in the background.
  *
  * \param FileName The executable, from WslGetWslFileName or WslGetWslcFileName.
- * \param Arguments The arguments. This function takes ownership of the string.
+ * \param Arguments The arguments, from PhFormatString. This function takes ownership of the
+ * string; NULL does nothing.
  * \param Description The error text shown if the action fails.
  */
 static VOID WslpStartAction(
     _In_ PPH_STRING FileName,
-    _In_ PPH_STRING Arguments,
+    _In_opt_ PPH_STRING Arguments,
     _In_ PCWSTR Description
     )
 {
     PWSL_ACTION_CONTEXT context;
+
+    if (!Arguments)
+        return;
 
     context = PhAllocateZero(sizeof(WSL_ACTION_CONTEXT));
     context->FileName = FileName;
@@ -1900,7 +1917,7 @@ static BOOLEAN NTAPI WslpTreeNewCallback(
                         node->TooltipText = PhFormatString(L"%s\nPorts: %s", PhGetString(container->Status), container->Ports->Buffer);
                 }
 
-                getCellTooltip->Text = node->TooltipText->sr;
+                getCellTooltip->Text = PhGetStringRef(node->TooltipText);
             }
             else
             {
@@ -2036,6 +2053,7 @@ static VOID WslpSaveTreeListSettings(
 /**
  * Main window tab page callback.
  */
+_Function_class_(PH_MAIN_TAB_PAGE_CALLBACK)
 static BOOLEAN WslpPageCallback(
     _In_ PPH_MAIN_TAB_PAGE Page,
     _In_ PH_MAIN_TAB_PAGE_MESSAGE Message,
@@ -2109,7 +2127,14 @@ static BOOLEAN WslpPageCallback(
             if (WslTabSelected)
                 WslOnProcessesUpdated();
 
-            WslSetProviderEnabled(WSL_PROVIDER_TAB, WslTabSelected);
+            WslSetProviderEnabled(WSL_PROVIDER_TAB, WslTabSelected && WslUpdateAutomatically);
+        }
+        break;
+    case MainTabPageUpdateAutomaticallyChanged:
+        {
+            // Like the Network tab: the provider runs only while the tab is shown and updating.
+            WslUpdateAutomatically = !!PtrToUlong(Parameter1);
+            WslSetProviderEnabled(WSL_PROVIDER_TAB, WslTabSelected && WslUpdateAutomatically);
         }
         break;
     case MainTabPageExportContent:

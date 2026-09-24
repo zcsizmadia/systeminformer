@@ -63,7 +63,7 @@ static CONST PCWSTR WslSysRowLabels[WSL_SYS_BOXES][WSL_SYS_ROWS] =
 };
 
 static HWND WslSysPanel = NULL;
-static PH_STRINGREF WslpServiceName = PH_STRINGREF_INIT(L"WSLService");
+static PH_STRINGREF WslpServiceName = PH_STRINGREF_INIT(L"WSLService"); // not CONST: PhReferenceServiceItem takes a PPH_STRINGREF
 static HWND WslSysPanelBoxes[WSL_SYS_BOXES];
 static HWND WslSysPanelLabels[WSL_SYS_BOXES][WSL_SYS_ROWS];
 static HWND WslSysPanelValues[WSL_SYS_BOXES][WSL_SYS_ROWS];
@@ -189,24 +189,26 @@ static VOID WslpSysFillPrivateData(
 /**
  * Formats a graph tooltip.
  *
- * \param Value The value lines, e.g. "WSL: 1.23%". This function takes ownership of the string.
+ * \param Value The value lines, e.g. "WSL: 1.23%", or NULL. This function takes ownership of the string.
  * \param Index The history index the tooltip is for.
  * \return The tooltip text.
  */
 static PPH_STRING WslpSysFormatTooltip(
-    _In_ PPH_STRING Value,
+    _In_opt_ PPH_STRING Value,
     _In_ ULONG Index
     )
 {
     PH_FORMAT format[3];
+    PPH_STRING text;
 
-    PhInitFormatSR(&format[0], Value->sr);
+    PhInitFormatSR(&format[0], PhGetStringRef(Value));
     PhInitFormatC(&format[1], L'\n');
     PhInitFormatSR(&format[2], PH_AUTO_T(PH_STRING, PhGetStatisticsTimeString(NULL, Index))->sr);
 
-    PhDereferenceObject(Value);
+    text = PhFormat(format, RTL_NUMBER_OF(format), 64);
+    PhClearReference(&Value);
 
-    return PhFormat(format, RTL_NUMBER_OF(format), 64);
+    return text;
 }
 
 /**
@@ -684,7 +686,7 @@ static VOID WslpSysUpdatePanel(
         value = WslpSysGetWslConfigValue(L"wsl2", L"autoMemoryReclaim");
     WslpSysSetValue(WslSysBoxService, 3, value ? value : PhCreateString(L"default"));
 
-    // Header: "2 VMs · WSL 2.9.12.0 · kernel 6.18.40.1"
+    // Header: "2 VMs, WSL 2.9.12.0, kernel 6.18.40.1", separated by middle dots.
     numberOfVms = (WslSysVmProcessItem ? 1 : 0) + (snapshot && snapshot->Sessions ? snapshot->Sessions->Count : (WslSysSessionVmProcessItem ? 1 : 0));
     version = WslpSysGetWslVersion();
 
@@ -702,12 +704,12 @@ static VOID WslpSysUpdatePanel(
             PhMoveReference(&kernelText, PhFormatString(L" \u00b7 kernel %.*s", (INT)(kernel.Length / sizeof(WCHAR)), kernel.Buffer));
         }
 
-        value = PhFormatString(L"%lu %s%s%s", numberOfVms, numberOfVms == 1 ? L"VM" : L"VMs", versionText->Buffer, kernelText->Buffer);
-        PhSetWindowText(GetDlgItem(WslSysDialog, IDC_HEADER), value->Buffer);
+        value = PhFormatString(L"%lu %s%s%s", numberOfVms, numberOfVms == 1 ? L"VM" : L"VMs", PhGetStringOrEmpty(versionText), PhGetStringOrEmpty(kernelText));
+        PhSetWindowText(GetDlgItem(WslSysDialog, IDC_HEADER), PhGetStringOrEmpty(value));
 
-        PhDereferenceObject(value);
-        PhDereferenceObject(versionText);
-        PhDereferenceObject(kernelText);
+        PhClearReference(&value);
+        PhClearReference(&versionText);
+        PhClearReference(&kernelText);
     }
 
     PhClearReference(&snapshot);
@@ -894,6 +896,8 @@ static BOOLEAN WslpSysSectionCallback(
     {
     case SysInfoDestroy:
         {
+            WslSetProviderEnabled(WSL_PROVIDER_SYSINFO, FALSE);
+
             if (WslSysDialog)
             {
                 PhDeleteGraphState(&WslSysCpuGraphState);
@@ -928,6 +932,10 @@ static BOOLEAN WslpSysSectionCallback(
         {
             PH_SYSINFO_VIEW_TYPE view = (PH_SYSINFO_VIEW_TYPE)PtrToUlong(Parameter1);
             PPH_SYSINFO_SECTION section = (PPH_SYSINFO_SECTION)Parameter2;
+
+            // Every section gets this message on every view change. The section dialog is only
+            // hidden when another view is shown, so the provider follows the view, not the dialog.
+            WslSetProviderEnabled(WSL_PROVIDER_SYSINFO, view == SysInfoSectionView && section == Section);
 
             if (view == SysInfoSummaryView || section != Section)
                 return TRUE;

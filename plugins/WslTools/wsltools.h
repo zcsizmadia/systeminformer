@@ -27,6 +27,10 @@
 #define WSL_REFRESH_INTERVAL_MS 5000
 // wsl.exe is killed if it has not exited within this time, e.g. when the WSL service is hung.
 #define WSL_COMMAND_TIMEOUT_MS 10000
+// User actions get longer: stopping a container that ignores SIGTERM waits out its grace period.
+#define WSL_ACTION_TIMEOUT_MS 60000
+// How long unloading waits for the provider thread, which can be inside one command.
+#define WSL_PROVIDER_STOP_TIMEOUT_MS 3000
 
 extern PPH_PLUGIN PluginInstance;
 
@@ -233,6 +237,7 @@ NTSTATUS WslRunCommand(
 NTSTATUS WslRunCommandEx(
     _In_ PPH_STRING FileName,
     _In_ PCPH_STRINGREF Arguments,
+    _In_ ULONG TimeoutMs,
     _Out_opt_ PPH_BYTES *Output,
     _In_ BOOLEAN OutputOnFailure
     );
@@ -260,7 +265,7 @@ VOID WslStartProvider(
     );
 
 VOID WslStopProvider(
-    VOID
+    _In_ BOOLEAN Wait
     );
 
 // Reasons for WslSetProviderEnabled.
@@ -278,6 +283,10 @@ PWSL_SNAPSHOT WslReferenceLatestSnapshot(
 
 VOID WslRefreshProvider(
     VOID
+    );
+
+BOOLEAN WslIsVmProcessName(
+    _In_ PPH_STRING ProcessName
     );
 
 PPH_PROCESS_ITEM WslReferenceVmProcessItem(

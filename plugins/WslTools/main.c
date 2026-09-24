@@ -37,7 +37,10 @@ static VOID NTAPI UnloadCallback(
     _In_opt_ PVOID Context
     )
 {
-    WslStopProvider();
+    BOOLEAN sessionEnding = (BOOLEAN)PtrToUlong(Parameter);
+
+    // At logoff the process is about to end anyway, so do not wait for a command in progress.
+    WslStopProvider(!sessionEnding);
 }
 
 _Function_class_(PH_CALLBACK_FUNCTION)
@@ -101,6 +104,10 @@ static VOID NTAPI ProcessMenuInitializingCallback(
         return;
 
     processItem = menuInfo->u.Process.Processes[0];
+
+    // This runs on every process menu, so rule out other processes before enumerating.
+    if (!processItem->ProcessName || !WslIsVmProcessName(processItem->ProcessName))
+        return;
 
     // Only a vmmem the tab can show gets the item, using the same matching as the tab.
     wslVmItem = WslReferenceVmProcessItem(NULL);

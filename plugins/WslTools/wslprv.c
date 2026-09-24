@@ -34,6 +34,18 @@ static CONST PH_STRINGREF WslpVmProcessNameWin11 = PH_STRINGREF_INIT(L"vmmemWSL"
 static CONST PH_STRINGREF WslpVmProcessName = PH_STRINGREF_INIT(L"vmmem");
 
 /**
+ * Determines whether a process has the name of a WSL VM process, before the more expensive
+ * matching of WslReferenceVmProcessItem.
+ */
+BOOLEAN WslIsVmProcessName(
+    _In_ PPH_STRING ProcessName
+    )
+{
+    return PhEqualStringRef(&ProcessName->sr, &WslpVmProcessNameWin11, TRUE) ||
+        PhEqualStringRef(&ProcessName->sr, &WslpVmProcessName, TRUE);
+}
+
+/**
  * Gets the "{GUID}" that follows "--vm-id " in a WSL helper process command line.
  */
 static BOOLEAN WslpGetVmIdArgument(
@@ -44,6 +56,8 @@ static BOOLEAN WslpGetVmIdArgument(
     static CONST PH_STRINGREF option = PH_STRINGREF_INIT(L"--vm-id ");
     ULONG_PTR index;
     ULONG_PTR close;
+
+    PhInitializeEmptyStringRef(VmId);
 
     if (!CommandLine || (index = PhFindStringInStringRef(&CommandLine->sr, &option, TRUE)) == SIZE_MAX)
         return FALSE;
@@ -92,6 +106,8 @@ static BOOLEAN WslpGetWslVmId(
     static CONST PH_STRINGREF hostName = PH_STRINGREF_INIT(L"wslhost.exe");
     static CONST PH_STRINGREF distroOption = PH_STRINGREF_INIT(L"--distro-id");
 
+    PhInitializeEmptyStringRef(VmId);
+
     for (ULONG i = 0; i < NumberOfProcessItems; i++)
     {
         PPH_PROCESS_ITEM processItem = ProcessItems[i];
@@ -137,6 +153,8 @@ static WSLP_VM_KIND WslpGetVmKind(
     static CONST PH_STRINGREF relayName = PH_STRINGREF_INIT(L"wslrelay.exe");
     static CONST PH_STRINGREF serviceName = PH_STRINGREF_INIT(L"wslservice.exe");
     static CONST PH_STRINGREF sessionName = PH_STRINGREF_INIT(L"wslcsession.exe");
+
+    PhInitializeEmptyStringRef(VmId);
 
     for (ULONG i = 0; i < NumberOfProcessItems; i++)
     {
@@ -306,6 +324,27 @@ static VOID WslpDestroyCollectorEntry(
 }
 
 /**
+ * Finds the collector entry of a distribution.
+ *
+ * \param Id The distribution id.
+ * \return The entry, or NULL if the distribution has no collector.
+ */
+static PWSL_COLLECTOR_ENTRY WslpFindCollectorEntry(
+    _In_ PPH_STRING Id
+    )
+{
+    for (ULONG i = 0; i < WslpCollectors->Count; i++)
+    {
+        PWSL_COLLECTOR_ENTRY entry = WslpCollectors->Items[i];
+
+        if (PhEqualString(entry->Id, Id, TRUE))
+            return entry;
+    }
+
+    return NULL;
+}
+
+/**
  * Stops every collector, e.g. when the tab is hidden.
  */
 static VOID WslpStopAllCollectors(
@@ -364,19 +403,12 @@ static VOID WslpUpdateCollectors(
     for (ULONG i = 0; i < Snapshot->Distributions->Count; i++)
     {
         PWSL_DISTRO_ITEM distro = Snapshot->Distributions->Items[i];
-        PWSL_COLLECTOR_ENTRY entry = NULL;
+        PWSL_COLLECTOR_ENTRY entry;
 
         if (distro->Version != 2)
             continue;
 
-        for (ULONG j = 0; j < WslpCollectors->Count; j++)
-        {
-            if (PhEqualString(((PWSL_COLLECTOR_ENTRY)WslpCollectors->Items[j])->Id, distro->Id, TRUE))
-            {
-                entry = WslpCollectors->Items[j];
-                break;
-            }
-        }
+        entry = WslpFindCollectorEntry(distro->Id);
 
         // A new collector needs a distribution reported as running just now; an existing one
         // also keeps supplying frames while the state is unknown.
@@ -423,11 +455,25 @@ static NTSTATUS NTAPI WslpProviderThread(
             PhClearReference(&vmProcessItem);
 
             snapshot = WslQuerySnapshot(candidates != 0);
+
+            // Each query can take up to WSL_COMMAND_TIMEOUT_MS, so check for a stop between them.
+            if (ReadAcquire(&WslpProviderStopping))
+            {
+                PhDereferenceObject(snapshot);
+                break;
+            }
+
             WslpUpdateCollectors(snapshot);
 
             // A WSLC session is a VM of its own, so without any VM process none can be running.
             if (candidates != 0)
                 snapshot->Sessions = WslQuerySessions();
+
+            if (ReadAcquire(&WslpProviderStopping))
+            {
+                PhDereferenceObject(snapshot);
+                break;
+            }
 
             // The snapshot is complete and no longer changes, so other threads can read it.
             PhAcquireQueuedLockExclusive(&WslpLatestSnapshotLock);
@@ -481,20 +527,27 @@ VOID WslStartProvider(
 }
 
 /**
- * Stops the provider thread and waits for it to exit.
+ * Stops the provider thread and waits a bounded time for it to exit.
+ *
+ * \param Wait FALSE to only signal the thread, e.g. when the session is ending.
+ * \remarks The thread can be inside a wsl.exe or wslc.exe call of up to WSL_COMMAND_TIMEOUT_MS.
+ * If it does not exit in time, its state is left allocated for it: the process is exiting, and
+ * the job objects end the children when their handles close.
  */
 VOID WslStopProvider(
-    VOID
+    _In_ BOOLEAN Wait
     )
 {
+    LARGE_INTEGER timeout;
+
     if (!WslpProviderThreadHandle)
         return;
 
     WriteRelease(&WslpProviderStopping, TRUE);
     NtSetEvent(WslpProviderWakeEvent, NULL);
 
-    // A snapshot in progress can be waiting on wsl.exe, which is bounded by WSL_COMMAND_TIMEOUT_MS.
-    NtWaitForSingleObject(WslpProviderThreadHandle, FALSE, NULL);
+    if (!Wait || NtWaitForSingleObject(WslpProviderThreadHandle, FALSE, PhTimeoutFromMilliseconds(&timeout, WSL_PROVIDER_STOP_TIMEOUT_MS)) != STATUS_WAIT_0)
+        return;
 
     NtClose(WslpProviderThreadHandle);
     WslpProviderThreadHandle = NULL;
