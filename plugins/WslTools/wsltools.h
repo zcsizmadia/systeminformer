@@ -270,4 +270,15 @@ VOID WslOnProcessesUpdated(
     VOID
     );
 
+typedef enum _WSL_VM_SELECTION
+{
+    WslVmSelectionNone,
+    WslVmSelectionWsl, // The WSL 2 VM row
+    WslVmSelectionSession // The row of the single running WSLC session
+} WSL_VM_SELECTION;
+
+VOID WslSelectVmNode(
+    _In_ WSL_VM_SELECTION Selection
+    );
+
 #endif
