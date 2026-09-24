@@ -57,8 +57,8 @@ BEGIN
     LTEXT           "WSL",IDC_TITLE,0,0,72,21
     LTEXT           "Panel layout",IDC_PANEL_LAYOUT,0,146,315,39,NOT WS_VISIBLE
     CONTROL         "",IDC_GRAPH_LAYOUT,"Static",SS_NOTIFY | NOT WS_VISIBLE,0,22,315,121
-    LTEXT           "CPU usage:",IDC_CPU_L,111,1,52,8
-    LTEXT           "Private bytes:",IDC_PRIVATE_L,111,7,56,8
+    LTEXT           "CPU usage (WSL, with the WSLC session stacked above):",IDC_CPU_L,111,1,200,8
+    LTEXT           "Private bytes (WSL, with the WSLC session stacked above):",IDC_PRIVATE_L,111,7,200,8
 END
 
 IDD_SYSINFO_WSLPANEL DIALOGEX 0, 0, 292, 38

@@ -12,9 +12,15 @@
 #include "wsltools.h"
 
 // The WSL section of System Information graphs the CPU usage and private bytes of the
-// WSL 2 virtual machine process. The history comes from the process item itself, which
-// the process provider already samples, so the section adds no sampling of its own.
-// Everything here runs on the System Information window thread.
+// WSL 2 VM process and, stacked on top, of the WSLC session VM process. The history comes
+// from the process items themselves, which the process provider already samples, so the
+// section adds no sampling of its own. Everything here runs on the System Information
+// window thread.
+
+// The two VMs use System Informer's configurable graph colors: green for the WSL VM and
+// blue for the session VM, as the default colors of these settings are.
+#define WSL_SYS_COLOR_WSL_VM SETTING_COLOR_CPU_KERNEL
+#define WSL_SYS_COLOR_SESSION_VM SETTING_COLOR_PHYSICAL
 
 #define GRAPH_PADDING 3
 
@@ -35,6 +41,7 @@ static HWND WslSysPanelPrivateLabel = NULL;
 
 static PPH_PROCESS_ITEM WslSysVmProcessItem = NULL;
 static ULONG WslSysVmCandidates = 0;
+static PPH_PROCESS_ITEM WslSysSessionVmProcessItem = NULL;
 
 /**
  * Gets the display text for the VM state.
@@ -52,11 +59,57 @@ static PCPH_STRINGREF WslpSysGetVmStateText(
 }
 
 /**
- * Fills graph data with the VM's kernel and user CPU history.
+ * Gets the number of history samples to draw: the longer history of the two VMs.
+ */
+static ULONG WslpSysGetHistoryCount(
+    VOID
+    )
+{
+    ULONG count = 0;
+
+    if (WslSysVmProcessItem)
+        count = WslSysVmProcessItem->CpuKernelHistory.Count;
+    if (WslSysSessionVmProcessItem)
+        count = max(count, WslSysSessionVmProcessItem->CpuKernelHistory.Count);
+
+    return count;
+}
+
+/**
+ * Gets the CPU usage of a VM process at a history index, or 0 before the process existed.
+ */
+static FLOAT WslpSysGetCpu(
+    _In_opt_ PPH_PROCESS_ITEM ProcessItem,
+    _In_ ULONG Index
+    )
+{
+    if (!ProcessItem || Index >= ProcessItem->CpuKernelHistory.Count)
+        return 0;
+
+    return PhGetItemCircularBuffer_FLOAT(&ProcessItem->CpuKernelHistory, Index) +
+        PhGetItemCircularBuffer_FLOAT(&ProcessItem->CpuUserHistory, Index);
+}
+
+/**
+ * Gets the private bytes of a VM process at a history index, or 0 before the process existed.
+ */
+static SIZE_T WslpSysGetPrivateBytes(
+    _In_opt_ PPH_PROCESS_ITEM ProcessItem,
+    _In_ ULONG Index
+    )
+{
+    if (!ProcessItem || Index >= ProcessItem->PrivateBytesHistory.Count)
+        return 0;
+
+    return PhGetItemCircularBuffer_SIZE_T(&ProcessItem->PrivateBytesHistory, Index);
+}
+
+/**
+ * Fills graph data with the CPU history of the WSL VM, and of the session VM stacked on it.
  *
  * \param DrawInfo The draw info whose LineDataCount has been set.
- * \param Data1 Receives the kernel CPU values.
- * \param Data2 Receives the user CPU values.
+ * \param Data1 Receives the WSL VM values.
+ * \param Data2 Receives the session VM values.
  */
 static VOID WslpSysFillCpuData(
     _In_ PPH_GRAPH_DRAW_INFO DrawInfo,
@@ -67,33 +120,38 @@ static VOID WslpSysFillCpuData(
     // CPU usage is already a fraction of all processors, so the graph needs no scaling.
     for (ULONG i = 0; i < DrawInfo->LineDataCount; i++)
     {
-        Data1[i] = PhGetItemCircularBuffer_FLOAT(&WslSysVmProcessItem->CpuKernelHistory, i);
-        Data2[i] = PhGetItemCircularBuffer_FLOAT(&WslSysVmProcessItem->CpuUserHistory, i);
+        Data1[i] = WslpSysGetCpu(WslSysVmProcessItem, i);
+        Data2[i] = WslpSysGetCpu(WslSysSessionVmProcessItem, i);
     }
 }
 
 /**
- * Fills graph data with the VM's private bytes history, scaled to the largest value.
+ * Fills graph data with the private bytes history of both VMs, scaled to the largest total.
  *
  * \param DrawInfo The draw info whose LineDataCount has been set.
- * \param Data1 Receives the scaled values.
+ * \param Data1 Receives the WSL VM values.
+ * \param Data2 Receives the session VM values.
  */
 static VOID WslpSysFillPrivateData(
     _Inout_ PPH_GRAPH_DRAW_INFO DrawInfo,
-    _Out_writes_(DrawInfo->LineDataCount) PFLOAT Data1
+    _Out_writes_(DrawInfo->LineDataCount) PFLOAT Data1,
+    _Out_writes_(DrawInfo->LineDataCount) PFLOAT Data2
     )
 {
     FLOAT max = 1024 * 1024; // Minimum scaling of 1 MB
 
     for (ULONG i = 0; i < DrawInfo->LineDataCount; i++)
     {
-        Data1[i] = (FLOAT)PhGetItemCircularBuffer_SIZE_T(&WslSysVmProcessItem->PrivateBytesHistory, i);
+        Data1[i] = (FLOAT)WslpSysGetPrivateBytes(WslSysVmProcessItem, i);
+        Data2[i] = (FLOAT)WslpSysGetPrivateBytes(WslSysSessionVmProcessItem, i);
 
-        if (max < Data1[i])
-            max = Data1[i];
+        // The lines are stacked, so the scale must fit their sum.
+        if (max < Data1[i] + Data2[i])
+            max = Data1[i] + Data2[i];
     }
 
     PhDivideSinglesBySingle(Data1, max, DrawInfo->LineDataCount);
+    PhDivideSinglesBySingle(Data2, max, DrawInfo->LineDataCount);
 
     DrawInfo->LabelYFunction = PhSiSizeLabelYFunction;
     DrawInfo->LabelYFunctionParameter = max;
@@ -102,7 +160,7 @@ static VOID WslpSysFillPrivateData(
 /**
  * Formats a graph tooltip.
  *
- * \param Value The value line, e.g. "CPU: 1.23%".
+ * \param Value The value lines, e.g. "WSL: 1.23%". This function takes ownership of the string.
  * \param Index The history index the tooltip is for.
  * \return The tooltip text.
  */
@@ -123,32 +181,47 @@ static PPH_STRING WslpSysFormatTooltip(
 }
 
 /**
- * Gets the CPU tooltip for a history index.
+ * Gets the CPU tooltip for a history index, with a line per VM.
  */
 static PPH_STRING WslpSysGetCpuTooltip(
     _In_ ULONG Index
     )
 {
-    FLOAT cpu;
+    if (!WslSysSessionVmProcessItem)
+        return WslpSysFormatTooltip(PhFormatString(L"WSL: %.2f%%", WslpSysGetCpu(WslSysVmProcessItem, Index) * 100), Index);
 
-    cpu = PhGetItemCircularBuffer_FLOAT(&WslSysVmProcessItem->CpuKernelHistory, Index) +
-        PhGetItemCircularBuffer_FLOAT(&WslSysVmProcessItem->CpuUserHistory, Index);
-
-    return WslpSysFormatTooltip(PhFormatString(L"CPU: %.2f%%", cpu * 100), Index);
+    return WslpSysFormatTooltip(PhFormatString(
+        L"WSL: %.2f%%\nSession: %.2f%%",
+        WslpSysGetCpu(WslSysVmProcessItem, Index) * 100,
+        WslpSysGetCpu(WslSysSessionVmProcessItem, Index) * 100
+        ), Index);
 }
 
 /**
- * Gets the private bytes tooltip for a history index.
+ * Gets the private bytes tooltip for a history index, with a line per VM.
  */
 static PPH_STRING WslpSysGetPrivateTooltip(
     _In_ ULONG Index
     )
 {
-    SIZE_T privateBytes;
+    PPH_STRING wslText = PhFormatSize(WslpSysGetPrivateBytes(WslSysVmProcessItem, Index), ULONG_MAX);
+    PPH_STRING text;
 
-    privateBytes = PhGetItemCircularBuffer_SIZE_T(&WslSysVmProcessItem->PrivateBytesHistory, Index);
+    if (WslSysSessionVmProcessItem)
+    {
+        PPH_STRING sessionText = PhFormatSize(WslpSysGetPrivateBytes(WslSysSessionVmProcessItem, Index), ULONG_MAX);
 
-    return WslpSysFormatTooltip(PhFormatSize(privateBytes, ULONG_MAX), Index);
+        text = PhFormatString(L"WSL: %s\nSession: %s", wslText->Buffer, sessionText->Buffer);
+        PhDereferenceObject(sessionText);
+    }
+    else
+    {
+        text = PhFormatString(L"WSL: %s", wslText->Buffer);
+    }
+
+    PhDereferenceObject(wslText);
+
+    return WslpSysFormatTooltip(text, Index);
 }
 
 /**
@@ -166,14 +239,13 @@ static VOID WslpSysNotifyCpuGraph(
             PPH_GRAPH_DRAW_INFO drawInfo = getDrawInfo->DrawInfo;
 
             drawInfo->Flags = PH_GRAPH_USE_GRID_X | PH_GRAPH_USE_GRID_Y | PH_GRAPH_USE_LINE_2;
-            WslSysSection->Parameters->ColorSetupFunction(drawInfo, PhGetIntegerSetting(SETTING_COLOR_CPU_KERNEL), PhGetIntegerSetting(SETTING_COLOR_CPU_USER), WslSysSection->Parameters->WindowDpi);
+            WslSysSection->Parameters->ColorSetupFunction(drawInfo, PhGetIntegerSetting(WSL_SYS_COLOR_WSL_VM), PhGetIntegerSetting(WSL_SYS_COLOR_SESSION_VM), WslSysSection->Parameters->WindowDpi);
 
-            PhGraphStateGetDrawInfo(&WslSysCpuGraphState, getDrawInfo, WslSysVmProcessItem ? WslSysVmProcessItem->CpuKernelHistory.Count : 0);
+            PhGraphStateGetDrawInfo(&WslSysCpuGraphState, getDrawInfo, WslpSysGetHistoryCount());
 
             if (!WslSysCpuGraphState.Valid)
             {
-                if (WslSysVmProcessItem)
-                    WslpSysFillCpuData(drawInfo, WslSysCpuGraphState.Data1, WslSysCpuGraphState.Data2);
+                WslpSysFillCpuData(drawInfo, WslSysCpuGraphState.Data1, WslSysCpuGraphState.Data2);
 
                 WslSysCpuGraphState.Valid = TRUE;
             }
@@ -183,7 +255,7 @@ static VOID WslpSysNotifyCpuGraph(
         {
             PPH_GRAPH_GETTOOLTIPTEXT getTooltipText = (PPH_GRAPH_GETTOOLTIPTEXT)Header;
 
-            if (WslSysVmProcessItem && getTooltipText->Index < getTooltipText->TotalCount)
+            if ((WslSysVmProcessItem || WslSysSessionVmProcessItem) && getTooltipText->Index < getTooltipText->TotalCount)
             {
                 if (WslSysCpuGraphState.TooltipIndex != getTooltipText->Index)
                     PhMoveReference(&WslSysCpuGraphState.TooltipText, WslpSysGetCpuTooltip(getTooltipText->Index));
@@ -209,15 +281,14 @@ static VOID WslpSysNotifyPrivateGraph(
             PPH_GRAPH_GETDRAWINFO getDrawInfo = (PPH_GRAPH_GETDRAWINFO)Header;
             PPH_GRAPH_DRAW_INFO drawInfo = getDrawInfo->DrawInfo;
 
-            drawInfo->Flags = PH_GRAPH_USE_GRID_X | PH_GRAPH_USE_GRID_Y | PH_GRAPH_LABEL_MAX_Y;
-            WslSysSection->Parameters->ColorSetupFunction(drawInfo, PhGetIntegerSetting(SETTING_COLOR_PRIVATE), 0, WslSysSection->Parameters->WindowDpi);
+            drawInfo->Flags = PH_GRAPH_USE_GRID_X | PH_GRAPH_USE_GRID_Y | PH_GRAPH_LABEL_MAX_Y | PH_GRAPH_USE_LINE_2;
+            WslSysSection->Parameters->ColorSetupFunction(drawInfo, PhGetIntegerSetting(WSL_SYS_COLOR_WSL_VM), PhGetIntegerSetting(WSL_SYS_COLOR_SESSION_VM), WslSysSection->Parameters->WindowDpi);
 
-            PhGraphStateGetDrawInfo(&WslSysPrivateGraphState, getDrawInfo, WslSysVmProcessItem ? WslSysVmProcessItem->PrivateBytesHistory.Count : 0);
+            PhGraphStateGetDrawInfo(&WslSysPrivateGraphState, getDrawInfo, WslpSysGetHistoryCount());
 
             if (!WslSysPrivateGraphState.Valid)
             {
-                if (WslSysVmProcessItem)
-                    WslpSysFillPrivateData(drawInfo, WslSysPrivateGraphState.Data1);
+                WslpSysFillPrivateData(drawInfo, WslSysPrivateGraphState.Data1, WslSysPrivateGraphState.Data2);
 
                 WslSysPrivateGraphState.Valid = TRUE;
             }
@@ -227,7 +298,7 @@ static VOID WslpSysNotifyPrivateGraph(
         {
             PPH_GRAPH_GETTOOLTIPTEXT getTooltipText = (PPH_GRAPH_GETTOOLTIPTEXT)Header;
 
-            if (WslSysVmProcessItem && getTooltipText->Index < getTooltipText->TotalCount)
+            if ((WslSysVmProcessItem || WslSysSessionVmProcessItem) && getTooltipText->Index < getTooltipText->TotalCount)
             {
                 if (WslSysPrivateGraphState.TooltipIndex != getTooltipText->Index)
                     PhMoveReference(&WslSysPrivateGraphState.TooltipText, WslpSysGetPrivateTooltip(getTooltipText->Index));
@@ -519,12 +590,14 @@ static BOOLEAN WslpSysSectionCallback(
             }
 
             PhClearReference(&WslSysVmProcessItem);
+            PhClearReference(&WslSysSessionVmProcessItem);
         }
         return TRUE;
     case SysInfoTick:
         {
             // The VM process comes and goes with WSL, so look it up again on every tick.
             PhMoveReference(&WslSysVmProcessItem, WslReferenceVmProcessItem(&WslSysVmCandidates));
+            PhMoveReference(&WslSysSessionVmProcessItem, WslReferenceSessionVmProcessItem());
 
             if (WslSysDialog)
             {
@@ -564,15 +637,14 @@ static BOOLEAN WslpSysSectionCallback(
         {
             PPH_GRAPH_DRAW_INFO drawInfo = Parameter1;
 
-            // The summary graph shows CPU, like the built-in CPU section.
+            // The summary graph shows CPU of both VMs, stacked, like the built-in CPU section.
             drawInfo->Flags = PH_GRAPH_USE_GRID_X | PH_GRAPH_USE_GRID_Y | PH_GRAPH_USE_LINE_2;
-            Section->Parameters->ColorSetupFunction(drawInfo, PhGetIntegerSetting(SETTING_COLOR_CPU_KERNEL), PhGetIntegerSetting(SETTING_COLOR_CPU_USER), Section->Parameters->WindowDpi);
-            PhGetDrawInfoGraphBuffers(&Section->GraphState.Buffers, drawInfo, WslSysVmProcessItem ? WslSysVmProcessItem->CpuKernelHistory.Count : 0);
+            Section->Parameters->ColorSetupFunction(drawInfo, PhGetIntegerSetting(WSL_SYS_COLOR_WSL_VM), PhGetIntegerSetting(WSL_SYS_COLOR_SESSION_VM), Section->Parameters->WindowDpi);
+            PhGetDrawInfoGraphBuffers(&Section->GraphState.Buffers, drawInfo, WslpSysGetHistoryCount());
 
             if (!Section->GraphState.Valid)
             {
-                if (WslSysVmProcessItem)
-                    WslpSysFillCpuData(drawInfo, Section->GraphState.Data1, Section->GraphState.Data2);
+                WslpSysFillCpuData(drawInfo, Section->GraphState.Data1, Section->GraphState.Data2);
 
                 Section->GraphState.Valid = TRUE;
             }
@@ -582,7 +654,7 @@ static BOOLEAN WslpSysSectionCallback(
         {
             PPH_SYSINFO_GRAPH_GET_TOOLTIP_TEXT getTooltipText = Parameter1;
 
-            if (!WslSysVmProcessItem)
+            if (!WslSysVmProcessItem && !WslSysSessionVmProcessItem)
                 return FALSE;
 
             PhMoveReference(&Section->GraphState.TooltipText, WslpSysGetCpuTooltip(getTooltipText->Index));
