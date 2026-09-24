@@ -31,14 +31,132 @@ static CONST PH_STRINGREF WslpVmProcessNameWin11 = PH_STRINGREF_INIT(L"vmmemWSL"
 static CONST PH_STRINGREF WslpVmProcessName = PH_STRINGREF_INIT(L"vmmem");
 
 /**
+ * Gets the "{GUID}" that follows "--vm-id " in a WSL helper process command line.
+ */
+static BOOLEAN WslpGetVmIdArgument(
+    _In_opt_ PPH_STRING CommandLine,
+    _Out_ PPH_STRINGREF VmId
+    )
+{
+    static CONST PH_STRINGREF option = PH_STRINGREF_INIT(L"--vm-id ");
+    ULONG_PTR index;
+    ULONG_PTR close;
+
+    if (!CommandLine || (index = PhFindStringInStringRef(&CommandLine->sr, &option, TRUE)) == SIZE_MAX)
+        return FALSE;
+
+    VmId->Buffer = CommandLine->Buffer + index + option.Length / sizeof(WCHAR);
+    VmId->Length = CommandLine->Length - index * sizeof(WCHAR) - option.Length;
+
+    if (VmId->Length == 0 || VmId->Buffer[0] != L'{' || (close = PhFindCharInStringRef(VmId, L'}', FALSE)) == SIZE_MAX)
+        return FALSE;
+
+    VmId->Length = (close + 1) * sizeof(WCHAR);
+
+    return TRUE;
+}
+
+/**
+ * Finds a process item by process ID in an enumeration.
+ */
+static PPH_PROCESS_ITEM WslpFindProcessItem(
+    _In_reads_(NumberOfProcessItems) PPH_PROCESS_ITEM *ProcessItems,
+    _In_ ULONG NumberOfProcessItems,
+    _In_ HANDLE ProcessId
+    )
+{
+    for (ULONG i = 0; i < NumberOfProcessItems; i++)
+    {
+        if (ProcessItems[i]->ProcessId == ProcessId)
+            return ProcessItems[i];
+    }
+
+    return NULL;
+}
+
+/**
+ * Picks the WSL VM out of several vmmem processes.
+ *
+ * \return The WSL VM process item, or NULL if it cannot be identified.
+ * \remarks A vmmem process can only be opened with administrative rights, so its VM cannot
+ * be read from it. Instead: the WSL VM's ID is on the command line of the wslhost.exe that
+ * hosts a distribution ("--distro-id ... --vm-id {id}"), and wslservice.exe starts a
+ * wslrelay.exe with "--vm-id {id}" about a second after each VM's vmmem appears. The vmmem
+ * whose relay started within a few seconds after it, with the WSL VM's ID, is the WSL VM.
+ * This is inferred from observed process start order, not from a documented interface, so
+ * anything unexpected leaves the VM unidentified rather than guessed.
+ */
+static PPH_PROCESS_ITEM WslpIdentifyWslVm(
+    _In_reads_(NumberOfProcessItems) PPH_PROCESS_ITEM *ProcessItems,
+    _In_ ULONG NumberOfProcessItems,
+    _In_ PPH_LIST Candidates
+    )
+{
+    static CONST PH_STRINGREF hostName = PH_STRINGREF_INIT(L"wslhost.exe");
+    static CONST PH_STRINGREF relayName = PH_STRINGREF_INIT(L"wslrelay.exe");
+    static CONST PH_STRINGREF serviceName = PH_STRINGREF_INIT(L"wslservice.exe");
+    static CONST PH_STRINGREF distroOption = PH_STRINGREF_INIT(L"--distro-id");
+    PH_STRINGREF wslVmId;
+    BOOLEAN haveWslVmId = FALSE;
+
+    for (ULONG i = 0; i < NumberOfProcessItems && !haveWslVmId; i++)
+    {
+        PPH_PROCESS_ITEM processItem = ProcessItems[i];
+
+        if (processItem->ProcessName && processItem->CommandLine &&
+            PhEqualStringRef(&processItem->ProcessName->sr, &hostName, TRUE) &&
+            PhFindStringInStringRef(&processItem->CommandLine->sr, &distroOption, TRUE) != SIZE_MAX)
+        {
+            haveWslVmId = WslpGetVmIdArgument(processItem->CommandLine, &wslVmId);
+        }
+    }
+
+    if (!haveWslVmId)
+        return NULL;
+
+    for (ULONG i = 0; i < Candidates->Count; i++)
+    {
+        PPH_PROCESS_ITEM vmItem = Candidates->Items[i];
+
+        for (ULONG j = 0; j < NumberOfProcessItems; j++)
+        {
+            PPH_PROCESS_ITEM relayItem = ProcessItems[j];
+            PPH_PROCESS_ITEM parentItem;
+            PH_STRINGREF relayVmId;
+            LONG64 delay;
+
+            if (!relayItem->ProcessName || !PhEqualStringRef(&relayItem->ProcessName->sr, &relayName, TRUE))
+                continue;
+
+            delay = relayItem->CreateTime.QuadPart - vmItem->CreateTime.QuadPart;
+
+            if (delay < 0 || delay > 5 * PH_TICKS_PER_SEC)
+                continue;
+
+            // Only a relay that the WSL service started counts.
+            if (!(parentItem = WslpFindProcessItem(ProcessItems, NumberOfProcessItems, relayItem->ParentProcessId)) ||
+                !parentItem->ProcessName || !PhEqualStringRef(&parentItem->ProcessName->sr, &serviceName, TRUE))
+            {
+                continue;
+            }
+
+            if (WslpGetVmIdArgument(relayItem->CommandLine, &relayVmId) && PhEqualStringRef(&relayVmId, &wslVmId, TRUE))
+                return vmItem;
+        }
+    }
+
+    return NULL;
+}
+
+/**
  * Finds the process that hosts the WSL 2 virtual machine.
  *
  * \param NumberOfCandidates Receives the number of processes that could be the WSL VM.
- * \return The VM process item, or NULL if there is none or it is ambiguous. The caller
- * owns the reference.
+ * \return The VM process item, or NULL if there is none or it cannot be identified. The
+ * caller owns the reference.
  * \remarks Windows 11 names the WSL VM process "vmmemWSL". Windows 10 names every VM
- * process "vmmem", including Hyper-V and WSLC session VMs, so there the process is only
- * returned when it is the single candidate.
+ * process "vmmem", including Hyper-V and WSLC session VMs; a single one is the WSL VM, and
+ * several are told apart by WslpIdentifyWslVm.
  */
 PPH_PROCESS_ITEM WslReferenceVmProcessItem(
     _Out_opt_ PULONG NumberOfCandidates
@@ -47,10 +165,10 @@ PPH_PROCESS_ITEM WslReferenceVmProcessItem(
     PPH_PROCESS_ITEM *processItems;
     ULONG numberOfProcessItems;
     PPH_PROCESS_ITEM vmProcessItem = NULL;
-    PPH_PROCESS_ITEM candidateItem = NULL;
-    ULONG candidates = 0;
+    PPH_LIST candidates;
 
     PhEnumProcessItems(&processItems, &numberOfProcessItems);
+    candidates = PhCreateList(2);
 
     for (ULONG i = 0; i < numberOfProcessItems; i++)
     {
@@ -62,28 +180,29 @@ PPH_PROCESS_ITEM WslReferenceVmProcessItem(
         if (PhEqualStringRef(&processItem->ProcessName->sr, &WslpVmProcessNameWin11, TRUE))
         {
             vmProcessItem = processItem;
-            candidates = 1;
+            PhClearList(candidates);
+            PhAddItemList(candidates, processItem);
             break;
         }
 
         if (PhEqualStringRef(&processItem->ProcessName->sr, &WslpVmProcessName, TRUE))
-        {
-            candidateItem = processItem;
-            candidates++;
-        }
+            PhAddItemList(candidates, processItem);
     }
 
-    if (!vmProcessItem && candidates == 1)
-        vmProcessItem = candidateItem;
+    if (!vmProcessItem && candidates->Count == 1)
+        vmProcessItem = candidates->Items[0];
+    else if (!vmProcessItem && candidates->Count > 1)
+        vmProcessItem = WslpIdentifyWslVm(processItems, numberOfProcessItems, candidates);
 
     if (vmProcessItem)
         PhReferenceObject(vmProcessItem);
 
+    if (NumberOfCandidates)
+        *NumberOfCandidates = candidates->Count;
+
+    PhDereferenceObject(candidates);
     PhDereferenceObjects(processItems, numberOfProcessItems);
     PhFree(processItems);
-
-    if (NumberOfCandidates)
-        *NumberOfCandidates = candidates;
 
     return vmProcessItem;
 }
