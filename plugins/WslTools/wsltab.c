@@ -93,6 +93,9 @@ static PPH_LIST WslRootNodes = NULL; // PWSL_NODE, the VM node, WSL 1 distributi
 static PPH_LIST WslSessionNodes = NULL; // PWSL_NODE, all WSLC sessions
 static PPH_PROCESS_ITEM WslVmProcessItem = NULL;
 static ULONG WslVmCandidates = 0;
+// The session VM process, only while exactly one session runs, because nothing links a
+// session VM to a session name.
+static PPH_PROCESS_ITEM WslSessionVmProcessItem = NULL;
 
 static CONST PH_STRINGREF WslPageText = PH_STRINGREF_INIT(L"WSL");
 static CONST PH_STRINGREF WslVmNodeText = PH_STRINGREF_INIT(L"WSL");
@@ -495,12 +498,15 @@ VOID WslOnProcessesUpdated(
         return;
 
     PhMoveReference(&WslVmProcessItem, WslReferenceVmProcessItem(&WslVmCandidates));
+    PhMoveReference(&WslSessionVmProcessItem, WslSessionNodes->Count == 1 ? WslReferenceSessionVmProcessItem() : NULL);
 
     if (WslVmNode)
-    {
         WslpInvalidateNode(WslVmNode);
-        InvalidateRect(WslTreeNewHandle, NULL, FALSE);
-    }
+
+    for (ULONG i = 0; i < WslSessionNodes->Count; i++)
+        WslpInvalidateNode(WslSessionNodes->Items[i]);
+
+    InvalidateRect(WslTreeNewHandle, NULL, FALSE);
 }
 
 /**
@@ -519,6 +525,8 @@ static ULONG64 WslpGetNodeMemory(
     case WslNodeTypeLinuxProcess:
         return Node->LinuxProcess->ResidentBytes;
     case WslNodeTypeSession:
+        if (WslSessionVmProcessItem)
+            return WslSessionVmProcessItem->VmCounters.PagefileUsage;
         return Node->Session->HaveStats ? Node->Session->MemoryBytes : 0;
     case WslNodeTypeContainer:
         return Node->Container->HaveStats ? Node->Container->MemoryBytes : 0;
@@ -539,6 +547,7 @@ static PCPH_STRINGREF WslpGetMemoryTooltip(
     static CONST PH_STRINGREF processText = PH_STRINGREF_INIT(L"Resident set of the Linux process.");
     static CONST PH_STRINGREF containerText = PH_STRINGREF_INIT(L"Memory usage as reported by wslc stats.");
     static CONST PH_STRINGREF sessionText = PH_STRINGREF_INIT(L"Sum of the memory usage of the session's running containers.");
+    static CONST PH_STRINGREF sessionVmText = PH_STRINGREF_INIT(L"Private bytes of the session VM process: the memory the VM holds on the host.");
 
     switch (Node->Type)
     {
@@ -549,7 +558,7 @@ static PCPH_STRINGREF WslpGetMemoryTooltip(
     case WslNodeTypeLinuxProcess:
         return &processText;
     case WslNodeTypeSession:
-        return &sessionText;
+        return WslSessionVmProcessItem ? &sessionVmText : &sessionText;
     default:
         return &containerText;
     }
@@ -1094,6 +1103,10 @@ static VOID WslpGetSessionCellText(
     case WSLTNC_NAME:
         GetCellText->Text = PhGetStringRef(Node->NameText);
         break;
+    case WSLTNC_PID:
+        if (WslSessionVmProcessItem)
+            WslpSetNumberCellText(GetCellText, Node, HandleToUlong(WslSessionVmProcessItem->ProcessId));
+        break;
     case WSLTNC_TYPE:
         PhInitializeStringRef(&GetCellText->Text, L"Container VM");
         break;
@@ -1102,8 +1115,20 @@ static VOID WslpGetSessionCellText(
         GetCellText->Text = *WslGetDistroStateText(WslDistroStateRunning);
         break;
     case WSLTNC_CPU:
-        if (session->HaveStats)
+        // The VM's CPU usage includes the session's own processes, not only the containers'.
+        if (WslSessionVmProcessItem)
+            WslpSetCpuCellText(GetCellText, Node, WslSessionVmProcessItem->CpuUsage);
+        else if (session->HaveStats)
             WslpSetCpuCellText(GetCellText, Node, session->CpuUsage);
+        break;
+    case WSLTNC_STATUS:
+        if (WslSessionVmProcessItem)
+        {
+            LARGE_INTEGER now;
+
+            PhQuerySystemTime(&now);
+            WslpSetUptimeCellText(GetCellText, Node, now.QuadPart > WslSessionVmProcessItem->CreateTime.QuadPart ? now.QuadPart - WslSessionVmProcessItem->CreateTime.QuadPart : 0);
+        }
         break;
     case WSLTNC_MEMORY:
         WslpSetSizeCellText(GetCellText, WslpGetNodeMemory(Node), Node->MemoryText, sizeof(Node->MemoryText));
@@ -1255,6 +1280,65 @@ static VOID WslpStartAction(
 }
 
 /**
+ * Gets the first published TCP host port of a container.
+ *
+ * \param Ports The ports text from wslc list, e.g. "0.0.0.0:8080->80/tcp, [::]:8080->80/tcp".
+ * \return The host port, or 0 if the container publishes no TCP port.
+ */
+static USHORT WslpGetContainerHostPort(
+    _In_opt_ PPH_STRING Ports
+    )
+{
+    static CONST PH_STRINGREF arrow = PH_STRINGREF_INIT(L"->");
+    static CONST PH_STRINGREF tcp = PH_STRINGREF_INIT(L"/tcp");
+    static CONST PH_STRINGREF space = PH_STRINGREF_INIT(L" ");
+    PH_STRINGREF remaining;
+
+    if (PhIsNullOrEmptyString(Ports))
+        return 0;
+
+    remaining = Ports->sr;
+
+    while (remaining.Length != 0)
+    {
+        PH_STRINGREF entry;
+        PH_STRINGREF host;
+        PH_STRINGREF container;
+        PH_STRINGREF address;
+        PH_STRINGREF port;
+        ULONG64 value;
+
+        PhSplitStringRefAtChar(&remaining, L',', &entry, &remaining);
+        PhTrimStringRef(&entry, &space, 0);
+
+        // "<address>:<host port>-><container port>/<protocol>"; only published TCP ports have a host part.
+        if (!PhSplitStringRefAtString(&entry, &arrow, FALSE, &host, &container) || !PhEndsWithStringRef(&container, &tcp, TRUE))
+            continue;
+
+        if (PhSplitStringRefAtLastChar(&host, L':', &address, &port) && PhStringToUInt64(&port, 10, &value) && value != 0 && value <= USHRT_MAX)
+            return (USHORT)value;
+    }
+
+    return 0;
+}
+
+/**
+ * Selects the process of a VM in the Processes tab.
+ */
+static VOID WslpGoToVmProcess(
+    _In_opt_ PPH_PROCESS_ITEM ProcessItem
+    )
+{
+    PPH_PROCESS_NODE processNode;
+
+    if (ProcessItem && (processNode = PhFindProcessNode(ProcessItem->ProcessId)))
+    {
+        SystemInformer_SelectTabPage(0);
+        SystemInformer_SelectProcessNode(processNode);
+    }
+}
+
+/**
  * Handles a command from the context menu or keyboard.
  *
  * \param WindowHandle The tree window handle.
@@ -1335,16 +1419,24 @@ static VOID WslpHandleCommand(
         break;
     case ID_WSL_GOTOPROCESS:
         {
-            PPH_PROCESS_NODE processNode;
-
-            if (!WslVmProcessItem)
+            if (!node)
                 break;
 
-            if (processNode = PhFindProcessNode(WslVmProcessItem->ProcessId))
-            {
-                SystemInformer_SelectTabPage(0);
-                SystemInformer_SelectProcessNode(processNode);
-            }
+            // The WSL VM for its own row, the session VM for a session and its containers.
+            if (node->Type == WslNodeTypeSession || node->Type == WslNodeTypeContainer)
+                WslpGoToVmProcess(WslSessionVmProcessItem);
+            else
+                WslpGoToVmProcess(WslVmProcessItem);
+        }
+        break;
+    case ID_WSL_CONTAINEROPENPORT:
+        {
+            USHORT port;
+
+            if (!node || !node->Container || !(port = WslpGetContainerHostPort(node->Container->Ports)))
+                break;
+
+            PhShellExecute(WindowHandle, PhaFormatString(L"http://localhost:%hu/", port)->Buffer, NULL);
         }
         break;
     case ID_WSL_CONTAINERSHELL:
@@ -1427,6 +1519,8 @@ static VOID WslpShowContextMenu(
     PWSL_NODE node = WslpGetSelectedNode();
     PPH_EMENU menu;
     PPH_EMENU_ITEM item;
+    PPH_STRING portText = NULL; // Kept alive until the menu is destroyed
+    USHORT port;
 
     if (!node)
         return;
@@ -1453,12 +1547,33 @@ static VOID WslpShowContextMenu(
         PhInsertEMenuItem(menu, PhCreateEMenuItem(0, ID_WSL_CONTAINERRESTART, L"&Restart", NULL, NULL), ULONG_MAX);
         PhInsertEMenuItem(menu, PhCreateEMenuItem(0, ID_WSL_CONTAINERKILL, L"&Kill", NULL, NULL), ULONG_MAX);
 
+        PhInsertEMenuItem(menu, PhCreateEMenuSeparator(), ULONG_MAX);
+
+        if (port = WslpGetContainerHostPort(node->Container->Ports))
+        {
+            PhMoveReference(&portText, PhFormatString(L"&Open port %hu in browser", port));
+            PhInsertEMenuItem(menu, PhCreateEMenuItem(0, ID_WSL_CONTAINEROPENPORT, portText->Buffer, NULL, NULL), ULONG_MAX);
+        }
+
+        PhInsertEMenuItem(menu, PhCreateEMenuItem(0, ID_WSL_GOTOPROCESS, L"&Go to VM process", NULL, NULL), ULONG_MAX);
+
         if (!node->Container->Running)
         {
             PhEnableEMenuItem(menu, ID_WSL_CONTAINERSHELL, FALSE);
             PhEnableEMenuItem(menu, ID_WSL_CONTAINERSTOP, FALSE);
             PhEnableEMenuItem(menu, ID_WSL_CONTAINERKILL, FALSE);
+            PhEnableEMenuItem(menu, ID_WSL_CONTAINEROPENPORT, FALSE);
         }
+
+        if (!WslSessionVmProcessItem)
+            PhEnableEMenuItem(menu, ID_WSL_GOTOPROCESS, FALSE);
+    }
+    else if (node->Type == WslNodeTypeSession)
+    {
+        PhInsertEMenuItem(menu, PhCreateEMenuItem(0, ID_WSL_GOTOPROCESS, L"&Go to VM process", NULL, NULL), ULONG_MAX);
+
+        if (!WslSessionVmProcessItem)
+            PhEnableEMenuItem(menu, ID_WSL_GOTOPROCESS, FALSE);
     }
     else if (node->Type == WslNodeTypeDistro)
     {
@@ -1473,8 +1588,8 @@ static VOID WslpShowContextMenu(
             PhEnableEMenuItem(menu, ID_WSL_OPENFILELOCATION, FALSE);
     }
 
-    // A Linux process and a session only offer Copy, so they need no separator.
-    if (node->Type != WslNodeTypeLinuxProcess && node->Type != WslNodeTypeSession)
+    // A Linux process only offers Copy, so it needs no separator.
+    if (node->Type != WslNodeTypeLinuxProcess)
         PhInsertEMenuItem(menu, PhCreateEMenuSeparator(), ULONG_MAX);
 
     PhInsertEMenuItem(menu, PhCreateEMenuItem(0, ID_WSL_COPY, L"&Copy\bCtrl+C", NULL, NULL), ULONG_MAX);
@@ -1493,6 +1608,7 @@ static VOID WslpShowContextMenu(
         WslpHandleCommand(WindowHandle, item->Id);
 
     PhDestroyEMenu(menu);
+    PhClearReference(&portText);
 }
 
 /**

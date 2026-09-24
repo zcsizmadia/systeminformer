@@ -75,97 +75,122 @@ static PPH_PROCESS_ITEM WslpFindProcessItem(
 }
 
 /**
- * Picks the WSL VM out of several vmmem processes.
+ * Gets the WSL VM's ID from the command line of a wslhost.exe that hosts a distribution
+ * ("--distro-id ... --vm-id {id}").
  *
- * \return The WSL VM process item, or NULL if it cannot be identified.
- * \remarks A vmmem process can only be opened with administrative rights, so its VM cannot
- * be read from it. Instead: the WSL VM's ID is on the command line of the wslhost.exe that
- * hosts a distribution ("--distro-id ... --vm-id {id}"), and wslservice.exe starts a
- * wslrelay.exe with "--vm-id {id}" about a second after each VM's vmmem appears. The vmmem
- * whose relay started within a few seconds after it, with the WSL VM's ID, is the WSL VM.
- * This is inferred from observed process start order, not from a documented interface, so
- * anything unexpected leaves the VM unidentified rather than guessed.
+ * \return TRUE if such a process exists, which is only while a WSL 2 distribution runs.
  */
-static PPH_PROCESS_ITEM WslpIdentifyWslVm(
+static BOOLEAN WslpGetWslVmId(
     _In_reads_(NumberOfProcessItems) PPH_PROCESS_ITEM *ProcessItems,
     _In_ ULONG NumberOfProcessItems,
-    _In_ PPH_LIST Candidates
+    _Out_ PPH_STRINGREF VmId
     )
 {
     static CONST PH_STRINGREF hostName = PH_STRINGREF_INIT(L"wslhost.exe");
-    static CONST PH_STRINGREF relayName = PH_STRINGREF_INIT(L"wslrelay.exe");
-    static CONST PH_STRINGREF serviceName = PH_STRINGREF_INIT(L"wslservice.exe");
     static CONST PH_STRINGREF distroOption = PH_STRINGREF_INIT(L"--distro-id");
-    PH_STRINGREF wslVmId;
-    BOOLEAN haveWslVmId = FALSE;
 
-    for (ULONG i = 0; i < NumberOfProcessItems && !haveWslVmId; i++)
+    for (ULONG i = 0; i < NumberOfProcessItems; i++)
     {
         PPH_PROCESS_ITEM processItem = ProcessItems[i];
 
         if (processItem->ProcessName && processItem->CommandLine &&
             PhEqualStringRef(&processItem->ProcessName->sr, &hostName, TRUE) &&
-            PhFindStringInStringRef(&processItem->CommandLine->sr, &distroOption, TRUE) != SIZE_MAX)
+            PhFindStringInStringRef(&processItem->CommandLine->sr, &distroOption, TRUE) != SIZE_MAX &&
+            WslpGetVmIdArgument(processItem->CommandLine, VmId))
         {
-            haveWslVmId = WslpGetVmIdArgument(processItem->CommandLine, &wslVmId);
+            return TRUE;
         }
     }
 
-    if (!haveWslVmId)
-        return NULL;
+    return FALSE;
+}
 
-    for (ULONG i = 0; i < Candidates->Count; i++)
+typedef enum _WSLP_VM_KIND
+{
+    WslpVmKindUnknown, // No relay found, e.g. a Hyper-V VM
+    WslpVmKindWsl, // Relay started by wslservice.exe
+    WslpVmKindSession // Relay started by wslcsession.exe
+} WSLP_VM_KIND;
+
+/**
+ * Determines which kind of VM a vmmem process hosts, and its VM ID.
+ *
+ * \return The kind of VM. VmId is only set when the kind is not unknown.
+ * \remarks A vmmem process can only be opened with administrative rights, so its VM cannot
+ * be read from it. Instead: about a second after a VM's vmmem appears, a wslrelay.exe with
+ * "--vm-id {id}" starts for it, started by wslservice.exe for the WSL VM and by
+ * wslcsession.exe for a WSLC session VM. The relay that started within a few seconds after
+ * a vmmem therefore names its VM and its kind. This is inferred from observed process start
+ * order and parents, not from a documented interface, so anything unexpected leaves the VM
+ * unknown. A Hyper-V VM has no relay.
+ */
+static WSLP_VM_KIND WslpGetVmKind(
+    _In_reads_(NumberOfProcessItems) PPH_PROCESS_ITEM *ProcessItems,
+    _In_ ULONG NumberOfProcessItems,
+    _In_ PPH_PROCESS_ITEM VmProcessItem,
+    _Out_ PPH_STRINGREF VmId
+    )
+{
+    static CONST PH_STRINGREF relayName = PH_STRINGREF_INIT(L"wslrelay.exe");
+    static CONST PH_STRINGREF serviceName = PH_STRINGREF_INIT(L"wslservice.exe");
+    static CONST PH_STRINGREF sessionName = PH_STRINGREF_INIT(L"wslcsession.exe");
+
+    for (ULONG i = 0; i < NumberOfProcessItems; i++)
     {
-        PPH_PROCESS_ITEM vmItem = Candidates->Items[i];
+        PPH_PROCESS_ITEM relayItem = ProcessItems[i];
+        PPH_PROCESS_ITEM parentItem;
+        LONG64 delay;
 
-        for (ULONG j = 0; j < NumberOfProcessItems; j++)
+        if (!relayItem->ProcessName || !PhEqualStringRef(&relayItem->ProcessName->sr, &relayName, TRUE))
+            continue;
+
+        delay = relayItem->CreateTime.QuadPart - VmProcessItem->CreateTime.QuadPart;
+
+        if (delay < 0 || delay > 5 * PH_TICKS_PER_SEC)
+            continue;
+
+        if (!(parentItem = WslpFindProcessItem(ProcessItems, NumberOfProcessItems, relayItem->ParentProcessId)) ||
+            !parentItem->ProcessName || !WslpGetVmIdArgument(relayItem->CommandLine, VmId))
         {
-            PPH_PROCESS_ITEM relayItem = ProcessItems[j];
-            PPH_PROCESS_ITEM parentItem;
-            PH_STRINGREF relayVmId;
-            LONG64 delay;
-
-            if (!relayItem->ProcessName || !PhEqualStringRef(&relayItem->ProcessName->sr, &relayName, TRUE))
-                continue;
-
-            delay = relayItem->CreateTime.QuadPart - vmItem->CreateTime.QuadPart;
-
-            if (delay < 0 || delay > 5 * PH_TICKS_PER_SEC)
-                continue;
-
-            // Only a relay that the WSL service started counts.
-            if (!(parentItem = WslpFindProcessItem(ProcessItems, NumberOfProcessItems, relayItem->ParentProcessId)) ||
-                !parentItem->ProcessName || !PhEqualStringRef(&parentItem->ProcessName->sr, &serviceName, TRUE))
-            {
-                continue;
-            }
-
-            if (WslpGetVmIdArgument(relayItem->CommandLine, &relayVmId) && PhEqualStringRef(&relayVmId, &wslVmId, TRUE))
-                return vmItem;
+            continue;
         }
+
+        if (PhEqualStringRef(&parentItem->ProcessName->sr, &serviceName, TRUE))
+            return WslpVmKindWsl;
+        if (PhEqualStringRef(&parentItem->ProcessName->sr, &sessionName, TRUE))
+            return WslpVmKindSession;
     }
 
-    return NULL;
+    return WslpVmKindUnknown;
 }
 
 /**
- * Finds the process that hosts the WSL 2 virtual machine.
+ * Finds the processes of the WSL 2 VM and of a WSLC session VM.
  *
+ * \param WslVm Receives the WSL VM process item, or NULL. The caller owns the reference.
+ * \param SessionVm Receives the session VM process item, or NULL when there is none or
+ * several could be meant. The caller owns the reference.
  * \param NumberOfCandidates Receives the number of processes that could be the WSL VM.
- * \return The VM process item, or NULL if there is none or it cannot be identified. The
- * caller owns the reference.
  * \remarks Windows 11 names the WSL VM process "vmmemWSL". Windows 10 names every VM
- * process "vmmem", including Hyper-V and WSLC session VMs; a single one is the WSL VM, and
- * several are told apart by WslpIdentifyWslVm.
+ * process "vmmem", including Hyper-V and WSLC session VMs, which WslpGetVmKind tells apart.
+ * A single vmmem of unknown kind is taken for the WSL VM, as before WSLC existed.
  */
-PPH_PROCESS_ITEM WslReferenceVmProcessItem(
+static VOID WslpFindVmProcessItems(
+    _Out_opt_ PPH_PROCESS_ITEM *WslVm,
+    _Out_opt_ PPH_PROCESS_ITEM *SessionVm,
     _Out_opt_ PULONG NumberOfCandidates
     )
 {
     PPH_PROCESS_ITEM *processItems;
     ULONG numberOfProcessItems;
-    PPH_PROCESS_ITEM vmProcessItem = NULL;
+    PPH_PROCESS_ITEM wslVmItem = NULL;
+    PPH_PROCESS_ITEM sessionVmItem = NULL;
+    PPH_PROCESS_ITEM unknownVmItem = NULL;
     PPH_LIST candidates;
+    PH_STRINGREF wslVmId;
+    BOOLEAN haveWslVmId;
+    ULONG sessionCandidates = 0;
+    ULONG unknownCandidates = 0;
 
     PhEnumProcessItems(&processItems, &numberOfProcessItems);
     candidates = PhCreateList(2);
@@ -178,31 +203,87 @@ PPH_PROCESS_ITEM WslReferenceVmProcessItem(
             continue;
 
         if (PhEqualStringRef(&processItem->ProcessName->sr, &WslpVmProcessNameWin11, TRUE))
-        {
-            vmProcessItem = processItem;
-            PhClearList(candidates);
-            PhAddItemList(candidates, processItem);
-            break;
-        }
-
-        if (PhEqualStringRef(&processItem->ProcessName->sr, &WslpVmProcessName, TRUE))
+            wslVmItem = processItem;
+        else if (PhEqualStringRef(&processItem->ProcessName->sr, &WslpVmProcessName, TRUE))
             PhAddItemList(candidates, processItem);
     }
 
-    if (!vmProcessItem && candidates->Count == 1)
-        vmProcessItem = candidates->Items[0];
-    else if (!vmProcessItem && candidates->Count > 1)
-        vmProcessItem = WslpIdentifyWslVm(processItems, numberOfProcessItems, candidates);
+    haveWslVmId = WslpGetWslVmId(processItems, numberOfProcessItems, &wslVmId);
 
-    if (vmProcessItem)
-        PhReferenceObject(vmProcessItem);
+    for (ULONG i = 0; i < candidates->Count; i++)
+    {
+        PPH_PROCESS_ITEM candidate = candidates->Items[i];
+        PH_STRINGREF vmId;
 
+        switch (WslpGetVmKind(processItems, numberOfProcessItems, candidate, &vmId))
+        {
+        case WslpVmKindWsl:
+            // With the WSL VM's ID known, it decides between several WSL service VMs.
+            if (!wslVmItem && (!haveWslVmId || PhEqualStringRef(&vmId, &wslVmId, TRUE)))
+                wslVmItem = candidate;
+            break;
+        case WslpVmKindSession:
+            sessionVmItem = candidate;
+            sessionCandidates++;
+            break;
+        default:
+            unknownVmItem = candidate;
+            unknownCandidates++;
+            break;
+        }
+    }
+
+    if (!wslVmItem && candidates->Count == 1 && unknownCandidates == 1)
+        wslVmItem = unknownVmItem;
+
+    if (sessionCandidates != 1)
+        sessionVmItem = NULL;
+
+    if (WslVm)
+        *WslVm = wslVmItem ? PhReferenceObject(wslVmItem) : NULL;
+    if (SessionVm)
+        *SessionVm = sessionVmItem ? PhReferenceObject(sessionVmItem) : NULL;
     if (NumberOfCandidates)
-        *NumberOfCandidates = candidates->Count;
+        *NumberOfCandidates = wslVmItem && candidates->Count == 0 ? 1 : candidates->Count;
 
     PhDereferenceObject(candidates);
     PhDereferenceObjects(processItems, numberOfProcessItems);
     PhFree(processItems);
+}
+
+/**
+ * Finds the process that hosts the WSL 2 virtual machine.
+ *
+ * \param NumberOfCandidates Receives the number of processes that could be the WSL VM.
+ * \return The VM process item, or NULL if there is none or it cannot be identified. The
+ * caller owns the reference.
+ */
+PPH_PROCESS_ITEM WslReferenceVmProcessItem(
+    _Out_opt_ PULONG NumberOfCandidates
+    )
+{
+    PPH_PROCESS_ITEM vmProcessItem;
+
+    WslpFindVmProcessItems(&vmProcessItem, NULL, NumberOfCandidates);
+
+    return vmProcessItem;
+}
+
+/**
+ * Finds the process of the WSLC session VM.
+ *
+ * \return The process item, or NULL if there is no session VM or several. The caller owns
+ * the reference.
+ * \remarks Nothing links a session VM to a session name, so the caller may only attribute
+ * the process to a session when exactly one session is running.
+ */
+PPH_PROCESS_ITEM WslReferenceSessionVmProcessItem(
+    VOID
+    )
+{
+    PPH_PROCESS_ITEM vmProcessItem;
+
+    WslpFindVmProcessItems(NULL, &vmProcessItem, NULL);
 
     return vmProcessItem;
 }
