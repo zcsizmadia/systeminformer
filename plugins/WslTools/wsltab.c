@@ -54,12 +54,12 @@ typedef struct _WSL_NODE
     PWSL_LINUX_PROCESS LinuxProcess; // Owned by the distribution's frame; process nodes only
     PWSL_PROCESS_FRAME Frame; // The frame LinuxProcess belongs to; process nodes only
     PWSL_SESSION Session; // Owned by WslCurrentSnapshot; session nodes and their container nodes
-    PWSL_ENGINE Engine; // Owned by WslCurrentSnapshot; container nodes of a Docker API engine
+    PWSL_ENGINE Engine; // Owned by WslCurrentSnapshot; the engine a distribution hosts, and its container nodes
     PWSL_CONTAINER Container; // Owned by WslCurrentSnapshot; container nodes only
     PPH_STRING NameText; // Distribution name, followed by " *" for the default one
     PPH_STRING TooltipText; // Cached name column tooltip
     PPH_STRING StateText; // Cached state of a container that exited, e.g. "Exited (137)"
-    PPH_STRING ImageText; // Cached "kernel <version>" of the VM
+    PPH_STRING ImageText; // Cached Image / OS text of the VM, a session or an engine's distribution
     PPH_STRING StatusText; // Cached uptime or container status
     // VM node: its distribution nodes, which WslDistroNodes owns.
     // Distribution, session and container nodes: their process and container nodes, which they own.
@@ -552,7 +552,6 @@ VOID NTAPI WslOnSnapshotUpdated(
 {
     PWSL_SNAPSHOT snapshot = Parameter;
     BOOLEAN hasWsl2 = FALSE;
-    PWSL_ENGINE engine;
 
     // The tab window can be gone while a snapshot is still queued.
     if (!WslTreeNewHandle)
@@ -583,8 +582,10 @@ VOID NTAPI WslOnSnapshotUpdated(
         else
             PhSetReference(&node->NameText, distro->Name);
 
-        if (engine = WslpFindDistroEngine(snapshot->Engines, distro->Id))
-            WslpUpdateEngineNodes(node, engine, distro->Processes);
+        node->Engine = WslpFindDistroEngine(snapshot->Engines, distro->Id);
+
+        if (node->Engine)
+            WslpUpdateEngineNodes(node, node->Engine, distro->Processes);
         else
             WslpUpdateProcessNodes(node, distro->Processes, NULL);
 
@@ -815,32 +816,6 @@ static PPH_STRING WslpGetContainerStateText(
     }
 
     return Container->State ? PhReferenceObject(Container->State) : PhReferenceEmptyString();
-}
-
-/**
- * Gets the kernel version shown for the VM, e.g. "kernel 6.18.40.1", from the kernel release
- * a process collector reported. The suffix after the version ("-microsoft-standard-WSL2")
- * is left out.
- */
-static PPH_STRING WslpGetKernelText(
-    VOID
-    )
-{
-    for (ULONG i = 0; i < WslDistroNodes->Count; i++)
-    {
-        PWSL_DISTRO_ITEM distro = ((PWSL_NODE)WslDistroNodes->Items[i])->Distro;
-        PH_STRINGREF version;
-        PH_STRINGREF rest;
-
-        if (distro->Version != 2 || !distro->Processes || !distro->Processes->KernelRelease)
-            continue;
-
-        PhSplitStringRefAtChar(&distro->Processes->KernelRelease->sr, L'-', &version, &rest);
-
-        return PhCreateString2(&version);
-    }
-
-    return NULL;
 }
 
 /**
@@ -1153,15 +1128,17 @@ static VOID WslpGetVmCellText(
         break;
     case WSLTNC_IMAGE:
         {
-            PPH_STRING kernel;
+            PPH_STRING version;
 
-            if (WslpGetVmState() == WslDistroStateRunning && (kernel = WslpGetKernelText()))
+            // The installed WSL, e.g. "WSL 2.9.12"; System Information shows the kernel.
+            if (version = WslGetWslVersion())
             {
-                static CONST PH_STRINGREF prefix = PH_STRINGREF_INIT(L"kernel ");
+                static CONST PH_STRINGREF prefix = PH_STRINGREF_INIT(L"WSL ");
 
-                PhMoveReference(&Node->ImageText, PhConcatStringRef2(&prefix, &kernel->sr));
+                if (!Node->ImageText)
+                    Node->ImageText = PhConcatStringRef2(&prefix, &version->sr);
+
                 GetCellText->Text = Node->ImageText->sr;
-                PhDereferenceObject(kernel);
             }
         }
         break;
@@ -1213,7 +1190,24 @@ static VOID WslpGetDistroCellText(
         WslpSetSizeCellText(GetCellText, WslpGetNodeMemory(Node), Node->MemoryText, sizeof(Node->MemoryText));
         break;
     case WSLTNC_IMAGE:
-        GetCellText->Text = PhGetStringRef(distro->OsName);
+        // A distribution that hosts a Docker API engine shows the engine rather than its OS,
+        // e.g. "Docker Desktop 4.92.0, Docker 29.8.0" with a middle dot.
+        if (Node->Engine && Node->Engine->ProductText)
+        {
+            if (!Node->ImageText)
+            {
+                if (Node->Engine->EngineText)
+                    Node->ImageText = PhFormatString(L"%s \u00b7 %s", Node->Engine->ProductText->Buffer, Node->Engine->EngineText->Buffer);
+                else
+                    PhSetReference(&Node->ImageText, Node->Engine->ProductText);
+            }
+
+            GetCellText->Text = PhGetStringRef(Node->ImageText);
+        }
+        else
+        {
+            GetCellText->Text = PhGetStringRef(distro->OsName);
+        }
         break;
     case WSLTNC_DISK:
         WslpSetSizeCellText(GetCellText, distro->VhdSize, Node->VhdSizeText, sizeof(Node->VhdSizeText));
@@ -1296,6 +1290,22 @@ static VOID WslpGetSessionCellText(
         break;
     case WSLTNC_STATE:
         GetCellText->Text = *WslGetDistroStateText(session->State);
+        break;
+    case WSLTNC_IMAGE:
+        {
+            PPH_STRING version;
+
+            // The wslc that manages the session, e.g. "wslc 2.9.12".
+            if (version = WslGetWslcVersion())
+            {
+                static CONST PH_STRINGREF prefix = PH_STRINGREF_INIT(L"wslc ");
+
+                if (!Node->ImageText)
+                    Node->ImageText = PhConcatStringRef2(&prefix, &version->sr);
+
+                GetCellText->Text = Node->ImageText->sr;
+            }
+        }
         break;
     case WSLTNC_CPU:
         // The VM's CPU usage includes the session's own processes, not only the containers'.
@@ -2271,7 +2281,7 @@ static VOID WslpInitializeTreeList(
     PhAddTreeNewColumn(WindowHandle, WSLTNC_STATE, TRUE, L"State", 90, PH_ALIGN_LEFT, 4, 0);
     PhAddTreeNewColumn(WindowHandle, WSLTNC_CPU, TRUE, L"CPU", 45, PH_ALIGN_RIGHT, 5, DT_RIGHT);
     PhAddTreeNewColumn(WindowHandle, WSLTNC_MEMORY, TRUE, L"Memory", 80, PH_ALIGN_RIGHT, 6, DT_RIGHT);
-    PhAddTreeNewColumn(WindowHandle, WSLTNC_IMAGE, TRUE, L"Image / OS", 120, PH_ALIGN_LEFT, 7, 0);
+    PhAddTreeNewColumn(WindowHandle, WSLTNC_IMAGE, TRUE, L"Image / OS", 220, PH_ALIGN_LEFT, 7, 0);
     PhAddTreeNewColumn(WindowHandle, WSLTNC_PORTS, TRUE, L"Ports", 130, PH_ALIGN_LEFT, 8, 0);
     PhAddTreeNewColumn(WindowHandle, WSLTNC_DISK, TRUE, L"Disk", 70, PH_ALIGN_RIGHT, 9, DT_RIGHT);
     PhAddTreeNewColumn(WindowHandle, WSLTNC_STATUS, TRUE, L"Uptime / Status", 120, PH_ALIGN_LEFT, 10, 0);
