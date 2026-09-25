@@ -83,7 +83,20 @@ typedef struct _WSL_ACTION_CONTEXT
     PPH_STRING Description;
     NTSTATUS Status;
     PPH_STRING Message; // the tool's own error text, if it printed one
+    // Reclaim memory: the VM process whose private bytes are reported, or NULL, its name for
+    // the report, e.g. "WSL VM", and its private bytes before and after.
+    HANDLE ReclaimProcessId;
+    PCWSTR ReclaimName;
+    SIZE_T ReclaimBefore;
+    SIZE_T ReclaimAfter;
 } WSL_ACTION_CONTEXT, *PWSL_ACTION_CONTEXT;
+
+// Drops the clean page cache of a VM's kernel, and compacts memory where the kernel can, so
+// that WSL returns the freed memory to Windows. Nothing is lost; files are read again when
+// needed. The script is one double-quoted argument, so it must not contain double quotes.
+#define WSL_RECLAIM_SCRIPT \
+    L"sync; echo 1 > /proc/sys/vm/drop_caches && " \
+    L"{ [ -w /proc/sys/vm/compact_memory ] && echo 1 > /proc/sys/vm/compact_memory; true; }"
 
 static PPH_MAIN_TAB_PAGE WslPage = NULL;
 static HWND WslTreeNewHandle = NULL;
@@ -1656,6 +1669,110 @@ static PPH_STRING WslpGetCommandErrorMessage(
 }
 
 /**
+ * Gets the private bytes of a VM process, as the process provider last read them.
+ *
+ * \return The private bytes, or 0 if the process is gone. The VM process cannot be opened
+ * without administrative rights, so it is not queried directly.
+ */
+static SIZE_T WslpGetVmPrivateBytes(
+    _In_ HANDLE ProcessId
+    )
+{
+    PPH_PROCESS_ITEM processItem;
+    SIZE_T privateBytes = 0;
+
+    if (processItem = PhReferenceProcessItem(ProcessId))
+    {
+        privateBytes = processItem->VmCounters.PagefileUsage;
+        PhDereferenceObject(processItem);
+    }
+
+    return privateBytes;
+}
+
+/**
+ * Waits for WSL to return reclaimed memory to Windows.
+ *
+ * \param ProcessId The VM process.
+ * \param Before The private bytes of the VM process before the reclaim.
+ * \return The private bytes of the VM process once they fell and stopped falling, or after 30
+ * seconds.
+ * \remarks Measured on WSL 2.9.12: the private bytes stay the same for several seconds, most
+ * of the memory is back after about 11 seconds, and a little more follows for another half
+ * minute. So the wait only looks for the end once the fall has started.
+ */
+static SIZE_T WslpWaitForReclaim(
+    _In_ HANDLE ProcessId,
+    _In_ SIZE_T Before
+    )
+{
+    SIZE_T history[4] = { 0 };
+    SIZE_T privateBytes = 0;
+    ULONG fallingSince = ULONG_MAX;
+    LARGE_INTEGER interval;
+
+    PhTimeoutFromMilliseconds(&interval, 1000);
+
+    for (ULONG seconds = 0; seconds < 30; seconds++)
+    {
+        NtDelayExecution(FALSE, &interval);
+
+        if (!(privateBytes = WslpGetVmPrivateBytes(ProcessId)))
+            break;
+
+        if (fallingSince == ULONG_MAX && privateBytes + 64 * 1024 * 1024 < Before)
+            fallingSince = seconds;
+
+        // Done once it fell by less than 16 MB over the last 3 seconds of the fall.
+        if (fallingSince != ULONG_MAX && seconds >= fallingSince + 3 &&
+            history[(seconds + 1) % 4] - min(history[(seconds + 1) % 4], privateBytes) < 16 * 1024 * 1024)
+        {
+            break;
+        }
+
+        history[seconds % 4] = privateBytes;
+    }
+
+    return privateBytes;
+}
+
+/**
+ * Shows how much memory a VM returned to Windows. Runs on the GUI thread.
+ *
+ * \param Parameter The action context. This function frees it.
+ */
+static VOID NTAPI WslpShowReclaimResult(
+    _In_ PVOID Parameter
+    )
+{
+    PWSL_ACTION_CONTEXT context = Parameter;
+
+    if (context->ReclaimBefore && context->ReclaimAfter && context->ReclaimAfter < context->ReclaimBefore)
+    {
+        PhShowInformation2(
+            SystemInformer_GetWindowHandle(),
+            L"Reclaim memory",
+            L"%s: %s returned to Windows, from %s to %s of private bytes. WSL can return a little more over the next seconds.",
+            context->ReclaimName,
+            PhaFormatSize(context->ReclaimBefore - context->ReclaimAfter, ULONG_MAX)->Buffer,
+            PhaFormatSize(context->ReclaimBefore, ULONG_MAX)->Buffer,
+            PhaFormatSize(context->ReclaimAfter, ULONG_MAX)->Buffer
+            );
+    }
+    else
+    {
+        PhShowInformation2(
+            SystemInformer_GetWindowHandle(),
+            L"Reclaim memory",
+            L"%s: the caches were dropped, but no memory was returned to Windows within 30 seconds.",
+            context->ReclaimName
+            );
+    }
+
+    WslpFreeActionContext(context);
+}
+
+/**
  * Runs a wsl.exe or wslc.exe action off the GUI thread; "--shutdown" can take several seconds.
  */
 _Function_class_(USER_THREAD_START_ROUTINE)
@@ -1666,6 +1783,9 @@ static NTSTATUS NTAPI WslpActionThread(
     PWSL_ACTION_CONTEXT context = Parameter;
     NTSTATUS status;
     PPH_BYTES output = NULL;
+
+    if (context->ReclaimProcessId)
+        context->ReclaimBefore = WslpGetVmPrivateBytes(context->ReclaimProcessId);
 
     if (context->PipeName)
     {
@@ -1694,6 +1814,14 @@ static NTSTATUS NTAPI WslpActionThread(
 
     PhClearReference(&output);
     context->Status = status;
+
+    if (NT_SUCCESS(status) && context->ReclaimProcessId)
+    {
+        context->ReclaimAfter = WslpWaitForReclaim(context->ReclaimProcessId, context->ReclaimBefore);
+        WslRefreshProvider();
+        SystemInformer_Invoke(WslpShowReclaimResult, context);
+        return STATUS_SUCCESS;
+    }
 
     WslRefreshProvider();
 
@@ -1738,6 +1866,67 @@ static VOID WslpStartAction(
 
     if (!NT_SUCCESS(PhCreateThread2(WslpActionThread, context)))
         WslpFreeActionContext(context);
+}
+
+/**
+ * Starts reclaiming the memory of a VM in the background, and reports how much it returned.
+ *
+ * \param FileName wsl.exe or wslc.exe.
+ * \param Arguments The command that runs WSL_RECLAIM_SCRIPT in the VM, from PhFormatString.
+ * This function takes ownership of the string; NULL does nothing.
+ * \param ProcessId The VM process, or NULL if it is not known, which skips the report.
+ * \param Name The VM for the report, e.g. "WSL VM".
+ */
+static VOID WslpStartReclaim(
+    _In_ PPH_STRING FileName,
+    _In_opt_ PPH_STRING Arguments,
+    _In_opt_ HANDLE ProcessId,
+    _In_ PCWSTR Name
+    )
+{
+    PWSL_ACTION_CONTEXT context;
+
+    if (!Arguments)
+        return;
+
+    context = PhAllocateZero(sizeof(WSL_ACTION_CONTEXT));
+    context->FileName = FileName;
+    context->Arguments = Arguments;
+    context->Description = PhCreateString(L"Unable to reclaim memory.");
+    context->ReclaimProcessId = ProcessId;
+    context->ReclaimName = Name;
+
+    if (!NT_SUCCESS(PhCreateThread2(WslpActionThread, context)))
+        WslpFreeActionContext(context);
+}
+
+/**
+ * Gets a running WSL 2 distribution to reclaim the WSL VM's memory in. All of them share the
+ * VM's kernel, so any one frees the cache of all.
+ *
+ * \return The default distribution if it runs, else another running one, or NULL.
+ */
+static PWSL_DISTRO_ITEM WslpGetReclaimDistro(
+    VOID
+    )
+{
+    PWSL_DISTRO_ITEM found = NULL;
+
+    for (ULONG i = 0; i < WslDistroNodes->Count; i++)
+    {
+        PWSL_DISTRO_ITEM distro = ((PWSL_NODE)WslDistroNodes->Items[i])->Distro;
+
+        if (distro->Version != 2 || distro->State != WslDistroStateRunning || !WslIsSafeDistroName(distro->Name))
+            continue;
+
+        if (distro->Default)
+            return distro;
+
+        if (!found)
+            found = distro;
+    }
+
+    return found;
 }
 
 /**
@@ -1891,6 +2080,36 @@ static VOID WslpHandleCommand(
                 WslpGoToVmProcess(WslSessionVmProcessItem);
             else
                 WslpGoToVmProcess(WslVmProcessItem);
+        }
+        break;
+    case ID_WSL_RECLAIMMEMORY:
+        {
+            PWSL_DISTRO_ITEM distro;
+
+            if (!node)
+                break;
+
+            // Only a VM that already runs, as a command in a stopped one would start it.
+            if (node->Type == WslNodeTypeVm && (distro = WslpGetReclaimDistro()))
+            {
+                WslpStartReclaim(
+                    WslGetWslFileName(),
+                    PhFormatString(L"--distribution %s --user root --cd / --exec /bin/sh -c \"%s\"", distro->Name->Buffer, WSL_RECLAIM_SCRIPT),
+                    WslVmProcessItem ? WslVmProcessItem->ProcessId : NULL,
+                    L"WSL VM"
+                    );
+            }
+            else if (node->Type == WslNodeTypeSession && node->Session->State == WslDistroStateRunning &&
+                WslIsSafeSessionName(node->Session->Name) && WslGetWslcFileName())
+            {
+                // "session run" runs as root in the session VM.
+                WslpStartReclaim(
+                    WslGetWslcFileName(),
+                    PhFormatString(L"--session \"%s\" system session run /bin/sh -c \"%s\"", node->Session->Name->Buffer, WSL_RECLAIM_SCRIPT),
+                    WslSessionVmProcessItem ? WslSessionVmProcessItem->ProcessId : NULL,
+                    L"WSLC session VM"
+                    );
+            }
         }
         break;
     case ID_WSL_CONTAINEROPENPORT:
@@ -2056,11 +2275,16 @@ static VOID WslpShowContextMenu(
     {
         PhInsertEMenuItem(menu, PhCreateEMenuItem(0, ID_WSL_GOTOPROCESS, L"&Go to process", NULL, NULL), ULONG_MAX);
         PhInsertEMenuItem(menu, PhCreateEMenuSeparator(), ULONG_MAX);
+        PhInsertEMenuItem(menu, PhCreateEMenuItem(0, ID_WSL_RECLAIMMEMORY, L"Reclaim &memory", NULL, NULL), ULONG_MAX);
         PhInsertEMenuItem(menu, PhCreateEMenuItem(0, ID_WSL_SHUTDOWN, L"&Shut down WSL", NULL, NULL), ULONG_MAX);
         PhSetFlagsEMenuItem(menu, ID_WSL_GOTOPROCESS, PH_EMENU_DEFAULT, PH_EMENU_DEFAULT);
 
         if (!WslVmProcessItem)
             PhEnableEMenuItem(menu, ID_WSL_GOTOPROCESS, FALSE);
+
+        // Reclaiming runs in a distribution that is already running, so that it never starts one.
+        if (!WslpGetReclaimDistro())
+            PhEnableEMenuItem(menu, ID_WSL_RECLAIMMEMORY, FALSE);
     }
     else if (node->Type == WslNodeTypeContainer)
     {
@@ -2099,9 +2323,14 @@ static VOID WslpShowContextMenu(
     else if (node->Type == WslNodeTypeSession)
     {
         PhInsertEMenuItem(menu, PhCreateEMenuItem(0, ID_WSL_GOTOPROCESS, L"&Go to VM process", NULL, NULL), ULONG_MAX);
+        PhInsertEMenuItem(menu, PhCreateEMenuItem(0, ID_WSL_RECLAIMMEMORY, L"Reclaim &memory", NULL, NULL), ULONG_MAX);
 
         if (!WslSessionVmProcessItem)
             PhEnableEMenuItem(menu, ID_WSL_GOTOPROCESS, FALSE);
+
+        // Any "--session" command starts a stopped session VM.
+        if (node->Session->State != WslDistroStateRunning || !WslIsSafeSessionName(node->Session->Name))
+            PhEnableEMenuItem(menu, ID_WSL_RECLAIMMEMORY, FALSE);
     }
     else if (node->Type == WslNodeTypeDistro)
     {
