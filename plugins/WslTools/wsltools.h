@@ -128,6 +128,18 @@ typedef struct _WSL_CONTAINER
     PPH_STRING State; // e.g. "Running", "Exited"
     PPH_STRING Status; // e.g. "Up 5 minutes"
     PPH_STRING Ports; // e.g. "0.0.0.0:8080->80/tcp"
+    // Details for the tooltip and the optional columns, each NULL if the source does not give it.
+    PPH_STRING ImageId; // Short image ID; Docker API only
+    PPH_STRING Command; // e.g. "/docker-entrypoint.sh nginx -g 'daemon off;'"
+    PPH_STRING Created; // Creation time as local time text
+    LARGE_INTEGER CreatedTime; // The same as a system time, for sorting; 0 if unknown
+    PPH_STRING Networks; // e.g. "bridge, backend"
+    PPH_STRING IpAddresses; // e.g. "172.17.0.3, 172.18.0.2"; Docker API only
+    PPH_STRING Mounts; // e.g. "/data, /config"
+    PPH_STRING Compose; // Compose project and service, e.g. "skrog / api"
+    PPH_STRING Health; // e.g. "healthy", or NULL if the container has no health check
+    PPH_STRING Platform; // e.g. "linux/amd64"; from "wslc list", or from the image for an engine
+    struct _WSL_CONTAINER_DETAILS *Details; // From the inspect output, or NULL; referenced
     BOOLEAN Running;
     BOOLEAN HaveStats;
     FLOAT CpuUsage; // Fraction of all host processors, as PH_PROCESS_ITEM.CpuUsage
@@ -137,6 +149,55 @@ typedef struct _WSL_CONTAINER
 
 VOID WslFreeContainer(
     _In_ PWSL_CONTAINER Container
+    );
+
+PWSL_CONTAINER WslCopyContainer(
+    _In_ PWSL_CONTAINER Container
+    );
+
+// What only the inspect output of a container gives, for the optional columns. It does not
+// change while the container keeps its state, so it is kept between refreshes (wslutil.c).
+typedef struct _WSL_CONTAINER_DETAILS
+{
+    PPH_STRING RestartText; // e.g. "always (3)"
+    ULONG RestartCount;
+    PPH_STRING ExitText; // e.g. "137 (OOM killed)"; NULL while the container runs
+    LONG ExitCode;
+    PPH_STRING MemoryLimitText; // e.g. "512 MB"; NULL for no limit
+    ULONG64 MemoryLimit;
+    PPH_STRING CpuLimitText; // e.g. "1.5"; NULL for no limit
+    ULONG64 NanoCpus; // 1e9 per CPU
+    PPH_STRING PrivilegedText; // "Yes" or "No"
+    BOOLEAN Privileged;
+    PPH_STRING User; // e.g. "root", or the user the container was started as
+    PPH_STRING Platform; // e.g. "linux/amd64", from the image; engines only
+} WSL_CONTAINER_DETAILS, *PWSL_CONTAINER_DETAILS;
+
+// Set by the tab while one of the columns that need the inspect output is shown; the provider
+// only inspects containers then.
+extern volatile LONG WslContainerDetailsWanted;
+
+PWSL_CONTAINER_DETAILS WslParseContainerDetails(
+    _In_ PVOID Object
+    );
+
+PWSL_CONTAINER_DETAILS WslGetCachedContainerDetails(
+    _In_ PPH_STRING Key,
+    _In_opt_ PPH_STRING State
+    );
+
+VOID WslCacheContainerDetails(
+    _In_ PPH_STRING Key,
+    _In_opt_ PPH_STRING State,
+    _In_ PWSL_CONTAINER_DETAILS Details
+    );
+
+VOID WslPruneContainerDetails(
+    VOID
+    );
+
+PPH_STRING WslFormatLocalTime(
+    _In_ PLARGE_INTEGER Time
     );
 
 typedef struct _WSL_SESSION

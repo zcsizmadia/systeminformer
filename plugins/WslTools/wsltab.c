@@ -32,6 +32,23 @@ typedef enum _WSL_TREE_COLUMN
     WSLTNC_STATUS, // Uptime, or a container's status
     WSLTNC_VERSION,
     WSLTNC_LOCATION,
+    // Container columns, hidden by default. These come from the container list.
+    WSLTNC_CONTAINERID,
+    WSLTNC_COMMAND,
+    WSLTNC_CREATED,
+    WSLTNC_IPADDRESS,
+    WSLTNC_NETWORK,
+    WSLTNC_MOUNTS,
+    WSLTNC_COMPOSE,
+    WSLTNC_HEALTH,
+    // These need the inspect output of each container, which is only asked for while one is shown.
+    WSLTNC_PLATFORM,
+    WSLTNC_RESTART,
+    WSLTNC_EXITCODE,
+    WSLTNC_MEMORYLIMIT,
+    WSLTNC_CPULIMIT,
+    WSLTNC_PRIVILEGED,
+    WSLTNC_USER,
     // New columns go last: the IDs are stored in the saved column layout and sort.
     WSLTNC_MAXIMUM
 } WSL_TREE_COLUMN;
@@ -64,7 +81,13 @@ typedef struct _WSL_NODE
     // VM node: its distribution nodes, which WslDistroNodes owns.
     // Distribution, session and container nodes: their process and container nodes, which they own.
     PPH_LIST Children;
+    ULONG64 CreateTime; // Tick count when the node was added, for the new row highlight; 0 for no highlight
+    ULONG64 RemoveTime; // Tick count when the item went away; the node stays for the removed row highlight
+    PWSL_SNAPSHOT RemovedSnapshot; // Keeps what the pointers above point into while a removed node stays
     BOOLEAN Seen; // Scratch flag while a snapshot is applied
+    BOOLEAN Populated; // The children were matched once, so later ones are new and are highlighted
+    BOOLEAN ShowsContainers; // Distribution nodes: the children are an engine's containers, not processes
+    ULONG InitProcessId; // Container nodes: the container's first process, or 0 if none runs
 
     PH_STRINGREF TextCache[WSLTNC_MAXIMUM];
     WCHAR PidText[PH_INT32_STR_LEN_1];
@@ -112,6 +135,23 @@ static PPH_PROCESS_ITEM WslSessionVmProcessItem = NULL;
 // A row asked for by "Go to WSL" before the tab had its rows; tried once on the next snapshot.
 static WSL_VM_SELECTION WslPendingVmSelection = WslVmSelectionNone;
 
+// New and removed rows are highlighted like on the Processes tab, with its settings. They are read
+// for each snapshot, which also sets the time the highlights are measured against.
+static ULONG64 WslUpdateTime = 0;
+static ULONG WslHighlightingDuration = 0;
+static COLORREF WslColorNew = 0;
+static COLORREF WslColorRemoved = 0;
+
+// The icons the tab adds to the process image list, by file and resource.
+typedef struct _WSL_ICON
+{
+    PPH_STRING FileName;
+    LONG IconIndex; // As for PhExtractIconEx: an index, or a negative resource id
+    ULONG ImageIndex; // In the process image list; 0, the generic icon, if the file has none
+} WSL_ICON, *PWSL_ICON;
+
+static PPH_LIST WslIcons = NULL; // PWSL_ICON; a DPI change empties the image list, and so this
+
 // The ToolStatus search box, or NULL when that plugin is not loaded.
 static PTOOLSTATUS_INTERFACE WslToolStatusInterface = NULL;
 static PH_CALLBACK_REGISTRATION WslSearchChangedRegistration;
@@ -135,11 +175,13 @@ static BOOLEAN WslpFilterNodes(
  *
  * \param Type The node type.
  * \param Id The distribution id, or NULL for the VM node.
+ * \param Highlight TRUE to highlight the node as new.
  * \return The new node.
  */
 static PWSL_NODE WslpCreateNode(
     _In_ WSL_NODE_TYPE Type,
-    _In_opt_ PPH_STRING Id
+    _In_opt_ PPH_STRING Id,
+    _In_ BOOLEAN Highlight
     )
 {
     PWSL_NODE node;
@@ -149,6 +191,7 @@ static PWSL_NODE WslpCreateNode(
     node->Node.TextCache = node->TextCache;
     node->Node.TextCacheSize = WSLTNC_MAXIMUM;
     node->Type = Type;
+    node->CreateTime = Highlight && WslHighlightingDuration ? WslUpdateTime : 0;
 
     if (Id)
         PhSetReference(&node->Id, Id);
@@ -184,6 +227,7 @@ static VOID WslpDestroyNode(
     PhClearReference(&Node->ImageText);
     PhClearReference(&Node->StatusText);
     PhClearReference(&Node->Children);
+    PhClearReference(&Node->RemovedSnapshot);
     PhFree(Node);
 }
 
@@ -201,7 +245,8 @@ static PWSL_NODE WslpFindDistroNode(
     {
         PWSL_NODE node = WslDistroNodes->Items[i];
 
-        if (PhEqualString(node->Id, Id, TRUE))
+        // A removed node stays only for its highlight; one that comes back gets a new node.
+        if (!node->RemoveTime && PhEqualString(node->Id, Id, TRUE))
             return node;
     }
 
@@ -225,7 +270,7 @@ static PWSL_NODE WslpFindChildNode(
         PWSL_NODE node = Parent->Children->Items[i];
 
         // Process nodes have no id.
-        if (node->Id && PhEqualString(node->Id, Id, TRUE))
+        if (node->Id && !node->RemoveTime && PhEqualString(node->Id, Id, TRUE))
             return node;
     }
 
@@ -246,7 +291,47 @@ static VOID WslpInvalidateNode(
     PhClearReference(&Node->StateText);
     PhClearReference(&Node->ImageText);
     PhClearReference(&Node->StatusText);
-    PhInvalidateTreeNewNode(&Node->Node, TN_CACHE_COLOR);
+    PhInvalidateTreeNewNode(&Node->Node, TN_CACHE_COLOR | TN_CACHE_ICON);
+}
+
+/**
+ * Removes the nodes of a list that were not seen in the snapshot being applied.
+ *
+ * \param Nodes The list, e.g. a node's children.
+ * \param Type The type of node the list holds. Other nodes are removed at once without a
+ * highlight, e.g. a distribution's process nodes once it hosts an engine, as their items did
+ * not go away.
+ * \remarks A node whose item went away stays for the highlighting duration. It keeps the
+ * previous snapshot, which its pointers are into, and is no longer updated.
+ */
+static VOID WslpRemoveUnseenNodes(
+    _In_ PPH_LIST Nodes,
+    _In_ WSL_NODE_TYPE Type
+    )
+{
+    for (ULONG i = Nodes->Count; i != 0; i--)
+    {
+        PWSL_NODE node = Nodes->Items[i - 1];
+
+        if (node->Seen)
+            continue;
+
+        if (node->RemoveTime)
+        {
+            if (WslUpdateTime - node->RemoveTime < WslHighlightingDuration)
+                continue;
+        }
+        else if (node->Type == Type && WslHighlightingDuration && WslCurrentSnapshot)
+        {
+            node->RemoveTime = WslUpdateTime;
+            node->RemovedSnapshot = PhReferenceObject(WslCurrentSnapshot);
+            PhInvalidateTreeNewNode(&node->Node, TN_CACHE_COLOR);
+            continue;
+        }
+
+        PhRemoveItemList(Nodes, i - 1);
+        WslpDestroyNode(node);
+    }
 }
 
 _Function_class_(PH_HASHTABLE_EQUAL_FUNCTION)
@@ -302,7 +387,7 @@ static VOID WslpUpdateProcessNodes(
 
         child->Seen = FALSE;
 
-        if (child->Type == WslNodeTypeLinuxProcess)
+        if (child->Type == WslNodeTypeLinuxProcess && !child->RemoveTime)
             PhAddEntryHashtable(nodeTable, &child);
     }
 
@@ -325,7 +410,7 @@ static VOID WslpUpdateProcessNodes(
 
         if (!node)
         {
-            node = WslpCreateNode(WslNodeTypeLinuxProcess, NULL);
+            node = WslpCreateNode(WslNodeTypeLinuxProcess, NULL, ParentNode->Populated);
             PhAddItemList(children, node);
         }
 
@@ -337,15 +422,35 @@ static VOID WslpUpdateProcessNodes(
 
     PhDereferenceObject(nodeTable);
 
-    for (ULONG i = children->Count; i != 0; i--)
-    {
-        PWSL_NODE node = children->Items[i - 1];
+    WslpRemoveUnseenNodes(children, WslNodeTypeLinuxProcess);
+    ParentNode->Populated = TRUE;
 
-        if (!node->Seen)
+    // A container's own PID, as "docker inspect" reports it, is its first process: the one
+    // whose parent is outside the container. The inspect output is not needed for it.
+    if (ContainerId)
+    {
+        PWSL_LINUX_PROCESS initProcess = NULL;
+
+        for (ULONG i = 0; i < children->Count; i++)
         {
-            PhRemoveItemList(children, i - 1);
-            WslpDestroyNode(node);
+            PWSL_NODE node = children->Items[i];
+            BOOLEAN parentInside = FALSE;
+
+            if (node->RemoveTime)
+                continue;
+
+            for (ULONG j = 0; j < children->Count && !parentInside; j++)
+            {
+                PWSL_NODE other = children->Items[j];
+
+                parentInside = !other->RemoveTime && other->LinuxProcess->ProcessId == node->LinuxProcess->ParentProcessId;
+            }
+
+            if (!parentInside && (!initProcess || node->LinuxProcess->StartTime < initProcess->StartTime))
+                initProcess = node->LinuxProcess;
         }
+
+        ParentNode->InitProcessId = initProcess ? initProcess->ProcessId : 0;
     }
 }
 
@@ -386,7 +491,7 @@ static VOID WslpUpdateEngineNodes(
 
             if (!containerNode)
             {
-                containerNode = WslpCreateNode(WslNodeTypeContainer, container->Id);
+                containerNode = WslpCreateNode(WslNodeTypeContainer, container->Id, DistroNode->Populated);
                 PhAddItemList(DistroNode->Children, containerNode);
             }
 
@@ -399,16 +504,8 @@ static VOID WslpUpdateEngineNodes(
         }
     }
 
-    for (ULONG i = DistroNode->Children->Count; i != 0; i--)
-    {
-        PWSL_NODE node = DistroNode->Children->Items[i - 1];
-
-        if (!node->Seen)
-        {
-            PhRemoveItemList(DistroNode->Children, i - 1);
-            WslpDestroyNode(node);
-        }
-    }
+    WslpRemoveUnseenNodes(DistroNode->Children, WslNodeTypeContainer);
+    DistroNode->Populated = TRUE;
 }
 
 /**
@@ -434,7 +531,7 @@ static VOID WslpUpdateSessionNodes(
         {
             PWSL_NODE node = WslSessionNodes->Items[j];
 
-            if (PhEqualString(node->Id, session->Name, FALSE))
+            if (!node->RemoveTime && PhEqualString(node->Id, session->Name, FALSE))
             {
                 sessionNode = node;
                 break;
@@ -443,7 +540,7 @@ static VOID WslpUpdateSessionNodes(
 
         if (!sessionNode)
         {
-            sessionNode = WslpCreateNode(WslNodeTypeSession, session->Name);
+            sessionNode = WslpCreateNode(WslNodeTypeSession, session->Name, !!WslCurrentSnapshot);
             PhAddItemList(WslSessionNodes, sessionNode);
         }
 
@@ -468,7 +565,7 @@ static VOID WslpUpdateSessionNodes(
 
             if (!containerNode)
             {
-                containerNode = WslpCreateNode(WslNodeTypeContainer, container->Id);
+                containerNode = WslpCreateNode(WslNodeTypeContainer, container->Id, sessionNode->Populated);
                 PhAddItemList(sessionNode->Children, containerNode);
             }
 
@@ -480,29 +577,38 @@ static VOID WslpUpdateSessionNodes(
             WslpUpdateProcessNodes(containerNode, session->Processes, container->Id);
         }
 
-        for (ULONG j = sessionNode->Children->Count; j != 0; j--)
-        {
-            PWSL_NODE node = sessionNode->Children->Items[j - 1];
-
-            if (!node->Seen)
-            {
-                PhRemoveItemList(sessionNode->Children, j - 1);
-                WslpDestroyNode(node);
-            }
-        }
+        WslpRemoveUnseenNodes(sessionNode->Children, WslNodeTypeContainer);
+        sessionNode->Populated = TRUE;
     }
 
     // Remove the nodes of sessions that ended.
-    for (ULONG i = WslSessionNodes->Count; i != 0; i--)
-    {
-        PWSL_NODE node = WslSessionNodes->Items[i - 1];
+    WslpRemoveUnseenNodes(WslSessionNodes, WslNodeTypeSession);
+}
 
-        if (!node->Seen)
-        {
-            PhRemoveItemList(WslSessionNodes, i - 1);
-            WslpDestroyNode(node);
-        }
+/**
+ * Gets the node of the only running session.
+ *
+ * \return The node, or NULL if no session or several run.
+ */
+static PWSL_NODE WslpGetOnlySessionNode(
+    VOID
+    )
+{
+    PWSL_NODE found = NULL;
+
+    for (ULONG i = 0; i < WslSessionNodes->Count; i++)
+    {
+        PWSL_NODE node = WslSessionNodes->Items[i];
+
+        if (node->RemoveTime)
+            continue;
+        if (found)
+            return NULL;
+
+        found = node;
     }
+
+    return found;
 }
 
 /**
@@ -521,8 +627,8 @@ static BOOLEAN WslpSelectVmNode(
 
     if (Selection == WslVmSelectionWsl)
         node = WslVmNode;
-    else if (Selection == WslVmSelectionSession && WslSessionNodes->Count == 1)
-        node = WslSessionNodes->Items[0];
+    else if (Selection == WslVmSelectionSession)
+        node = WslpGetOnlySessionNode();
 
     if (!node)
         return FALSE;
@@ -576,6 +682,11 @@ VOID NTAPI WslOnSnapshotUpdated(
         return;
     }
 
+    WslUpdateTime = NtGetTickCount64();
+    WslHighlightingDuration = PhGetIntegerSetting(L"HighlightingDuration");
+    WslColorNew = PhGetIntegerSetting(L"ColorNew");
+    WslColorRemoved = PhGetIntegerSetting(L"ColorRemoved");
+
     for (ULONG i = 0; i < WslDistroNodes->Count; i++)
         ((PWSL_NODE)WslDistroNodes->Items[i])->Seen = FALSE;
 
@@ -586,7 +697,8 @@ VOID NTAPI WslOnSnapshotUpdated(
 
         if (!(node = WslpFindDistroNode(distro->Id)))
         {
-            node = WslpCreateNode(WslNodeTypeDistro, distro->Id);
+            // The first snapshot is what is there, not what is new.
+            node = WslpCreateNode(WslNodeTypeDistro, distro->Id, !!WslCurrentSnapshot);
             PhAddItemList(WslDistroNodes, node);
         }
 
@@ -600,6 +712,14 @@ VOID NTAPI WslOnSnapshotUpdated(
 
         node->Engine = WslpFindDistroEngine(snapshot->Engines, distro->Id);
 
+        // The containers that replace the processes once an engine is found, or the other way
+        // around, were there before, so they are not highlighted as new.
+        if (node->ShowsContainers != !!node->Engine)
+        {
+            node->ShowsContainers = !!node->Engine;
+            node->Populated = FALSE;
+        }
+
         if (node->Engine)
             WslpUpdateEngineNodes(node, snapshot->Engines, distro->Processes);
         else
@@ -610,16 +730,7 @@ VOID NTAPI WslOnSnapshotUpdated(
     }
 
     // Remove nodes of distributions that were unregistered.
-    for (ULONG i = WslDistroNodes->Count; i != 0; i--)
-    {
-        PWSL_NODE node = WslDistroNodes->Items[i - 1];
-
-        if (!node->Seen)
-        {
-            PhRemoveItemList(WslDistroNodes, i - 1);
-            WslpDestroyNode(node);
-        }
-    }
+    WslpRemoveUnseenNodes(WslDistroNodes, WslNodeTypeDistro);
 
     WslpUpdateSessionNodes(snapshot->Sessions);
 
@@ -627,7 +738,7 @@ VOID NTAPI WslOnSnapshotUpdated(
     PhMoveReference(&WslCurrentSnapshot, snapshot);
 
     if (hasWsl2 && !WslVmNode)
-        WslVmNode = WslpCreateNode(WslNodeTypeVm, NULL);
+        WslVmNode = WslpCreateNode(WslNodeTypeVm, NULL, FALSE);
 
     PhClearList(WslRootNodes);
 
@@ -698,7 +809,7 @@ VOID WslOnProcessesUpdated(
         return;
 
     PhMoveReference(&WslVmProcessItem, WslReferenceVmProcessItem(&WslVmCandidates, NULL));
-    PhMoveReference(&WslSessionVmProcessItem, WslSessionNodes->Count == 1 ? WslReferenceSessionVmProcessItem() : NULL);
+    PhMoveReference(&WslSessionVmProcessItem, WslpGetOnlySessionNode() ? WslReferenceSessionVmProcessItem() : NULL);
 
     if (WslVmNode)
         WslpInvalidateNode(WslVmNode);
@@ -809,6 +920,76 @@ static ULONG64 WslpGetDistroRunTime(
 }
 
 /**
+ * Appends a "Label: value" line to a container tooltip, if there is a value.
+ */
+static VOID WslpAppendTooltipLine(
+    _Inout_ PPH_STRING_BUILDER Builder,
+    _In_ PCWSTR Label,
+    _In_opt_ PPH_STRING Value
+    )
+{
+    // A long command line would make the tooltip as wide as the screen.
+    static CONST SIZE_T maximumLength = 200 * sizeof(WCHAR);
+    PH_STRINGREF value;
+
+    if (PhIsNullOrEmptyString(Value))
+        return;
+
+    value = Value->sr;
+
+    if (Builder->String->Length != 0)
+        PhAppendCharStringBuilder(Builder, L'\n');
+
+    PhAppendStringBuilder2(Builder, (PWSTR)Label);
+    PhAppendStringBuilder2(Builder, L": ");
+
+    if (value.Length > maximumLength)
+    {
+        value.Length = maximumLength;
+        PhAppendStringBuilder(Builder, &value);
+        PhAppendCharStringBuilder(Builder, L'\x2026');
+    }
+    else
+    {
+        PhAppendStringBuilder(Builder, &value);
+    }
+}
+
+/**
+ * Formats the name column tooltip of a container from what the container list gives; the
+ * Inspect window has the rest.
+ */
+static PPH_STRING WslpGetContainerTooltip(
+    _In_ PWSL_CONTAINER Container
+    )
+{
+    PH_STRING_BUILDER builder;
+    PPH_STRING image = NULL;
+
+    PhInitializeStringBuilder(&builder, 256);
+
+    if (!PhIsNullOrEmptyString(Container->Image) && !PhIsNullOrEmptyString(Container->ImageId))
+        image = PhFormatString(L"%s (%s)", Container->Image->Buffer, Container->ImageId->Buffer);
+    else if (Container->Image)
+        PhSetReference(&image, Container->Image);
+
+    WslpAppendTooltipLine(&builder, L"Image", image);
+    WslpAppendTooltipLine(&builder, L"Command", Container->Command);
+    WslpAppendTooltipLine(&builder, L"Created", Container->Created);
+    WslpAppendTooltipLine(&builder, L"Status", Container->Status);
+    WslpAppendTooltipLine(&builder, L"Ports", Container->Ports);
+    WslpAppendTooltipLine(&builder, L"Health", Container->Health);
+    WslpAppendTooltipLine(&builder, L"Network", Container->Networks);
+    WslpAppendTooltipLine(&builder, L"IP address", Container->IpAddresses);
+    WslpAppendTooltipLine(&builder, L"Mounts", Container->Mounts);
+    WslpAppendTooltipLine(&builder, L"Compose", Container->Compose);
+
+    PhClearReference(&image);
+
+    return PhFinalStringBuilderString(&builder);
+}
+
+/**
  * Gets the display state of a container. An exited container shows its exit code, which
  * wslc only puts in the status text, e.g. "Exited (137) 2 days ago".
  */
@@ -886,6 +1067,41 @@ static PH_STRINGREF WslpGetDistroImageText(
  * \remarks Siblings of different types, e.g. the VM, WSL 1 distributions and sessions at the
  * root, are grouped by type in WSL_NODE_TYPE order whatever the sort order.
  */
+/**
+ * Compares containers by a column that shows their inspect details. Containers without
+ * details sort first.
+ */
+static int WslpCompareContainerDetails(
+    _In_opt_ PWSL_CONTAINER_DETAILS Details1,
+    _In_opt_ PWSL_CONTAINER_DETAILS Details2
+    )
+{
+    if (!Details1 || !Details2)
+        return intcmp(!!Details1, !!Details2);
+
+    switch (WslTreeNewSortColumn)
+    {
+    case WSLTNC_PLATFORM:
+        return PhCompareStringWithNull(Details1->Platform, Details2->Platform, TRUE);
+    case WSLTNC_RESTART:
+        return uintcmp(Details1->RestartCount, Details2->RestartCount);
+    case WSLTNC_EXITCODE:
+        if (!Details1->ExitText || !Details2->ExitText)
+            return intcmp(!!Details1->ExitText, !!Details2->ExitText);
+        return intcmp(Details1->ExitCode, Details2->ExitCode);
+    case WSLTNC_MEMORYLIMIT:
+        return uint64cmp(Details1->MemoryLimit, Details2->MemoryLimit);
+    case WSLTNC_CPULIMIT:
+        return uint64cmp(Details1->NanoCpus, Details2->NanoCpus);
+    case WSLTNC_PRIVILEGED:
+        return intcmp(Details1->Privileged, Details2->Privileged);
+    case WSLTNC_USER:
+        return PhCompareStringWithNull(Details1->User, Details2->User, TRUE);
+    }
+
+    return 0;
+}
+
 static int __cdecl WslpCompareNodes(
     _In_ void *Context,
     _In_ const void *Elem1,
@@ -991,6 +1207,36 @@ static int __cdecl WslpCompareNodes(
             break;
         case WSLTNC_STATUS:
             sortResult = PhCompareStringWithNull(container1->Status, container2->Status, TRUE);
+            break;
+        case WSLTNC_LINUXPID:
+            sortResult = uintcmp(node1->InitProcessId, node2->InitProcessId);
+            break;
+        case WSLTNC_CONTAINERID:
+            sortResult = PhCompareString(container1->Id, container2->Id, TRUE);
+            break;
+        case WSLTNC_COMMAND:
+            sortResult = PhCompareStringWithNull(container1->Command, container2->Command, TRUE);
+            break;
+        case WSLTNC_CREATED:
+            sortResult = int64cmp(container1->CreatedTime.QuadPart, container2->CreatedTime.QuadPart);
+            break;
+        case WSLTNC_IPADDRESS:
+            sortResult = PhCompareStringWithNull(container1->IpAddresses, container2->IpAddresses, TRUE);
+            break;
+        case WSLTNC_NETWORK:
+            sortResult = PhCompareStringWithNull(container1->Networks, container2->Networks, TRUE);
+            break;
+        case WSLTNC_MOUNTS:
+            sortResult = PhCompareStringWithNull(container1->Mounts, container2->Mounts, TRUE);
+            break;
+        case WSLTNC_COMPOSE:
+            sortResult = PhCompareStringWithNull(container1->Compose, container2->Compose, TRUE);
+            break;
+        case WSLTNC_HEALTH:
+            sortResult = PhCompareStringWithNull(container1->Health, container2->Health, TRUE);
+            break;
+        default:
+            sortResult = WslpCompareContainerDetails(container1->Details, container2->Details);
             break;
         }
 
@@ -1153,9 +1399,10 @@ static WSL_DISTRO_STATE WslpGetVmState(
 
     for (ULONG i = 0; i < WslDistroNodes->Count; i++)
     {
-        PWSL_DISTRO_ITEM distro = ((PWSL_NODE)WslDistroNodes->Items[i])->Distro;
+        PWSL_NODE node = WslDistroNodes->Items[i];
+        PWSL_DISTRO_ITEM distro = node->Distro;
 
-        if (distro->Version == 2 && distro->State == WslDistroStateRunning)
+        if (!node->RemoveTime && distro->Version == 2 && distro->State == WslDistroStateRunning)
             return WslDistroStateRunning;
     }
 
@@ -1389,6 +1636,7 @@ static VOID WslpGetContainerCellText(
     )
 {
     PWSL_CONTAINER container = Node->Container;
+    PWSL_CONTAINER_DETAILS details = container->Details;
 
     switch (GetCellText->Id)
     {
@@ -1417,6 +1665,63 @@ static VOID WslpGetContainerCellText(
         break;
     case WSLTNC_STATUS:
         GetCellText->Text = PhGetStringRef(container->Status);
+        break;
+    case WSLTNC_LINUXPID:
+        if (Node->InitProcessId)
+            WslpSetNumberCellText(GetCellText, Node, Node->InitProcessId);
+        break;
+    case WSLTNC_CONTAINERID:
+        // As short as the Docker CLI shows it; a Docker API gives the full ID.
+        GetCellText->Text = container->Id->sr;
+        GetCellText->Text.Length = min(GetCellText->Text.Length, 12 * sizeof(WCHAR));
+        break;
+    case WSLTNC_COMMAND:
+        GetCellText->Text = PhGetStringRef(container->Command);
+        break;
+    case WSLTNC_CREATED:
+        GetCellText->Text = PhGetStringRef(container->Created);
+        break;
+    case WSLTNC_IPADDRESS:
+        GetCellText->Text = PhGetStringRef(container->IpAddresses);
+        break;
+    case WSLTNC_NETWORK:
+        GetCellText->Text = PhGetStringRef(container->Networks);
+        break;
+    case WSLTNC_MOUNTS:
+        GetCellText->Text = PhGetStringRef(container->Mounts);
+        break;
+    case WSLTNC_COMPOSE:
+        GetCellText->Text = PhGetStringRef(container->Compose);
+        break;
+    case WSLTNC_HEALTH:
+        GetCellText->Text = PhGetStringRef(container->Health);
+        break;
+    case WSLTNC_PLATFORM:
+        GetCellText->Text = PhGetStringRef(container->Platform ? container->Platform : (details ? details->Platform : NULL));
+        break;
+    case WSLTNC_RESTART:
+        if (details)
+            GetCellText->Text = PhGetStringRef(details->RestartText);
+        break;
+    case WSLTNC_EXITCODE:
+        if (details)
+            GetCellText->Text = PhGetStringRef(details->ExitText);
+        break;
+    case WSLTNC_MEMORYLIMIT:
+        if (details)
+            GetCellText->Text = PhGetStringRef(details->MemoryLimitText);
+        break;
+    case WSLTNC_CPULIMIT:
+        if (details)
+            GetCellText->Text = PhGetStringRef(details->CpuLimitText);
+        break;
+    case WSLTNC_PRIVILEGED:
+        if (details)
+            GetCellText->Text = PhGetStringRef(details->PrivilegedText);
+        break;
+    case WSLTNC_USER:
+        if (details)
+            GetCellText->Text = PhGetStringRef(details->User);
         break;
     }
 }
@@ -1451,7 +1756,11 @@ static BOOLEAN WslpNodeMatchesSearch(
     _In_ PWSL_NODE Node
     )
 {
-    static CONST ULONG columns[] = { WSLTNC_NAME, WSLTNC_PID, WSLTNC_LINUXPID, WSLTNC_TYPE, WSLTNC_STATE, WSLTNC_IMAGE, WSLTNC_PORTS, WSLTNC_STATUS };
+    static CONST ULONG columns[] =
+    {
+        WSLTNC_NAME, WSLTNC_PID, WSLTNC_LINUXPID, WSLTNC_TYPE, WSLTNC_STATE, WSLTNC_IMAGE, WSLTNC_PORTS, WSLTNC_STATUS,
+        WSLTNC_COMMAND, WSLTNC_IPADDRESS, WSLTNC_NETWORK, WSLTNC_MOUNTS, WSLTNC_COMPOSE, WSLTNC_HEALTH, WSLTNC_PLATFORM, WSLTNC_USER
+    };
 
     if (!WslToolStatusInterface || !WslToolStatusInterface->GetSearchMatchHandle())
         return TRUE;
@@ -2116,9 +2425,10 @@ static PWSL_DISTRO_ITEM WslpGetReclaimDistro(
 
     for (ULONG i = 0; i < WslDistroNodes->Count; i++)
     {
-        PWSL_DISTRO_ITEM distro = ((PWSL_NODE)WslDistroNodes->Items[i])->Distro;
+        PWSL_NODE node = WslDistroNodes->Items[i];
+        PWSL_DISTRO_ITEM distro = node->Distro;
 
-        if (distro->Version != 2 || distro->State != WslDistroStateRunning || !WslIsSafeDistroName(distro->Name))
+        if (node->RemoveTime || distro->Version != 2 || distro->State != WslDistroStateRunning || !WslIsSafeDistroName(distro->Name))
             continue;
 
         if (distro->Default)
@@ -2468,7 +2778,8 @@ static VOID WslpShowContextMenu(
     PPH_STRING portText = NULL; // Kept alive until the menu is destroyed
     USHORT port;
 
-    if (!node)
+    // A removed row is only shown for its highlight; what it names is gone.
+    if (!node || node->RemoveTime)
         return;
 
     menu = PhCreateEMenu();
@@ -2572,6 +2883,221 @@ static VOID WslpShowContextMenu(
 }
 
 /**
+ * Gets an icon's index in the process image list, and adds the icon the first time.
+ *
+ * \param FileName An executable or DLL, or an .ico file.
+ * \param IconIndex As for PhExtractIconEx: an index, or a negative resource id. Not used for
+ * an .ico file.
+ * \return The index, or 0, the generic icon, if the file has no such icon.
+ */
+static ULONG WslpGetIconImageIndex(
+    _In_ PPH_STRING FileName,
+    _In_ LONG IconIndex
+    )
+{
+    static CONST PH_STRINGREF icoExtension = PH_STRINGREF_INIT(L".ico");
+    PWSL_ICON entry;
+    HICON icon = NULL;
+    LONG dpi;
+    LONG width;
+    LONG height;
+
+    if (!WslIcons)
+        WslIcons = PhCreateList(8);
+
+    for (ULONG i = 0; i < WslIcons->Count; i++)
+    {
+        entry = WslIcons->Items[i];
+
+        if (entry->IconIndex == IconIndex && PhEqualString(entry->FileName, FileName, TRUE))
+            return entry->ImageIndex;
+    }
+
+    dpi = PhGetWindowDpi(WslTreeNewHandle);
+    width = PhGetSystemMetrics(SM_CXSMICON, dpi);
+    height = PhGetSystemMetrics(SM_CYSMICON, dpi);
+
+    // PhImageListExtractIcon reads only executables, and always the first icon.
+    if (PhEndsWithStringRef(&FileName->sr, &icoExtension, TRUE))
+        icon = LoadImage(NULL, FileName->Buffer, IMAGE_ICON, width, height, LR_LOADFROMFILE);
+    else
+        PhExtractIconEx(&FileName->sr, FALSE, IconIndex, width, height, width, height, NULL, &icon);
+
+    // A failure is kept too, so that the file is not read again on every refresh.
+    entry = PhAllocate(sizeof(WSL_ICON));
+    entry->FileName = PhReferenceObject(FileName);
+    entry->IconIndex = IconIndex;
+    entry->ImageIndex = 0;
+
+    if (icon)
+    {
+        entry->ImageIndex = PhImageListAddIcon(PhGetProcessSmallImageList(), icon);
+        DestroyIcon(icon);
+    }
+
+    PhAddItemList(WslIcons, entry);
+
+    return entry->ImageIndex;
+}
+
+/**
+ * Forgets the icons added to the process image list, after System Informer emptied it for a
+ * new DPI.
+ */
+static VOID WslpClearIcons(
+    VOID
+    )
+{
+    if (!WslIcons)
+        return;
+
+    for (ULONG i = 0; i < WslIcons->Count; i++)
+    {
+        PWSL_ICON entry = WslIcons->Items[i];
+
+        PhDereferenceObject(entry->FileName);
+        PhFree(entry);
+    }
+
+    PhClearList(WslIcons);
+}
+
+/**
+ * Clears the cached icons of nodes and their children, so they are looked up again.
+ */
+static VOID WslpInvalidateNodeIcons(
+    _In_ PPH_LIST Nodes
+    )
+{
+    for (ULONG i = 0; i < Nodes->Count; i++)
+    {
+        PWSL_NODE node = Nodes->Items[i];
+
+        PhInvalidateTreeNewNode(&node->Node, TN_CACHE_ICON);
+
+        if (node->Children)
+            WslpInvalidateNodeIcons(node->Children);
+    }
+}
+
+/**
+ * Gets the icon of the process that serves an engine's pipe, e.g. Docker Desktop.
+ *
+ * \return The index in the process image list, or 0 if the process or its icon is not known yet.
+ */
+static ULONG WslpGetEngineIconIndex(
+    _In_ PWSL_ENGINE Engine
+    )
+{
+    PPH_PROCESS_ITEM processItem;
+    ULONG index = 0;
+
+    if (Engine->ServerProcessId && (processItem = PhReferenceProcessItem(Engine->ServerProcessId)))
+    {
+        if (processItem->IconEntry)
+            index = processItem->IconEntry->SmallIconIndex;
+
+        PhDereferenceObject(processItem);
+    }
+
+    return index;
+}
+
+/**
+ * Gets the icon of a node: the WSL icon for the VM and sessions, the distribution's own icon,
+ * the icon of the program that serves an engine, and a cube for containers.
+ *
+ * \return The index in the process image list; 0, the generic icon, for Linux processes.
+ */
+static ULONG WslpGetNodeIconIndex(
+    _In_ PWSL_NODE Node
+    )
+{
+    static PH_INITONCE initOnce = PH_INITONCE_INIT;
+    static PPH_STRING wslFileName = NULL;
+    static PPH_STRING imageresFileName = NULL;
+    // The "3D Objects" icon, a cube; a resource id, as icon indexes differ between Windows versions.
+    static CONST LONG containerIconId = -198;
+    ULONG index = 0;
+
+    if (PhBeginInitOnce(&initOnce))
+    {
+        static CONST PH_STRINGREF wslPath = PH_STRINGREF_INIT(L"%ProgramW6432%\\WSL\\wsl.exe");
+        static CONST PH_STRINGREF imageresPath = PH_STRINGREF_INIT(L"\\System32\\imageres.dll");
+        PH_STRINGREF systemRoot;
+
+        // The wsl.exe of the WSL package has the WSL icon; the one in System32 has Tux.
+        if ((wslFileName = PhExpandEnvironmentStrings(&wslPath)) && !PhDoesFileExistWin32(wslFileName->Buffer))
+            PhClearReference(&wslFileName);
+
+        if (!wslFileName)
+            wslFileName = PhReferenceObject(WslGetWslFileName());
+
+        PhGetSystemRoot(&systemRoot);
+        imageresFileName = PhConcatStringRef2(&systemRoot, &imageresPath);
+
+        PhEndInitOnce(&initOnce);
+    }
+
+    switch (Node->Type)
+    {
+    case WslNodeTypeVm:
+        index = WslpGetIconImageIndex(wslFileName, 0);
+        break;
+    case WslNodeTypeSession:
+        index = WslpGetIconImageIndex(WslGetWslcFileName() ? WslGetWslcFileName() : wslFileName, 0);
+        break;
+    case WslNodeTypeDistro:
+        {
+            static CONST PH_STRINGREF iconName = PH_STRINGREF_INIT(L"\\shortcut.ico");
+
+            if (Node->Engine)
+                index = WslpGetEngineIconIndex(Node->Engine);
+
+            // Distributions from the Store and from wsl --install put their icon here.
+            if (!index && Node->Distro->BasePath)
+            {
+                PPH_STRING iconFileName = PhConcatStringRef2(&Node->Distro->BasePath->sr, &iconName);
+
+                index = WslpGetIconImageIndex(iconFileName, 0);
+                PhDereferenceObject(iconFileName);
+            }
+
+            if (!index)
+                index = WslpGetIconImageIndex(wslFileName, 0);
+        }
+        break;
+    case WslNodeTypeContainer:
+        index = WslpGetIconImageIndex(imageresFileName, containerIconId);
+        break;
+    }
+
+    return index;
+}
+
+/**
+ * Tells the provider whether a column that needs the containers' inspect output is shown, and
+ * asks for a refresh when one was just added, so that it fills without waiting a refresh.
+ */
+static VOID WslpUpdateDetailsWanted(
+    VOID
+    )
+{
+    static CONST ULONG columns[] = { WSLTNC_PLATFORM, WSLTNC_RESTART, WSLTNC_EXITCODE, WSLTNC_MEMORYLIMIT, WSLTNC_CPULIMIT, WSLTNC_PRIVILEGED, WSLTNC_USER };
+    PH_TREENEW_COLUMN column;
+    LONG wanted = FALSE;
+
+    for (ULONG i = 0; i < RTL_NUMBER_OF(columns) && !wanted; i++)
+    {
+        if (TreeNew_GetColumn(WslTreeNewHandle, columns[i], &column) && column.Visible)
+            wanted = TRUE;
+    }
+
+    if (InterlockedExchange(&WslContainerDetailsWanted, wanted) != wanted && wanted)
+        WslRefreshProvider();
+}
+
+/**
  * Tree callback.
  */
 static BOOLEAN NTAPI WslpTreeNewCallback(
@@ -2637,10 +3163,32 @@ static BOOLEAN NTAPI WslpTreeNewCallback(
             else
                 stopped = FALSE;
 
-            if (stopped)
-                getNodeColor->ForeColor = GetSysColor(COLOR_GRAYTEXT);
-
             getNodeColor->Flags = TN_CACHE;
+
+            // A highlight ends on the first snapshot after the duration, which clears this cache.
+            if (node->RemoveTime)
+            {
+                getNodeColor->BackColor = WslColorRemoved;
+                getNodeColor->Flags |= TN_AUTO_FORECOLOR;
+            }
+            else if (node->CreateTime && WslUpdateTime - node->CreateTime < WslHighlightingDuration)
+            {
+                getNodeColor->BackColor = WslColorNew;
+                getNodeColor->Flags |= TN_AUTO_FORECOLOR;
+            }
+            else if (stopped)
+            {
+                getNodeColor->ForeColor = GetSysColor(COLOR_GRAYTEXT);
+            }
+        }
+        return TRUE;
+    case TreeNewGetNodeIcon:
+        {
+            PPH_TREENEW_GET_NODE_ICON getNodeIcon = Parameter1;
+
+            // The tree draws an index into the process image list.
+            getNodeIcon->Icon = (HICON)(ULONG_PTR)WslpGetNodeIconIndex((PWSL_NODE)getNodeIcon->Node);
+            getNodeIcon->Flags = TN_CACHE;
         }
         return TRUE;
     case TreeNewGetCellTooltip:
@@ -2682,12 +3230,7 @@ static BOOLEAN NTAPI WslpTreeNewCallback(
                 PWSL_CONTAINER container = node->Container;
 
                 if (!node->TooltipText)
-                {
-                    if (PhIsNullOrEmptyString(container->Ports))
-                        node->TooltipText = container->Status ? PhReferenceObject(container->Status) : PhReferenceEmptyString();
-                    else
-                        node->TooltipText = PhFormatString(L"%s\nPorts: %s", PhGetString(container->Status), container->Ports->Buffer);
-                }
+                    node->TooltipText = WslpGetContainerTooltip(container);
 
                 getCellTooltip->Text = PhGetStringRef(node->TooltipText);
             }
@@ -2731,6 +3274,9 @@ static BOOLEAN NTAPI WslpTreeNewCallback(
                 PH_ALIGN_LEFT | PH_ALIGN_TOP, data.MouseEvent->ScreenLocation.x, data.MouseEvent->ScreenLocation.y);
             PhHandleTreeNewColumnMenu(&data);
             PhDeleteTreeNewColumnMenu(&data);
+
+            // The menu can show or hide columns, also through "Choose columns...".
+            WslpUpdateDetailsWanted();
         }
         return TRUE;
     case TreeNewLeftDoubleClick:
@@ -2769,6 +3315,7 @@ static VOID WslpInitializeTreeList(
     TreeNew_SetRedraw(WindowHandle, FALSE);
     TreeNew_SetCallback(WindowHandle, WslpTreeNewCallback, NULL);
     TreeNew_SetEmptyText(WindowHandle, &WslEmptyText, 0);
+    TreeNew_SetImageList(WindowHandle, PhGetProcessSmallImageList());
 
     PhAddTreeNewColumn(WindowHandle, WSLTNC_NAME, TRUE, L"Name", 200, PH_ALIGN_LEFT, 0, 0);
     PhAddTreeNewColumn(WindowHandle, WSLTNC_PID, TRUE, L"PID", 50, PH_ALIGN_RIGHT, 1, DT_RIGHT);
@@ -2783,6 +3330,21 @@ static VOID WslpInitializeTreeList(
     PhAddTreeNewColumn(WindowHandle, WSLTNC_STATUS, TRUE, L"Uptime / Status", 120, PH_ALIGN_LEFT, 10, 0);
     PhAddTreeNewColumn(WindowHandle, WSLTNC_VERSION, FALSE, L"Version", 50, PH_ALIGN_RIGHT, ULONG_MAX, DT_RIGHT);
     PhAddTreeNewColumn(WindowHandle, WSLTNC_LOCATION, FALSE, L"Location", 300, PH_ALIGN_LEFT, ULONG_MAX, DT_PATH_ELLIPSIS);
+    PhAddTreeNewColumn(WindowHandle, WSLTNC_CONTAINERID, FALSE, L"Container ID", 100, PH_ALIGN_LEFT, ULONG_MAX, 0);
+    PhAddTreeNewColumn(WindowHandle, WSLTNC_COMMAND, FALSE, L"Command", 200, PH_ALIGN_LEFT, ULONG_MAX, 0);
+    PhAddTreeNewColumn(WindowHandle, WSLTNC_CREATED, FALSE, L"Created", 140, PH_ALIGN_LEFT, ULONG_MAX, 0);
+    PhAddTreeNewColumn(WindowHandle, WSLTNC_IPADDRESS, FALSE, L"IP address", 110, PH_ALIGN_LEFT, ULONG_MAX, 0);
+    PhAddTreeNewColumn(WindowHandle, WSLTNC_NETWORK, FALSE, L"Network", 90, PH_ALIGN_LEFT, ULONG_MAX, 0);
+    PhAddTreeNewColumn(WindowHandle, WSLTNC_MOUNTS, FALSE, L"Mounts", 160, PH_ALIGN_LEFT, ULONG_MAX, 0);
+    PhAddTreeNewColumn(WindowHandle, WSLTNC_COMPOSE, FALSE, L"Compose project", 120, PH_ALIGN_LEFT, ULONG_MAX, 0);
+    PhAddTreeNewColumn(WindowHandle, WSLTNC_HEALTH, FALSE, L"Health", 70, PH_ALIGN_LEFT, ULONG_MAX, 0);
+    PhAddTreeNewColumn(WindowHandle, WSLTNC_PLATFORM, FALSE, L"Platform", 90, PH_ALIGN_LEFT, ULONG_MAX, 0);
+    PhAddTreeNewColumn(WindowHandle, WSLTNC_RESTART, FALSE, L"Restart policy", 100, PH_ALIGN_LEFT, ULONG_MAX, 0);
+    PhAddTreeNewColumn(WindowHandle, WSLTNC_EXITCODE, FALSE, L"Exit code", 110, PH_ALIGN_LEFT, ULONG_MAX, 0);
+    PhAddTreeNewColumn(WindowHandle, WSLTNC_MEMORYLIMIT, FALSE, L"Memory limit", 80, PH_ALIGN_RIGHT, ULONG_MAX, DT_RIGHT);
+    PhAddTreeNewColumn(WindowHandle, WSLTNC_CPULIMIT, FALSE, L"CPU limit", 60, PH_ALIGN_RIGHT, ULONG_MAX, DT_RIGHT);
+    PhAddTreeNewColumn(WindowHandle, WSLTNC_PRIVILEGED, FALSE, L"Privileged", 70, PH_ALIGN_LEFT, ULONG_MAX, 0);
+    PhAddTreeNewColumn(WindowHandle, WSLTNC_USER, FALSE, L"User", 80, PH_ALIGN_LEFT, ULONG_MAX, 0);
 
     TreeNew_SetTriState(WindowHandle, TRUE);
     TreeNew_SetSort(WindowHandle, WSLTNC_NAME, AscendingSortOrder);
@@ -2793,6 +3355,7 @@ static VOID WslpInitializeTreeList(
 
     sortSettings = PhGetIntegerPairSetting(SETTING_NAME_TREE_LIST_SORT);
     TreeNew_SetSort(WindowHandle, (ULONG)sortSettings.X, (PH_SORT_ORDER)sortSettings.Y);
+    WslpUpdateDetailsWanted();
 
     TreeNew_SetRedraw(WindowHandle, TRUE);
 }
@@ -2937,6 +3500,18 @@ static BOOLEAN WslpPageCallback(
 
             if (WslTreeNewHandle)
                 SetWindowFont(WslTreeNewHandle, font, TRUE);
+        }
+        break;
+    case MainTabPageDpiChanged:
+        {
+            // System Informer has just emptied the process image list and added its own icons again.
+            WslpClearIcons();
+
+            if (WslTreeNewHandle)
+            {
+                WslpInvalidateNodeIcons(WslRootNodes);
+                InvalidateRect(WslTreeNewHandle, NULL, FALSE);
+            }
         }
         break;
     }

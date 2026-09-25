@@ -10,9 +10,33 @@
  */
 
 #include "wsltools.h"
+#include <json.h>
 
 static CONST PH_STRINGREF WslpLxssKeyName = PH_STRINGREF_INIT(L"Software\\Microsoft\\Windows\\CurrentVersion\\Lxss");
 static PPH_OBJECT_TYPE WslpSnapshotType = NULL;
+static PPH_OBJECT_TYPE WslpContainerDetailsType = NULL;
+
+// The inspect details of containers, by container, while they keep their state. Only the
+// provider thread uses it.
+typedef struct _WSL_CONTAINER_DETAILS_ENTRY
+{
+    PPH_STRING Key;
+    PPH_STRING State;
+    PWSL_CONTAINER_DETAILS Details;
+    ULONG64 LastUsedTime;
+} WSL_CONTAINER_DETAILS_ENTRY, *PWSL_CONTAINER_DETAILS_ENTRY;
+
+// A container not seen for this long is forgotten, e.g. after it was removed.
+#define WSL_CONTAINER_DETAILS_LIFETIME_MS 60000
+
+static PPH_LIST WslpContainerDetailsCache = NULL; // PWSL_CONTAINER_DETAILS_ENTRY
+volatile LONG WslContainerDetailsWanted = FALSE;
+
+_Function_class_(PH_TYPE_DELETE_PROCEDURE)
+static VOID NTAPI WslpContainerDetailsDeleteProcedure(
+    _In_ PVOID Object,
+    _In_ ULONG Flags
+    );
 
 typedef struct _WSL_ENUM_DISTRO_CONTEXT
 {
@@ -84,6 +108,7 @@ VOID WslInitializeSnapshotType(
     )
 {
     WslpSnapshotType = PhCreateObjectType(L"WslSnapshot", 0, WslpSnapshotDeleteProcedure);
+    WslpContainerDetailsType = PhCreateObjectType(L"WslContainerDetails", 0, WslpContainerDetailsDeleteProcedure);
 }
 
 /**
@@ -842,4 +867,223 @@ NTSTATUS WslStartShell(
     PhDereferenceObject(commandLine);
 
     return status;
+}
+
+_Function_class_(PH_TYPE_DELETE_PROCEDURE)
+static VOID NTAPI WslpContainerDetailsDeleteProcedure(
+    _In_ PVOID Object,
+    _In_ ULONG Flags
+    )
+{
+    PWSL_CONTAINER_DETAILS details = Object;
+
+    PhClearReference(&details->RestartText);
+    PhClearReference(&details->ExitText);
+    PhClearReference(&details->MemoryLimitText);
+    PhClearReference(&details->CpuLimitText);
+    PhClearReference(&details->PrivilegedText);
+    PhClearReference(&details->User);
+    PhClearReference(&details->Platform);
+}
+
+/**
+ * Formats a system time as local date and time text.
+ */
+PPH_STRING WslFormatLocalTime(
+    _In_ PLARGE_INTEGER Time
+    )
+{
+    SYSTEMTIME systemTime;
+
+    PhLargeIntegerToLocalSystemTime(&systemTime, Time);
+
+    return PhFormatDateTime(&systemTime);
+}
+
+/**
+ * Reads the details for the optional columns from the inspect output of a container, which
+ * Docker API engines and wslc print alike.
+ *
+ * \param Object One container of the inspect output.
+ * \return The details, or NULL if the object is not a container.
+ */
+PWSL_CONTAINER_DETAILS WslParseContainerDetails(
+    _In_ PVOID Object
+    )
+{
+    PWSL_CONTAINER_DETAILS details;
+    PVOID hostConfig;
+    PVOID state;
+    PVOID config;
+
+    if (PhGetJsonObjectType(Object) != PH_JSON_OBJECT_TYPE_OBJECT)
+        return NULL;
+
+    details = PhCreateObjectZero(sizeof(WSL_CONTAINER_DETAILS), WslpContainerDetailsType);
+    details->RestartCount = PhGetJsonValueAsUlong(Object, "RestartCount");
+
+    if ((hostConfig = PhGetJsonObject(Object, "HostConfig")) && PhGetJsonObjectType(hostConfig) == PH_JSON_OBJECT_TYPE_OBJECT)
+    {
+        PVOID restartPolicy;
+        ULONG64 cpuQuota;
+        ULONG64 cpuPeriod;
+
+        if (restartPolicy = PhGetJsonObject(hostConfig, "RestartPolicy"))
+        {
+            PPH_STRING name = PhGetJsonValueAsString(restartPolicy, "Name");
+
+            // An empty policy is the default, which is not to restart.
+            if (PhIsNullOrEmptyString(name))
+                PhMoveReference(&name, PhCreateString(L"no"));
+
+            if (details->RestartCount != 0)
+                details->RestartText = PhFormatString(L"%s (%lu)", name->Buffer, details->RestartCount);
+            else
+                PhSetReference(&details->RestartText, name);
+
+            PhDereferenceObject(name);
+        }
+
+        if ((details->MemoryLimit = PhGetJsonValueAsUInt64(hostConfig, "Memory")) != 0)
+            details->MemoryLimitText = PhFormatSize(details->MemoryLimit, ULONG_MAX);
+
+        // "docker run --cpus" sets NanoCpus; --cpu-quota and --cpu-period set the same limit.
+        details->NanoCpus = PhGetJsonValueAsUInt64(hostConfig, "NanoCpus");
+        cpuQuota = PhGetJsonValueAsUInt64(hostConfig, "CpuQuota");
+        cpuPeriod = PhGetJsonValueAsUInt64(hostConfig, "CpuPeriod");
+
+        if (details->NanoCpus == 0 && cpuQuota != 0 && cpuPeriod != 0)
+            details->NanoCpus = cpuQuota * 1000000000ULL / cpuPeriod;
+
+        if (details->NanoCpus != 0)
+        {
+            PH_FORMAT format;
+
+            PhInitFormatFD(&format, (DOUBLE)details->NanoCpus / 1e9, 2);
+            format.Type |= FormatCropZeros;
+            details->CpuLimitText = PhFormat(&format, 1, 0);
+        }
+
+        details->Privileged = PhGetJsonObjectBool(hostConfig, "Privileged");
+        details->PrivilegedText = PhCreateString(details->Privileged ? L"Yes" : L"No");
+    }
+
+    if ((state = PhGetJsonObject(Object, "State")) && PhGetJsonObjectType(state) == PH_JSON_OBJECT_TYPE_OBJECT)
+    {
+        PPH_STRING status = PhGetJsonValueAsString(state, "Status");
+
+        // Only a container that ran and stopped has an exit code worth showing.
+        if (status && (PhEqualString2(status, L"exited", TRUE) || PhEqualString2(status, L"dead", TRUE)))
+        {
+            details->ExitCode = (LONG)PhGetJsonValueAsInt64(state, "ExitCode");
+
+            if (PhGetJsonObjectBool(state, "OOMKilled"))
+                details->ExitText = PhFormatString(L"%ld (OOM killed)", details->ExitCode);
+            else
+                details->ExitText = PhFormatString(L"%ld", details->ExitCode);
+        }
+
+        PhClearReference(&status);
+    }
+
+    if ((config = PhGetJsonObject(Object, "Config")) && PhGetJsonObjectType(config) == PH_JSON_OBJECT_TYPE_OBJECT)
+    {
+        // The user of the container and its image together; none set means root.
+        details->User = PhGetJsonValueAsString(config, "User");
+
+        if (PhIsNullOrEmptyString(details->User))
+            PhMoveReference(&details->User, PhCreateString(L"root"));
+    }
+
+    return details;
+}
+
+/**
+ * Gets the cached details of a container.
+ *
+ * \param Key Identifies the container, e.g. its full ID.
+ * \param State The container's state. Details kept for another state are stale, e.g. the exit
+ * code of a container that was restarted.
+ * \return The details, referenced, or NULL if there are none for this state.
+ */
+PWSL_CONTAINER_DETAILS WslGetCachedContainerDetails(
+    _In_ PPH_STRING Key,
+    _In_opt_ PPH_STRING State
+    )
+{
+    for (ULONG i = 0; WslpContainerDetailsCache && i < WslpContainerDetailsCache->Count; i++)
+    {
+        PWSL_CONTAINER_DETAILS_ENTRY entry = WslpContainerDetailsCache->Items[i];
+
+        if (!PhEqualString(entry->Key, Key, TRUE))
+            continue;
+
+        if (PhCompareStringWithNull(entry->State, State, TRUE) != 0)
+            return NULL;
+
+        entry->LastUsedTime = NtGetTickCount64();
+
+        return PhReferenceObject(entry->Details);
+    }
+
+    return NULL;
+}
+
+/**
+ * Keeps the details of a container, replacing those kept for another state.
+ */
+VOID WslCacheContainerDetails(
+    _In_ PPH_STRING Key,
+    _In_opt_ PPH_STRING State,
+    _In_ PWSL_CONTAINER_DETAILS Details
+    )
+{
+    PWSL_CONTAINER_DETAILS_ENTRY entry = NULL;
+
+    if (!WslpContainerDetailsCache)
+        WslpContainerDetailsCache = PhCreateList(8);
+
+    for (ULONG i = 0; i < WslpContainerDetailsCache->Count && !entry; i++)
+    {
+        if (PhEqualString(((PWSL_CONTAINER_DETAILS_ENTRY)WslpContainerDetailsCache->Items[i])->Key, Key, TRUE))
+            entry = WslpContainerDetailsCache->Items[i];
+    }
+
+    if (!entry)
+    {
+        entry = PhAllocateZero(sizeof(WSL_CONTAINER_DETAILS_ENTRY));
+        PhSetReference(&entry->Key, Key);
+        PhAddItemList(WslpContainerDetailsCache, entry);
+    }
+
+    PhSetReference(&entry->State, State);
+    PhSetReference(&entry->Details, Details);
+    entry->LastUsedTime = NtGetTickCount64();
+}
+
+/**
+ * Forgets the details of containers that have not been seen for a while.
+ */
+VOID WslPruneContainerDetails(
+    VOID
+    )
+{
+    ULONG64 now = NtGetTickCount64();
+
+    if (!WslpContainerDetailsCache)
+        return;
+
+    for (ULONG i = WslpContainerDetailsCache->Count; i != 0; i--)
+    {
+        PWSL_CONTAINER_DETAILS_ENTRY entry = WslpContainerDetailsCache->Items[i - 1];
+
+        if (now - entry->LastUsedTime < WSL_CONTAINER_DETAILS_LIFETIME_MS)
+            continue;
+
+        PhRemoveItemList(WslpContainerDetailsCache, i - 1);
+        PhDereferenceObject(entry->Key);
+        PhClearReference(&entry->State);
+        PhDereferenceObject(entry->Details);
+        PhFree(entry);
+    }
 }

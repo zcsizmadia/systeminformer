@@ -18,6 +18,9 @@
 // are only ever listed for a session it reported, and always with --session, because
 // "wslc list" without a session could create or start the default session.
 
+// How many "wslc inspect" processes a refresh runs at most, for the optional columns.
+#define WSL_SESSION_MAX_INSPECTS 2
+
 // The processes of a session VM, with the cgroup of each, printed once. This is a one-shot
 // snapshot per refresh rather than a loop like the distribution collector, because a loop
 // started with "session run" keeps running inside the VM when wslc.exe is killed. The script
@@ -113,7 +116,48 @@ VOID WslFreeContainer(
     PhClearReference(&Container->State);
     PhClearReference(&Container->Status);
     PhClearReference(&Container->Ports);
+    PhClearReference(&Container->ImageId);
+    PhClearReference(&Container->Command);
+    PhClearReference(&Container->Created);
+    PhClearReference(&Container->Networks);
+    PhClearReference(&Container->IpAddresses);
+    PhClearReference(&Container->Mounts);
+    PhClearReference(&Container->Compose);
+    PhClearReference(&Container->Health);
+    PhClearReference(&Container->Platform);
+    PhClearReference(&Container->Details);
     PhFree(Container);
+}
+
+/**
+ * Copies a container, without its usage.
+ */
+PWSL_CONTAINER WslCopyContainer(
+    _In_ PWSL_CONTAINER Container
+    )
+{
+    PWSL_CONTAINER copy = PhAllocateZero(sizeof(WSL_CONTAINER));
+
+    PhSetReference(&copy->Id, Container->Id);
+    PhSetReference(&copy->Name, Container->Name);
+    PhSetReference(&copy->Image, Container->Image);
+    PhSetReference(&copy->State, Container->State);
+    PhSetReference(&copy->Status, Container->Status);
+    PhSetReference(&copy->Ports, Container->Ports);
+    PhSetReference(&copy->ImageId, Container->ImageId);
+    PhSetReference(&copy->Command, Container->Command);
+    PhSetReference(&copy->Created, Container->Created);
+    copy->CreatedTime = Container->CreatedTime;
+    PhSetReference(&copy->Networks, Container->Networks);
+    PhSetReference(&copy->IpAddresses, Container->IpAddresses);
+    PhSetReference(&copy->Mounts, Container->Mounts);
+    PhSetReference(&copy->Compose, Container->Compose);
+    PhSetReference(&copy->Health, Container->Health);
+    PhSetReference(&copy->Platform, Container->Platform);
+    PhSetReference(&copy->Details, Container->Details);
+    copy->Running = Container->Running;
+
+    return copy;
 }
 
 /**
@@ -280,6 +324,139 @@ static PPH_LIST WslpParseSessionList(
 }
 
 /**
+ * Reads a number of a fixed number of digits.
+ */
+_Success_(return)
+static BOOLEAN WslpParseDigits(
+    _In_reads_(Count) PCWSTR Text,
+    _In_ ULONG Count,
+    _Out_ PCSHORT Value
+    )
+{
+    CSHORT value = 0;
+
+    for (ULONG i = 0; i < Count; i++)
+    {
+        if (Text[i] < L'0' || Text[i] > L'9')
+            return FALSE;
+
+        value = (CSHORT)(value * 10 + (Text[i] - L'0'));
+    }
+
+    *Value = value;
+
+    return TRUE;
+}
+
+/**
+ * Reads a time as "wslc list" prints it, e.g. "2026-09-24 00:10:25 -0500 CDT".
+ *
+ * \param Text The text.
+ * \param Time Receives the time as a system time.
+ * \return FALSE if the text is not in that format.
+ */
+static BOOLEAN WslpParseListTime(
+    _In_ PCPH_STRINGREF Text,
+    _Out_ PLARGE_INTEGER Time
+    )
+{
+    PCWSTR text = Text->Buffer;
+    TIME_FIELDS fields = { 0 };
+    CSHORT offsetHours;
+    CSHORT offsetMinutes;
+    LONG64 offset;
+
+    Time->QuadPart = 0;
+
+    // "YYYY-MM-DD hh:mm:ss +hhmm", then the zone name, which the offset makes redundant.
+    if (Text->Length < 25 * sizeof(WCHAR))
+        return FALSE;
+    if (text[4] != L'-' || text[7] != L'-' || text[10] != L' ' || text[13] != L':' || text[16] != L':' || text[19] != L' ')
+        return FALSE;
+    if (text[20] != L'+' && text[20] != L'-')
+        return FALSE;
+
+    if (!WslpParseDigits(text, 4, &fields.Year) || !WslpParseDigits(text + 5, 2, &fields.Month) ||
+        !WslpParseDigits(text + 8, 2, &fields.Day) || !WslpParseDigits(text + 11, 2, &fields.Hour) ||
+        !WslpParseDigits(text + 14, 2, &fields.Minute) || !WslpParseDigits(text + 17, 2, &fields.Second) ||
+        !WslpParseDigits(text + 21, 2, &offsetHours) || !WslpParseDigits(text + 23, 2, &offsetMinutes))
+    {
+        return FALSE;
+    }
+
+    if (!RtlTimeFieldsToTime(&fields, Time))
+        return FALSE;
+
+    // The fields are local to the offset; UTC is the local time minus the offset.
+    offset = (offsetHours * 60LL + offsetMinutes) * 60 * PH_TICKS_PER_SEC;
+    Time->QuadPart += text[20] == L'+' ? -offset : offset;
+
+    return TRUE;
+}
+
+/**
+ * Gets the value of a label from the labels as "wslc list" prints them, e.g. "a=1,b=2".
+ *
+ * \return The value, or NULL if the label is not there.
+ * \remarks Values can contain commas, e.g. JSON metadata, so the value found ends at the next
+ * comma; that is enough for the Compose labels, whose values are names.
+ */
+static PPH_STRING WslpGetListLabel(
+    _In_ PPH_STRING Labels,
+    _In_ PCPH_STRINGREF Name
+    )
+{
+    PH_STRINGREF remaining = Labels->sr;
+
+    while (remaining.Length != 0)
+    {
+        PH_STRINGREF label;
+        PH_STRINGREF key;
+        PH_STRINGREF value;
+
+        PhSplitStringRefAtChar(&remaining, L',', &label, &remaining);
+
+        if (PhSplitStringRefAtChar(&label, L'=', &key, &value) && PhEqualStringRef(&key, Name, FALSE))
+            return value.Length != 0 ? PhCreateString2(&value) : NULL;
+    }
+
+    return NULL;
+}
+
+/**
+ * Formats the Compose project and service of a container from its labels.
+ *
+ * \return e.g. "skrog / api", or NULL if the container is not from Compose.
+ */
+static PPH_STRING WslpGetComposeText(
+    _In_ PPH_STRING Labels
+    )
+{
+    static CONST PH_STRINGREF projectName = PH_STRINGREF_INIT(L"com.docker.compose.project");
+    static CONST PH_STRINGREF serviceName = PH_STRINGREF_INIT(L"com.docker.compose.service");
+    PPH_STRING project;
+    PPH_STRING service;
+    PPH_STRING text = NULL;
+
+    if (project = WslpGetListLabel(Labels, &projectName))
+    {
+        if (service = WslpGetListLabel(Labels, &serviceName))
+        {
+            text = PhFormatString(L"%s / %s", project->Buffer, service->Buffer);
+            PhDereferenceObject(service);
+        }
+        else
+        {
+            PhSetReference(&text, project);
+        }
+
+        PhDereferenceObject(project);
+    }
+
+    return text;
+}
+
+/**
  * Parses one line of "wslc list --format json".
  */
 static VOID WslpParseContainerLine(
@@ -290,6 +467,9 @@ static VOID WslpParseContainerLine(
     PWSL_SESSION session = Context;
     PVOID object;
     PWSL_CONTAINER container;
+    PPH_STRING labels;
+    PPH_STRING created;
+    PVOID platform;
 
     if (!NT_SUCCESS(PhCreateJsonParserEx(&object, Line, FALSE)) || !object)
         return;
@@ -303,7 +483,42 @@ static VOID WslpParseContainerLine(
         container->State = PhGetJsonValueAsString(object, "State");
         container->Status = PhGetJsonValueAsString(object, "Status");
         container->Ports = PhGetJsonValueAsString(object, "Ports");
+        container->Command = PhGetJsonValueAsString(object, "Command");
+        container->Networks = PhGetJsonValueAsString(object, "Networks");
+        container->Mounts = PhGetJsonValueAsString(object, "Mounts");
+        container->Health = PhGetJsonValueAsString(object, "HealthStatus");
         container->Running = container->State && PhEqualString2(container->State, L"running", TRUE);
+
+        // Shown in local time like the containers of an engine, and as it is when it cannot
+        // be read.
+        if (created = PhGetJsonValueAsString(object, "CreatedAt"))
+        {
+            if (WslpParseListTime(&created->sr, &container->CreatedTime))
+                container->Created = WslFormatLocalTime(&container->CreatedTime);
+            else
+                PhSetReference(&container->Created, created);
+
+            PhDereferenceObject(created);
+        }
+
+        if (labels = PhGetJsonValueAsString(object, "Labels"))
+        {
+            container->Compose = WslpGetComposeText(labels);
+            PhDereferenceObject(labels);
+        }
+
+        // "Platform" is e.g. {"architecture":"amd64","os":"linux"}.
+        if (platform = PhGetJsonObject(object, "Platform"))
+        {
+            PPH_STRING os = PhGetJsonValueAsString(platform, "os");
+            PPH_STRING architecture = PhGetJsonValueAsString(platform, "architecture");
+
+            if (!PhIsNullOrEmptyString(os) && !PhIsNullOrEmptyString(architecture))
+                container->Platform = PhFormatString(L"%s/%s", os->Buffer, architecture->Buffer);
+
+            PhClearReference(&os);
+            PhClearReference(&architecture);
+        }
 
         // wslc prints states in lower case; show them like the other rows. The string is new and
         // not shared yet, so it can still be changed.
@@ -421,6 +636,67 @@ static VOID WslpParseStatsLine(
 }
 
 /**
+ * Adds the inspect details to the containers of a running session: from the cache, or, while
+ * the tab shows a column that needs them, from "wslc inspect".
+ *
+ * \remarks Each inspect is a wslc process, so a refresh runs only a few; the other containers
+ * get theirs on the next refreshes.
+ */
+static VOID WslpQuerySessionDetails(
+    _In_ PPH_STRING FileName,
+    _In_ PWSL_SESSION Session
+    )
+{
+    ULONG inspected = 0;
+
+    for (ULONG i = 0; i < Session->Containers->Count; i++)
+    {
+        PWSL_CONTAINER container = Session->Containers->Items[i];
+        PPH_STRING key;
+        PPH_STRING arguments;
+        PPH_BYTES output;
+        PVOID object;
+
+        // Container IDs are short here, so they are only unique within the session.
+        if (!(key = PhFormatString(L"%s/%s", Session->Name->Buffer, container->Id->Buffer)))
+            continue;
+
+        if (container->Details = WslGetCachedContainerDetails(key, container->State))
+        {
+            PhDereferenceObject(key);
+            continue;
+        }
+
+        if (ReadAcquire(&WslContainerDetailsWanted) && inspected < WSL_SESSION_MAX_INSPECTS &&
+            WslIsSafeContainerId(container->Id) && !WslIsProviderStopping() &&
+            (arguments = PhFormatString(L"--session \"%s\" inspect %s", Session->Name->Buffer, container->Id->Buffer)))
+        {
+            inspected++;
+
+            if (NT_SUCCESS(WslRunCommand(FileName, &arguments->sr, &output)))
+            {
+                if (NT_SUCCESS(PhCreateJsonParserEx(&object, output, FALSE)) && object)
+                {
+                    // wslc prints an array with one object per inspected ID, like docker inspect.
+                    PVOID element = PhGetJsonObjectType(object) == PH_JSON_OBJECT_TYPE_ARRAY ? PhGetJsonArrayIndexObject(object, 0) : object;
+
+                    if (element && (container->Details = WslParseContainerDetails(element)))
+                        WslCacheContainerDetails(key, container->State, container->Details);
+
+                    PhFreeJsonObject(object);
+                }
+
+                PhDereferenceObject(output);
+            }
+
+            PhDereferenceObject(arguments);
+        }
+
+        PhDereferenceObject(key);
+    }
+}
+
+/**
  * Lists the containers of a running session and adds their resource usage.
  *
  * \remarks "wslc stats" samples CPU usage over about two seconds, so this blocks for that
@@ -457,6 +733,8 @@ static VOID WslpQuerySessionContainers(
 
     WslpForEachLine(output, WslpParseContainerLine, Session);
     PhDereferenceObject(output);
+
+    WslpQuerySessionDetails(FileName, Session);
 
     for (ULONG i = 0; i < Session->Containers->Count; i++)
         anyRunning |= ((PWSL_CONTAINER)Session->Containers->Items[i])->Running;
