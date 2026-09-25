@@ -21,9 +21,14 @@
 // processes of the distribution the loop runs in.
 
 // The first two frames are one second apart, so CPU usage, which needs two frames, is
-// available right after the tab is shown instead of one full interval later. The cgroup of
-// each process tells the container it runs in, when the distribution hosts a container engine.
-// The script is a PhFormatString format, so "%%" prints the "%" that starts a cgroup line.
+// available right after the tab is shown instead of one full interval later.
+//
+// When the distribution hosts a container engine, the header ends with the Docker engine ID
+// ("-" if there is none), and the cgroup of each process tells the container it runs in. The
+// cgroup lines come before the stat lines, where a process name cannot forge them. A
+// redirection that fails is reported before a "2>" on the same command applies, so the reads
+// are grouped to keep those errors out of the output. The script is a PhFormatString format,
+// so "%%" prints the "%" that starts a cgroup line.
 #define WSL_PROCESS_SCRIPT \
     L"t=$(getconf CLK_TCK 2>/dev/null || echo 100); " \
     L"p=$(getconf PAGESIZE 2>/dev/null || echo 4096); " \
@@ -32,9 +37,10 @@
     L"while :; do " \
     L"read u i < /proc/uptime; " \
     L"m=0; a=0; while read -r n v r; do case $n in MemTotal:) m=$v ;; MemAvailable:) a=$v ;; esac; done < /proc/meminfo; " \
-    L"echo @ $u $t $p $$ $k $m $a; " \
+    L"e=; { read -r e < /var/lib/docker/engine-id; } 2>/dev/null; " \
+    L"echo @ $u $t $p $$ $k $m $a ${e:--}; " \
+    L"for d in /proc/[0-9]*; do { read -r g < $d/cgroup; } 2>/dev/null && echo %%${d#/proc/} $g; done; " \
     L"cat /proc/[0-9]*/stat 2>/dev/null; " \
-    L"for d in /proc/[0-9]*; do read -r g < $d/cgroup 2>/dev/null && echo %%${d#/proc/} $g; done; " \
     L"echo @end; " \
     L"sleep $s; " \
     L"s=%lu; " \
@@ -85,7 +91,12 @@ typedef struct _WSL_FRAME_PARSER
     PPH_STRING KernelRelease;
     ULONG64 MemoryTotal;
     ULONG64 MemoryAvailable;
+    PPH_STRING EngineId; // Docker engine ID of the distribution, from the header, or NULL
+    // Simple hashtable of the frame being read: process ID -> container ID (PPH_STRING). The
+    // cgroup lines come before the stat lines and are applied when the frame completes.
+    PPH_HASHTABLE Cgroups;
     BOOLEAN InFrame;
+    BOOLEAN InStats; // A stat line of the frame was read; later cgroup lines are ignored
 } WSL_FRAME_PARSER, *PWSL_FRAME_PARSER;
 
 typedef struct _WSL_COLLECTOR
@@ -130,6 +141,7 @@ static VOID NTAPI WslpProcessFrameDeleteProcedure(
 
     PhDereferenceObject(frame->Processes);
     PhClearReference(&frame->KernelRelease);
+    PhClearReference(&frame->EngineId);
 }
 
 /**
@@ -217,12 +229,38 @@ PCPH_STRINGREF WslGetLinuxProcessStateText(
 }
 
 /**
+ * Determines whether a header field is a Docker engine ID, e.g. a UUID.
+ *
+ * \return TRUE if the field has 1 to 128 letters, digits, "-" or ":".
+ */
+static BOOLEAN WslpIsEngineId(
+    _In_ PCPH_STRINGREF Text
+    )
+{
+    SIZE_T count = Text->Length / sizeof(WCHAR);
+
+    if (count == 0 || count > 128)
+        return FALSE;
+
+    for (SIZE_T i = 0; i < count; i++)
+    {
+        WCHAR c = Text->Buffer[i];
+
+        if (!((c >= L'0' && c <= L'9') || (c >= L'a' && c <= L'z') || (c >= L'A' && c <= L'Z') || c == L'-' || c == L':'))
+            return FALSE;
+    }
+
+    return TRUE;
+}
+
+/**
  * Parses a frame header, "@ <uptime> <ticks per second> <page size> <shell pid> <kernel release>
- * <MemTotal kB> <MemAvailable kB>".
+ * <MemTotal kB> <MemAvailable kB> [<engine id>]".
  *
  * \remarks A process name can contain a newline, so a line that only starts like a header
  * can be the tail of a stat line. The rest of that stat line always follows the name on the
- * same line, so requiring exactly these fields and nothing after them rejects it.
+ * same line, so requiring exactly these fields and nothing after them rejects it. A name has at
+ * most 15 bytes, too short to fake a header.
  */
 static BOOLEAN WslpParseHeader(
     _In_ PWSL_FRAME_PARSER Parser,
@@ -276,6 +314,20 @@ static BOOLEAN WslpParseHeader(
 
     Parser->MemoryTotal *= 1024;
     Parser->MemoryAvailable *= 1024;
+
+    // The collector adds the Docker engine ID of the distribution, from
+    // /var/lib/docker/engine-id, or "-"; the session snapshot has no such field.
+    PhSplitStringRefAtChar(&Line, L' ', &part, &Line);
+
+    if (WslpIsEngineId(&part))
+    {
+        if (!Parser->EngineId || !PhEqualStringRef(&Parser->EngineId->sr, &part, FALSE))
+            PhMoveReference(&Parser->EngineId, PhCreateString2(&part));
+    }
+    else
+    {
+        PhClearReference(&Parser->EngineId);
+    }
 
     return Line.Length == 0;
 }
@@ -447,6 +499,7 @@ static PWSL_PROCESS_FRAME WslpCompleteFrame(
     frame->MemoryTotal = Parser->MemoryTotal;
     frame->MemoryAvailable = Parser->MemoryAvailable;
     PhSetReference(&frame->KernelRelease, Parser->KernelRelease);
+    PhSetReference(&frame->EngineId, Parser->EngineId);
     samples = PhCreateHashtable(sizeof(WSL_CPU_SAMPLE), WslpCpuSampleEqualFunction, WslpCpuSampleHashFunction, Parser->Entries->Count);
 
     for (ULONG i = 0; i < Parser->Entries->Count; i++)
@@ -454,6 +507,7 @@ static PWSL_PROCESS_FRAME WslpCompleteFrame(
         PWSL_STAT_ENTRY entry = Parser->Entries->Items[i];
         PWSL_LINUX_PROCESS process;
         WSL_CPU_SAMPLE sample;
+        PPH_STRING containerId;
 
         if (WslpIsCollectorEntry(Parser, entry, relayProcessId, sessionLeaderProcessId))
         {
@@ -489,6 +543,10 @@ static PWSL_PROCESS_FRAME WslpCompleteFrame(
         sample.StartTime = entry->Process.StartTime;
         sample.Ticks = entry->Ticks;
         PhAddEntryHashtable(samples, &sample);
+
+        // The container of the process, from the cgroup lines read before the stat lines.
+        if (containerId = PhFindItemSimpleHashtable2(Parser->Cgroups, UlongToPtr(entry->Process.ProcessId)))
+            PhSetReference(&entry->Process.ContainerId, containerId);
 
         process = PhAllocateCopy(&entry->Process, sizeof(WSL_LINUX_PROCESS));
         PhAddItemList(frame->Processes, process);
@@ -535,6 +593,21 @@ static VOID WslpDiscardEntries(
     }
 
     PhClearList(Parser->Entries);
+
+    // The cgroup lines belong to the frame being read too.
+    {
+        PH_HASHTABLE_ENUM_CONTEXT enumContext;
+        PPH_KEY_VALUE_PAIR pair;
+
+        PhBeginEnumHashtable(Parser->Cgroups, &enumContext);
+
+        while (pair = PhNextEnumHashtable(&enumContext))
+            PhDereferenceObject(pair->Value);
+
+        PhClearHashtable(Parser->Cgroups);
+    }
+
+    Parser->InStats = FALSE;
 }
 
 /**
@@ -625,14 +698,26 @@ static PWSL_PROCESS_FRAME WslpProcessLine(
     {
         PH_STRINGREF pidPart;
         PH_STRINGREF cgroup;
-        PWSL_STAT_ENTRY entry;
         ULONG64 pid;
+        PPH_STRING containerId;
 
-        PhSkipStringRef(&lineRef, sizeof(WCHAR));
-        PhSplitStringRefAtChar(&lineRef, L' ', &pidPart, &cgroup);
+        // A process name can contain a line break, so only the lines before the first stat
+        // line are cgroup lines; one inside the stat lines could be forged by a name.
+        if (!Parser->InStats)
+        {
+            PhSkipStringRef(&lineRef, sizeof(WCHAR));
+            PhSplitStringRefAtChar(&lineRef, L' ', &pidPart, &cgroup);
 
-        if (PhStringToUInt64(&pidPart, 10, &pid) && (entry = WslpFindEntry(Parser->Entries, (ULONG)pid)))
-            PhMoveReference(&entry->Process.ContainerId, WslpGetCgroupContainerId(cgroup));
+            if (PhStringToUInt64(&pidPart, 10, &pid) && pid != 0 && pid <= MAXULONG && (containerId = WslpGetCgroupContainerId(cgroup)))
+            {
+                PVOID *value;
+
+                if (value = PhFindItemSimpleHashtable(Parser->Cgroups, UlongToPtr((ULONG)pid)))
+                    PhMoveReference(value, containerId);
+                else
+                    PhAddItemSimpleHashtable(Parser->Cgroups, UlongToPtr((ULONG)pid), containerId);
+            }
+        }
     }
     else if (lineRef.Length >= 2 * sizeof(WCHAR) && lineRef.Buffer[0] == L'@' && lineRef.Buffer[1] == L' ')
     {
@@ -642,6 +727,8 @@ static PWSL_PROCESS_FRAME WslpProcessLine(
     else if (Parser->InFrame)
     {
         PWSL_STAT_ENTRY entry;
+
+        Parser->InStats = TRUE;
 
         if (entry = WslpParseStatLine(Parser, lineRef))
             PhAddItemList(Parser->Entries, entry);
@@ -666,6 +753,7 @@ PWSL_FRAME_PARSER WslCreateFrameParser(
     parser = PhAllocateZero(sizeof(WSL_FRAME_PARSER));
     parser->PreviousSamples = PhCreateHashtable(sizeof(WSL_CPU_SAMPLE), WslpCpuSampleEqualFunction, WslpCpuSampleHashFunction, 64);
     parser->Entries = PhCreateList(64);
+    parser->Cgroups = PhCreateSimpleHashtable(64);
 
     return parser;
 }
@@ -679,8 +767,10 @@ VOID WslDestroyFrameParser(
 {
     WslpDiscardEntries(Parser);
     PhDereferenceObject(Parser->Entries);
+    PhDereferenceObject(Parser->Cgroups);
     PhDereferenceObject(Parser->PreviousSamples);
     PhClearReference(&Parser->KernelRelease);
+    PhClearReference(&Parser->EngineId);
     PhFree(Parser);
 }
 

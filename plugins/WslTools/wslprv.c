@@ -128,7 +128,8 @@ typedef enum _WSLP_VM_KIND
 {
     WslpVmKindUnknown, // No relay found, e.g. a Hyper-V VM
     WslpVmKindWsl, // Relay started by wslservice.exe
-    WslpVmKindSession // Relay started by wslcsession.exe
+    WslpVmKindSession, // Relay started by this user's wslcsession.exe
+    WslpVmKindForeign // Relay started by another user's wslcsession.exe; ignored
 } WSLP_VM_KIND;
 
 /**
@@ -178,8 +179,10 @@ static WSLP_VM_KIND WslpGetVmKind(
 
         if (PhEqualStringRef(&parentItem->ProcessName->sr, &serviceName, TRUE))
             return WslpVmKindWsl;
+        // Every user has their own sessions, and an elevated System Informer sees the session
+        // VMs of other users too, which must not count as this user's.
         if (PhEqualStringRef(&parentItem->ProcessName->sr, &sessionName, TRUE))
-            return WslpVmKindSession;
+            return PhEqualSid(parentItem->Sid, PhGetOwnTokenAttributes().TokenSid) ? WslpVmKindSession : WslpVmKindForeign;
     }
 
     return WslpVmKindUnknown;
@@ -248,6 +251,8 @@ static VOID WslpFindVmProcessItems(
         case WslpVmKindSession:
             sessionVmItem = candidate;
             sessionCandidates++;
+            break;
+        case WslpVmKindForeign:
             break;
         default:
             unknownVmItem = candidate;
@@ -473,8 +478,15 @@ static NTSTATUS NTAPI WslpProviderThread(
             WslpUpdateCollectors(snapshot);
 
             // A WSLC session is a VM of its own, so without any VM process none can be running.
+            // The session VMs are counted again just before the sessions are asked, after the
+            // wsl.exe calls above, so that a VM that stopped on idle meanwhile is not started
+            // again by asking. The process list itself is up to one update interval old.
             if (candidates != 0)
+            {
+                vmProcessItem = WslReferenceVmProcessItem(NULL, &sessionVms);
+                PhClearReference(&vmProcessItem);
                 snapshot->Sessions = WslQuerySessions(sessionVms);
+            }
 
             // Engines are placed by the containers of the distribution frames just attached,
             // and a Docker API in front of WSLC is recognized by the sessions' containers.
@@ -497,10 +509,12 @@ static NTSTATUS NTAPI WslpProviderThread(
         }
         else
         {
-            // Hidden: nothing is collected, and CPU usage starts fresh when shown again.
+            // Hidden: nothing is collected, and CPU usage starts fresh when shown again. Where
+            // each engine runs is kept, so that showing the tab again does not ask an engine
+            // whose distribution stopped meanwhile.
             WslpStopAllCollectors();
             WslResetSessionProcesses();
-            WslResetEngines();
+            WslResetEngines(FALSE);
 
             PhAcquireQueuedLockExclusive(&WslpLatestSnapshotLock);
             PhClearReference(&WslpLatestSnapshot);
@@ -512,7 +526,7 @@ static NTSTATUS NTAPI WslpProviderThread(
 
     WslpStopAllCollectors();
     WslResetSessionProcesses();
-    WslResetEngines();
+    WslResetEngines(TRUE);
 
     return STATUS_SUCCESS;
 }
@@ -538,6 +552,16 @@ VOID WslStartProvider(
         WslpProviderWakeEvent = NULL;
         PhClearReference(&WslpCollectors);
     }
+}
+
+/**
+ * Determines whether the provider thread is being stopped, for work that should end early.
+ */
+BOOLEAN WslIsProviderStopping(
+    VOID
+    )
+{
+    return !!ReadAcquire(&WslpProviderStopping);
 }
 
 /**

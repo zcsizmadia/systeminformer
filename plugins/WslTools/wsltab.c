@@ -343,44 +343,53 @@ static VOID WslpUpdateProcessNodes(
 }
 
 /**
- * Matches the children of a distribution that hosts a Docker API engine to the engine's
+ * Matches the children of a distribution that hosts Docker API engines to the engines'
  * containers, each with its processes, like the containers of a WSLC session.
  *
  * \param DistroNode The distribution node.
- * \param Engine The engine placed in the distribution.
+ * \param Engines The engines of the snapshot; those placed in the distribution are shown,
+ * e.g. both Docker and Podman.
  * \param Frame The distribution's processes, or NULL.
- * \remarks The engine's own processes, e.g. dockerd and containerd, are not shown.
+ * \remarks The engines' own processes, e.g. dockerd and containerd, are not shown.
  */
 static VOID WslpUpdateEngineNodes(
     _In_ PWSL_NODE DistroNode,
-    _In_ PWSL_ENGINE Engine,
+    _In_ PPH_LIST Engines,
     _In_opt_ PWSL_PROCESS_FRAME Frame
     )
 {
     for (ULONG i = 0; i < DistroNode->Children->Count; i++)
         ((PWSL_NODE)DistroNode->Children->Items[i])->Seen = FALSE;
 
-    for (ULONG i = 0; i < Engine->Containers->Count; i++)
+    for (ULONG e = 0; e < Engines->Count; e++)
     {
-        PWSL_CONTAINER container = Engine->Containers->Items[i];
-        PWSL_NODE containerNode = WslpFindChildNode(DistroNode, container->Id);
+        PWSL_ENGINE engine = Engines->Items[e];
 
-        // The distribution's process nodes are removed below, as they are never seen here.
-        if (containerNode && containerNode->Type != WslNodeTypeContainer)
-            containerNode = NULL;
+        if (!PhEqualString(engine->DistroId, DistroNode->Distro->Id, TRUE))
+            continue;
 
-        if (!containerNode)
+        for (ULONG i = 0; i < engine->Containers->Count; i++)
         {
-            containerNode = WslpCreateNode(WslNodeTypeContainer, container->Id);
-            PhAddItemList(DistroNode->Children, containerNode);
-        }
+            PWSL_CONTAINER container = engine->Containers->Items[i];
+            PWSL_NODE containerNode = WslpFindChildNode(DistroNode, container->Id);
 
-        containerNode->Session = NULL;
-        containerNode->Engine = Engine;
-        containerNode->Container = container;
-        containerNode->Seen = TRUE;
-        WslpInvalidateNode(containerNode);
-        WslpUpdateProcessNodes(containerNode, Frame, container->Id);
+            // The distribution's process nodes are removed below, as they are never seen here.
+            if (containerNode && containerNode->Type != WslNodeTypeContainer)
+                containerNode = NULL;
+
+            if (!containerNode)
+            {
+                containerNode = WslpCreateNode(WslNodeTypeContainer, container->Id);
+                PhAddItemList(DistroNode->Children, containerNode);
+            }
+
+            containerNode->Session = NULL;
+            containerNode->Engine = engine;
+            containerNode->Container = container;
+            containerNode->Seen = TRUE;
+            WslpInvalidateNode(containerNode);
+            WslpUpdateProcessNodes(containerNode, Frame, container->Id);
+        }
     }
 
     for (ULONG i = DistroNode->Children->Count; i != 0; i--)
@@ -585,7 +594,7 @@ VOID NTAPI WslOnSnapshotUpdated(
         node->Engine = WslpFindDistroEngine(snapshot->Engines, distro->Id);
 
         if (node->Engine)
-            WslpUpdateEngineNodes(node, node->Engine, distro->Processes);
+            WslpUpdateEngineNodes(node, snapshot->Engines, distro->Processes);
         else
             WslpUpdateProcessNodes(node, distro->Processes, NULL);
 
@@ -819,6 +828,52 @@ static PPH_STRING WslpGetContainerStateText(
 }
 
 /**
+ * Gets the Image / OS text of a distribution: its OS, or the Docker API engines it hosts, e.g.
+ * "Docker Desktop 4.92.0, Docker 29.8.0" with a middle dot, separated by ", " when there are several.
+ */
+static PH_STRINGREF WslpGetDistroImageText(
+    _In_ PWSL_NODE Node
+    )
+{
+    if (!Node->Engine)
+        return PhGetStringRef(Node->Distro->OsName);
+
+    if (!Node->ImageText && WslCurrentSnapshot && WslCurrentSnapshot->Engines)
+    {
+        PPH_LIST engines = WslCurrentSnapshot->Engines;
+
+        for (ULONG i = 0; i < engines->Count; i++)
+        {
+            PWSL_ENGINE engine = engines->Items[i];
+            PPH_STRING part;
+
+            if (!engine->ProductText || !PhEqualString(engine->DistroId, Node->Distro->Id, TRUE))
+                continue;
+
+            if (engine->EngineText)
+                part = PhFormatString(L"%s \u00b7 %s", engine->ProductText->Buffer, engine->EngineText->Buffer);
+            else
+                part = PhReferenceObject(engine->ProductText);
+
+            if (!part)
+                continue;
+
+            if (Node->ImageText)
+            {
+                PhMoveReference(&Node->ImageText, PhFormatString(L"%s, %s", Node->ImageText->Buffer, part->Buffer));
+                PhDereferenceObject(part);
+            }
+            else
+            {
+                Node->ImageText = part;
+            }
+        }
+    }
+
+    return Node->ImageText ? Node->ImageText->sr : PhGetStringRef(Node->Distro->OsName);
+}
+
+/**
  * Compares two nodes for the current sort column.
  *
  * \remarks Siblings of different types, e.g. the VM, WSL 1 distributions and sessions at the
@@ -886,7 +941,13 @@ static int __cdecl WslpCompareNodes(
             sortResult = singlecmp(distro1->Processes ? distro1->Processes->CpuUsage : 0, distro2->Processes ? distro2->Processes->CpuUsage : 0);
             break;
         case WSLTNC_IMAGE:
-            sortResult = PhCompareStringWithNull(distro1->OsName, distro2->OsName, TRUE);
+            {
+                // By what the column shows, which for an engine's distribution is the engine.
+                PH_STRINGREF text1 = WslpGetDistroImageText(node1);
+                PH_STRINGREF text2 = WslpGetDistroImageText(node2);
+
+                sortResult = PhCompareStringRef(&text1, &text2, TRUE);
+            }
             break;
         case WSLTNC_DISK:
             sortResult = uint64cmp(distro1->VhdSize, distro2->VhdSize);
@@ -1190,24 +1251,7 @@ static VOID WslpGetDistroCellText(
         WslpSetSizeCellText(GetCellText, WslpGetNodeMemory(Node), Node->MemoryText, sizeof(Node->MemoryText));
         break;
     case WSLTNC_IMAGE:
-        // A distribution that hosts a Docker API engine shows the engine rather than its OS,
-        // e.g. "Docker Desktop 4.92.0, Docker 29.8.0" with a middle dot.
-        if (Node->Engine && Node->Engine->ProductText)
-        {
-            if (!Node->ImageText)
-            {
-                if (Node->Engine->EngineText)
-                    Node->ImageText = PhFormatString(L"%s \u00b7 %s", Node->Engine->ProductText->Buffer, Node->Engine->EngineText->Buffer);
-                else
-                    PhSetReference(&Node->ImageText, Node->Engine->ProductText);
-            }
-
-            GetCellText->Text = PhGetStringRef(Node->ImageText);
-        }
-        else
-        {
-            GetCellText->Text = PhGetStringRef(distro->OsName);
-        }
+        GetCellText->Text = WslpGetDistroImageText(Node);
         break;
     case WSLTNC_DISK:
         WslpSetSizeCellText(GetCellText, distro->VhdSize, Node->VhdSizeText, sizeof(Node->VhdSizeText));
@@ -1881,6 +1925,11 @@ static VOID WslpHandleCommand(
     case ID_WSL_CONTAINERREMOVE:
         {
             PCWSTR verb;
+            PPH_STRING pipeName = NULL;
+            PPH_STRING sessionName = NULL;
+            PPH_STRING containerId;
+            PPH_STRING containerName;
+            BOOLEAN confirmed = TRUE;
 
             switch (Id)
             {
@@ -1908,53 +1957,68 @@ static VOID WslpHandleCommand(
                 break;
             }
 
+            // The confirmation runs a message loop, in which a new snapshot can replace the node
+            // and the engine or session it points to, so what the action needs is kept first.
+            if (node->Engine)
+                PhSetReference(&pipeName, node->Engine->PipeName);
+            else
+                PhSetReference(&sessionName, node->Session->Name);
+
+            containerId = PhReferenceObject(node->Container->Id);
+            containerName = PhReferenceObject(node->Container->Name);
+            node = NULL;
+
             // Killing skips the container's shutdown and removing deletes its filesystem, so both
             // ask first; stop and restart do not.
-            if (Id == ID_WSL_CONTAINERKILL && !PhShowConfirmMessage(
-                WindowHandle,
-                L"kill",
-                node->Container->Name->Buffer,
-                L"The container's processes will be killed without a chance to shut down.",
-                TRUE
-                ))
+            if (Id == ID_WSL_CONTAINERKILL)
             {
-                break;
+                confirmed = PhShowConfirmMessage(
+                    WindowHandle,
+                    L"kill",
+                    containerName->Buffer,
+                    L"The container's processes will be killed without a chance to shut down.",
+                    TRUE
+                    );
             }
-
-            if (Id == ID_WSL_CONTAINERREMOVE && !PhShowConfirmMessage(
-                WindowHandle,
-                L"remove",
-                node->Container->Name->Buffer,
-                L"The container and any changes made to its filesystem will be deleted.",
-                TRUE
-                ))
+            else if (Id == ID_WSL_CONTAINERREMOVE)
             {
-                break;
+                confirmed = PhShowConfirmMessage(
+                    WindowHandle,
+                    L"remove",
+                    containerName->Buffer,
+                    L"The container and any changes made to its filesystem will be deleted.",
+                    TRUE
+                    );
             }
 
             // The Docker API has the same actions: POST /containers/<id>/<verb>, and DELETE to remove.
-            if (node->Engine)
+            if (confirmed && pipeName)
             {
                 WslpStartAction(
                     NULL,
-                    node->Engine->PipeName,
+                    pipeName,
                     Id == ID_WSL_CONTAINERREMOVE ? "DELETE" : "POST",
                     Id == ID_WSL_CONTAINERREMOVE ?
-                        PhFormatString(L"/containers/%s", node->Container->Id->Buffer) :
-                        PhFormatString(L"/containers/%s/%s", node->Container->Id->Buffer, verb),
+                        PhFormatString(L"/containers/%s", containerId->Buffer) :
+                        PhFormatString(L"/containers/%s/%s", containerId->Buffer, verb),
                     L"Unable to control the container."
                     );
             }
-            else
+            else if (confirmed)
             {
                 WslpStartAction(
                     WslGetWslcFileName(),
                     NULL,
                     NULL,
-                    PhFormatString(L"--session \"%s\" %s %s", node->Session->Name->Buffer, verb, node->Container->Id->Buffer),
+                    PhFormatString(L"--session \"%s\" %s %s", sessionName->Buffer, verb, containerId->Buffer),
                     L"Unable to control the container."
                     );
             }
+
+            PhClearReference(&pipeName);
+            PhClearReference(&sessionName);
+            PhDereferenceObject(containerId);
+            PhDereferenceObject(containerName);
         }
         break;
     case ID_WSL_COPY:

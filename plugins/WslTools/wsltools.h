@@ -62,6 +62,7 @@ typedef struct _WSL_PROCESS_FRAME
     PPH_STRING KernelRelease; // e.g. "6.18.40.1-microsoft-standard-WSL2"
     ULONG64 MemoryTotal; // Memory of the whole VM, from /proc/meminfo
     ULONG64 MemoryAvailable;
+    PPH_STRING EngineId; // Docker engine ID of the distribution, from /var/lib/docker/engine-id, or NULL
 } WSL_PROCESS_FRAME, *PWSL_PROCESS_FRAME;
 
 typedef struct _WSL_COLLECTOR *PWSL_COLLECTOR;
@@ -181,6 +182,7 @@ typedef struct _WSL_ENGINE
     PPH_STRING ProductText; // The product, e.g. "Docker Desktop 4.92.0", "Podman 5.2.0" or "Skrog"
     PPH_STRING EngineText; // The engine, e.g. "Docker 29.8.1", or NULL when ProductText names it
     PPH_STRING ServerText; // The Server header, e.g. "Docker/29.8.1 (linux)"
+    PPH_STRING EngineId; // The ID from GET /info, or NULL
     HANDLE ServerProcessId;
     PPH_STRING DistroId; // The distribution its containers run in
     PPH_LIST Containers; // PWSL_CONTAINER
@@ -197,7 +199,7 @@ VOID WslFreeEngines(
     );
 
 VOID WslResetEngines(
-    VOID
+    _In_ BOOLEAN Forget
     );
 
 NTSTATUS WslEngineRequest(
@@ -332,6 +334,10 @@ VOID WslStartProvider(
 
 VOID WslStopProvider(
     _In_ BOOLEAN Wait
+    );
+
+BOOLEAN WslIsProviderStopping(
+    VOID
     );
 
 // Reasons for WslSetProviderEnabled.
