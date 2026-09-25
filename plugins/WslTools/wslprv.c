@@ -493,6 +493,9 @@ static NTSTATUS NTAPI WslpProviderThread(
             if (candidates != 0 && !ReadAcquire(&WslpProviderStopping))
                 snapshot->Engines = WslQueryEngines(snapshot);
 
+            // The containers seen just now kept their cached inspect details.
+            WslPruneContainerDetails();
+
             if (ReadAcquire(&WslpProviderStopping))
             {
                 PhDereferenceObject(snapshot);

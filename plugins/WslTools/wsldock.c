@@ -32,6 +32,8 @@
 // pipes that do not answer cannot hold up the refresh or System Informer exiting.
 #define WSL_ENGINE_REFRESH_BUDGET_MS 3000
 #define WSL_ENGINE_MAX_PIPES 8
+// The inspect requests of the optional columns get this long per refresh, after the above.
+#define WSL_ENGINE_DETAILS_BUDGET_MS 1000
 // A placed engine that misses this many polls in a row is shown as gone.
 #define WSL_ENGINE_MAX_FAILED_POLLS 3
 // GET /info and /version are tried this many times before the pipe goes without them.
@@ -958,6 +960,197 @@ static PPH_STRING WslpFormatEnginePorts(
 }
 
 /**
+ * Ends a list built with a string builder.
+ *
+ * \return The list, or NULL if it is empty.
+ */
+static PPH_STRING WslpFinalListString(
+    _Inout_ PPH_STRING_BUILDER Builder
+    )
+{
+    if (Builder->String->Length == 0)
+    {
+        PhDeleteStringBuilder(Builder);
+        return NULL;
+    }
+
+    return PhFinalStringBuilderString(Builder);
+}
+
+/**
+ * Reads the networks of an element of GET /containers/json, and the container's address in each.
+ *
+ * \param Object The element.
+ * \param Networks Receives e.g. "bridge, backend", or NULL if there are none.
+ * \param IpAddresses Receives e.g. "172.17.0.3, 172.18.0.2", or NULL if there are none.
+ */
+static VOID WslpGetEngineNetworks(
+    _In_ PVOID Object,
+    _Out_ PPH_STRING *Networks,
+    _Out_ PPH_STRING *IpAddresses
+    )
+{
+    PVOID settings;
+    PVOID networks;
+    PPH_LIST members;
+    PH_STRING_BUILDER names;
+    PH_STRING_BUILDER addresses;
+
+    *Networks = NULL;
+    *IpAddresses = NULL;
+
+    if (!(settings = PhGetJsonObject(Object, "NetworkSettings")) || !(networks = PhGetJsonObject(settings, "Networks")))
+        return;
+    if (!(members = PhGetJsonObjectAsArrayList(networks)))
+        return;
+
+    PhInitializeStringBuilder(&names, 64);
+    PhInitializeStringBuilder(&addresses, 64);
+
+    for (ULONG i = 0; i < members->Count; i++)
+    {
+        PJSON_ARRAY_LIST_OBJECT member = members->Items[i];
+        PPH_STRING name;
+        PPH_STRING address;
+
+        if (name = PhConvertUtf8ToUtf16(member->Key))
+        {
+            if (names.String->Length != 0)
+                PhAppendStringBuilder2(&names, L", ");
+
+            PhAppendStringBuilder(&names, &name->sr);
+            PhDereferenceObject(name);
+        }
+
+        // A network without an address, e.g. "none", is listed only by name.
+        if ((address = PhGetJsonValueAsString(member->Entry, "IPAddress")) && address->Length != 0)
+        {
+            if (addresses.String->Length != 0)
+                PhAppendStringBuilder2(&addresses, L", ");
+
+            PhAppendStringBuilder(&addresses, &address->sr);
+        }
+
+        PhClearReference(&address);
+        PhFree(member);
+    }
+
+    PhDereferenceObject(members);
+
+    *Networks = WslpFinalListString(&names);
+    *IpAddresses = WslpFinalListString(&addresses);
+}
+
+/**
+ * Gets the health from the status of a container, as the Docker API only puts it there, e.g.
+ * "Up 5 minutes (healthy)" or "Up 1 second (health: starting)".
+ *
+ * \return e.g. "healthy" or "starting", or NULL if the container has no health check.
+ */
+static PPH_STRING WslpGetEngineHealth(
+    _In_opt_ PPH_STRING Status
+    )
+{
+    static CONST PH_STRINGREF healthPrefix = PH_STRINGREF_INIT(L"health: ");
+    PH_STRINGREF before;
+    PH_STRINGREF health;
+
+    if (PhIsNullOrEmptyString(Status) || !PhEndsWithStringRef2(&Status->sr, L")", FALSE))
+        return NULL;
+    if (!PhSplitStringRefAtLastChar(&Status->sr, L'(', &before, &health))
+        return NULL;
+
+    health.Length -= sizeof(WCHAR); // The ")"
+
+    if (PhStartsWithStringRef(&health, &healthPrefix, FALSE))
+        PhSkipStringRef(&health, healthPrefix.Length);
+
+    // Only these are health; other text in parentheses could be anything.
+    if (!PhEqualStringRef2(&health, L"healthy", FALSE) && !PhEqualStringRef2(&health, L"unhealthy", FALSE) &&
+        !PhEqualStringRef2(&health, L"starting", FALSE))
+    {
+        return NULL;
+    }
+
+    return PhCreateString2(&health);
+}
+
+/**
+ * Formats where the mounts of an element of GET /containers/json appear in the container.
+ *
+ * \return e.g. "/data, /config", or NULL if there are none.
+ */
+static PPH_STRING WslpFormatEngineMounts(
+    _In_ PVOID Object
+    )
+{
+    // Enough to recognise the container; the Inspect window lists them all.
+    static CONST ULONG maximumShown = 5;
+    PVOID mounts;
+    ULONG count;
+    PH_STRING_BUILDER builder;
+
+    if (!(mounts = PhGetJsonObject(Object, "Mounts")) || PhGetJsonObjectType(mounts) != PH_JSON_OBJECT_TYPE_ARRAY)
+        return NULL;
+    if ((count = PhGetJsonArrayLength(mounts)) == 0)
+        return NULL;
+
+    PhInitializeStringBuilder(&builder, 64);
+
+    for (ULONG i = 0; i < count && i < maximumShown; i++)
+    {
+        PVOID mount = PhGetJsonArrayIndexObject(mounts, i);
+        PPH_STRING destination;
+
+        if (mount && (destination = PhGetJsonValueAsString(mount, "Destination")))
+        {
+            if (builder.String->Length != 0)
+                PhAppendStringBuilder2(&builder, L", ");
+
+            PhAppendStringBuilder(&builder, &destination->sr);
+            PhDereferenceObject(destination);
+        }
+    }
+
+    if (count > maximumShown)
+        PhAppendFormatStringBuilder(&builder, L" and %lu more", count - maximumShown);
+
+    return PhFinalStringBuilderString(&builder);
+}
+
+/**
+ * Formats the Compose project and service of an element of GET /containers/json.
+ *
+ * \return e.g. "skrog / api", or NULL if the container is not from Compose.
+ */
+static PPH_STRING WslpFormatEngineCompose(
+    _In_ PVOID Object
+    )
+{
+    PVOID labels;
+    PPH_STRING project;
+    PPH_STRING service;
+    PPH_STRING text = NULL;
+
+    if (!(labels = PhGetJsonObject(Object, "Labels")) || PhGetJsonObjectType(labels) != PH_JSON_OBJECT_TYPE_OBJECT)
+        return NULL;
+
+    if ((project = PhGetJsonValueAsString(labels, "com.docker.compose.project")) && project->Length != 0)
+    {
+        if ((service = PhGetJsonValueAsString(labels, "com.docker.compose.service")) && service->Length != 0)
+            text = PhFormatString(L"%s / %s", project->Buffer, service->Buffer);
+        else
+            PhSetReference(&text, project);
+
+        PhClearReference(&service);
+    }
+
+    PhClearReference(&project);
+
+    return text;
+}
+
+/**
  * Creates a container from an element of GET /containers/json.
  *
  * \return The container, or NULL if the element has no valid ID.
@@ -969,6 +1162,8 @@ static PWSL_CONTAINER WslpParseEngineContainer(
     PWSL_CONTAINER container;
     PVOID names;
     PVOID ports;
+    PPH_STRING imageId;
+    LONG64 created;
 
     if (PhGetJsonObjectType(Object) != PH_JSON_OBJECT_TYPE_OBJECT)
         return NULL;
@@ -1001,6 +1196,34 @@ static PWSL_CONTAINER WslpParseEngineContainer(
 
     if ((ports = PhGetJsonObject(Object, "Ports")) && PhGetJsonObjectType(ports) == PH_JSON_OBJECT_TYPE_ARRAY)
         container->Ports = WslpFormatEnginePorts(ports);
+
+    // "ImageID" is e.g. "sha256:3f2a..."; show it as short as the Docker CLI does.
+    if (imageId = PhGetJsonValueAsString(Object, "ImageID"))
+    {
+        static CONST PH_STRINGREF digestPrefix = PH_STRINGREF_INIT(L"sha256:");
+        PH_STRINGREF id = imageId->sr;
+
+        if (PhStartsWithStringRef(&id, &digestPrefix, TRUE))
+            PhSkipStringRef(&id, digestPrefix.Length);
+        if (id.Length != 0)
+            container->ImageId = PhCreateStringEx(id.Buffer, min(id.Length, 12 * sizeof(WCHAR)));
+
+        PhDereferenceObject(imageId);
+    }
+
+    container->Command = PhGetJsonValueAsString(Object, "Command");
+
+    // "Created" is in seconds since 1970.
+    if ((created = PhGetJsonValueAsInt64(Object, "Created")) > 0 && created <= MAXULONG)
+    {
+        RtlSecondsSince1970ToTime((ULONG)created, &container->CreatedTime);
+        container->Created = WslFormatLocalTime(&container->CreatedTime);
+    }
+
+    WslpGetEngineNetworks(Object, &container->Networks, &container->IpAddresses);
+    container->Mounts = WslpFormatEngineMounts(Object);
+    container->Compose = WslpFormatEngineCompose(Object);
+    container->Health = WslpGetEngineHealth(container->Status);
 
     container->Running = container->State && PhEqualString2(container->State, L"running", TRUE);
 
@@ -1309,6 +1532,150 @@ static PWSL_ENGINE WslpQueryEngine(
 }
 
 /**
+ * Sends a GET request to an engine and parses the JSON answer.
+ *
+ * \param Path The path, e.g. "/containers/<id>/json". Only ASCII.
+ * \return The parsed object, or NULL if the request failed. Free it with PhFreeJsonObject.
+ */
+static PVOID WslpEngineGetJson(
+    _In_ PWSL_ENGINE Engine,
+    _In_ PPH_STRING Path,
+    _In_ ULONG TimeoutMs
+    )
+{
+    PPH_BYTES path;
+    ULONG statusCode;
+    PPH_BYTES body = NULL;
+    PVOID object = NULL;
+
+    if (!(path = PhConvertUtf16ToUtf8Ex(Path->Buffer, Path->Length)))
+        return NULL;
+
+    if (NT_SUCCESS(WslpEngineRequest(Engine->PipeName, "GET", path->Buffer, TimeoutMs, &statusCode, &body, NULL, NULL)) && statusCode == 200 && body)
+    {
+        if (!NT_SUCCESS(PhCreateJsonParserEx(&object, body, FALSE)))
+            object = NULL;
+    }
+
+    PhClearReference(&body);
+    PhDereferenceObject(path);
+
+    return object;
+}
+
+/**
+ * Gets the platform of a container's image, which only the image's inspect output has.
+ *
+ * \param Object The container's inspect output.
+ * \return e.g. "linux/arm64/v8", or NULL.
+ */
+static PPH_STRING WslpQueryImagePlatform(
+    _In_ PWSL_ENGINE Engine,
+    _In_ PVOID Object,
+    _In_ ULONG64 Deadline
+    )
+{
+    static CONST PH_STRINGREF digestPrefix = PH_STRINGREF_INIT(L"sha256:");
+    PPH_STRING image;
+    PPH_STRING digest;
+    PPH_STRING path;
+    PVOID imageObject;
+    PPH_STRING platform = NULL;
+    ULONG64 now = NtGetTickCount64();
+
+    if (now >= Deadline)
+        return NULL;
+
+    // "Image" is the image ID, e.g. "sha256:3f2a...", which goes into the request path, so
+    // only hexadecimal is accepted after the prefix.
+    if (!(image = PhGetJsonValueAsString(Object, "Image")))
+        return NULL;
+
+    if (!PhStartsWithStringRef(&image->sr, &digestPrefix, TRUE) ||
+        !(digest = PhSubstring(image, digestPrefix.Length / sizeof(WCHAR), (image->Length - digestPrefix.Length) / sizeof(WCHAR))))
+    {
+        PhDereferenceObject(image);
+        return NULL;
+    }
+
+    if (WslIsSafeContainerId(digest) && (path = PhFormatString(L"/images/sha256:%s/json", digest->Buffer)))
+    {
+        if (imageObject = WslpEngineGetJson(Engine, path, (ULONG)min(WSL_ENGINE_TIMEOUT_MS, Deadline - now)))
+        {
+            PPH_STRING os = PhGetJsonValueAsString(imageObject, "Os");
+            PPH_STRING architecture = PhGetJsonValueAsString(imageObject, "Architecture");
+            PPH_STRING variant = PhGetJsonValueAsString(imageObject, "Variant");
+
+            if (!PhIsNullOrEmptyString(os) && !PhIsNullOrEmptyString(architecture))
+            {
+                if (!PhIsNullOrEmptyString(variant))
+                    platform = PhFormatString(L"%s/%s/%s", os->Buffer, architecture->Buffer, variant->Buffer);
+                else
+                    platform = PhFormatString(L"%s/%s", os->Buffer, architecture->Buffer);
+            }
+
+            PhClearReference(&os);
+            PhClearReference(&architecture);
+            PhClearReference(&variant);
+            PhFreeJsonObject(imageObject);
+        }
+
+        PhDereferenceObject(path);
+    }
+
+    PhDereferenceObject(digest);
+    PhDereferenceObject(image);
+
+    return platform;
+}
+
+/**
+ * Adds the inspect details to the containers of an engine: from the cache, or, while the tab
+ * shows a column that needs them, from GET /containers/<id>/json and the image's inspect.
+ *
+ * \param Deadline When the requests of this refresh must end; the containers left get theirs
+ * on the next refreshes.
+ */
+static VOID WslpQueryEngineDetails(
+    _In_ PWSL_ENGINE Engine,
+    _In_ ULONG64 Deadline
+    )
+{
+    for (ULONG i = 0; i < Engine->Containers->Count; i++)
+    {
+        PWSL_CONTAINER container = Engine->Containers->Items[i];
+        PPH_STRING path;
+        PVOID object;
+        ULONG64 now;
+
+        if (container->Details = WslGetCachedContainerDetails(container->Id, container->State))
+            continue;
+
+        now = NtGetTickCount64();
+
+        if (!ReadAcquire(&WslContainerDetailsWanted) || now >= Deadline || WslIsProviderStopping())
+            continue;
+
+        // The ID was checked to be hexadecimal when the container was read.
+        if (!(path = PhFormatString(L"/containers/%s/json", container->Id->Buffer)))
+            continue;
+
+        if (object = WslpEngineGetJson(Engine, path, (ULONG)min(WSL_ENGINE_TIMEOUT_MS, Deadline - now)))
+        {
+            if (container->Details = WslParseContainerDetails(object))
+            {
+                container->Details->Platform = WslpQueryImagePlatform(Engine, object, Deadline);
+                WslCacheContainerDetails(container->Id, container->State, container->Details);
+            }
+
+            PhFreeJsonObject(object);
+        }
+
+        PhDereferenceObject(path);
+    }
+}
+
+/**
  * Finds a container of an engine by its full ID.
  */
 static PWSL_CONTAINER WslpFindEngineContainer(
@@ -1579,19 +1946,7 @@ static PWSL_ENGINE WslpCopyEngine(
     copy->Containers = PhCreateList(max(Engine->Containers->Count, 1));
 
     for (ULONG i = 0; i < Engine->Containers->Count; i++)
-    {
-        PWSL_CONTAINER container = Engine->Containers->Items[i];
-        PWSL_CONTAINER containerCopy = PhAllocateZero(sizeof(WSL_CONTAINER));
-
-        PhSetReference(&containerCopy->Id, container->Id);
-        PhSetReference(&containerCopy->Name, container->Name);
-        PhSetReference(&containerCopy->Image, container->Image);
-        PhSetReference(&containerCopy->State, container->State);
-        PhSetReference(&containerCopy->Status, container->Status);
-        PhSetReference(&containerCopy->Ports, container->Ports);
-        containerCopy->Running = container->Running;
-        PhAddItemList(copy->Containers, containerCopy);
-    }
+        PhAddItemList(copy->Containers, WslCopyContainer(Engine->Containers->Items[i]));
 
     return copy;
 }
@@ -1900,6 +2255,15 @@ PPH_LIST WslQueryEngines(
         }
 
         WslpUpdateEngineStats(engine, WslpFindSnapshotDistro(Snapshot, engine->DistroId));
+    }
+
+    // Only placed engines, whose distributions run; with a budget of its own, so that the
+    // details of many new containers cannot delay the rows.
+    {
+        ULONG64 detailsDeadline = NtGetTickCount64() + WSL_ENGINE_DETAILS_BUDGET_MS;
+
+        for (ULONG i = 0; i < engines->Count; i++)
+            WslpQueryEngineDetails(engines->Items[i], detailsDeadline);
     }
 
     // A pipe that serves an engine seen on another pipe is not asked while that engine's
