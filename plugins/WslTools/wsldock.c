@@ -28,29 +28,58 @@
 #define WSL_ENGINE_TIMEOUT_MS 1000
 #define WSL_ENGINE_MAX_RESPONSE (16 * 1024 * 1024)
 
-// Where an engine was placed before, so that it is not queried while its distribution is
-// stopped. Used only by the provider thread.
-typedef struct _WSL_ENGINE_PLACEMENT
+// All engines together get this long per refresh, and at most this many pipes are asked, so
+// pipes that do not answer cannot hold up the refresh or System Informer exiting.
+#define WSL_ENGINE_REFRESH_BUDGET_MS 3000
+#define WSL_ENGINE_MAX_PIPES 8
+// A placed engine that misses this many polls in a row is shown as gone.
+#define WSL_ENGINE_MAX_FAILED_POLLS 3
+// GET /info and /version are tried this many times before the pipe goes without them.
+#define WSL_ENGINE_MAX_INFO_ATTEMPTS 3
+// A pipe that does not answer, or whose engine cannot be placed, is asked again after twice as
+// long each time, up to this long; where its engine runs is unknown, so each ask could start it.
+#define WSL_ENGINE_MAX_BACKOFF_MS 60000
+
+// What is known about a pipe that answered as a Docker API. Used only by the provider thread.
+typedef struct _WSL_ENGINE_PIPE
 {
     PPH_STRING PipeName;
-    PPH_STRING DistroId;
-    // From GET /version, asked again only when another process serves the pipe.
+    // What follows was read from this server process; another one starts over.
     HANDLE ServerProcessId;
-    PPH_STRING ProductText;
+    BOOLEAN InfoQueried; // GET /info and /version answered, or were tried often enough
+    ULONG InfoAttempts;
+    PPH_STRING EngineId; // From GET /info, or NULL
+    PPH_STRING ProductText; // From GET /version
     PPH_STRING EngineText;
-} WSL_ENGINE_PLACEMENT, *PWSL_ENGINE_PLACEMENT;
+    // A Docker API in front of WSLC, whose containers the sessions show. It is not asked
+    // again, as asking could start a session VM.
+    BOOLEAN SessionEngine;
+    // The distribution the engine runs in, or NULL until it is placed. The pipe is not asked
+    // while that distribution is stopped, as asking could start the engine's VM.
+    PPH_STRING DistroId;
+    // The last answer, shown while a few polls in a row fail, so the rows do not flicker.
+    PWSL_ENGINE LastEngine;
+    ULONG FailedPolls;
+    // An unplaced pipe that did not answer or could not be placed, how often in a row, and
+    // the tick count before which it is not asked again.
+    ULONG BackoffCount;
+    ULONG64 NextQueryTime;
+} WSL_ENGINE_PIPE, *PWSL_ENGINE_PIPE;
 
-static PPH_LIST WslpEnginePlacements = NULL;
+static PPH_LIST WslpEnginePipes = NULL; // PWSL_ENGINE_PIPE
 
 /**
  * Determines whether a pipe name is safe to open as "\\.\pipe\<name>".
  *
- * \return TRUE if the name is not empty and only has letters, digits and "._-".
+ * \return TRUE if the name is not empty, only has letters, digits and "._-", and is not only
+ * dots, like "." or "..".
  */
 BOOLEAN WslIsSafePipeName(
     _In_ PPH_STRING Name
     )
 {
+    BOOLEAN onlyDots = TRUE;
+
     if (Name->Length == 0)
         return FALSE;
 
@@ -60,9 +89,11 @@ BOOLEAN WslIsSafePipeName(
 
         if (!((c >= L'a' && c <= L'z') || (c >= L'A' && c <= L'Z') || (c >= L'0' && c <= L'9') || c == L'.' || c == L'_' || c == L'-'))
             return FALSE;
+
+        onlyDots &= c == L'.';
     }
 
-    return TRUE;
+    return !onlyDots;
 }
 
 /**
@@ -285,6 +316,7 @@ static BOOLEAN WslpDecodeChunkedBody(
 
     return complete;
 }
+
 /**
  * Parses the status line and headers of an HTTP response.
  *
@@ -472,9 +504,13 @@ static NTSTATUS WslpEngineRequest(
             NULL
             );
 
-        // Every instance of the pipe is busy; wait once for one to become free.
-        if (fileHandle != INVALID_HANDLE_VALUE || GetLastError() != ERROR_PIPE_BUSY || !WaitNamedPipe(fileName->Buffer, 500))
+        // Every instance of the pipe is busy; wait once for one to become free, within the time
+        // the request has.
+        if (fileHandle != INVALID_HANDLE_VALUE || GetLastError() != ERROR_PIPE_BUSY || NtGetTickCount64() >= deadline ||
+            !WaitNamedPipe(fileName->Buffer, (ULONG)min(500, deadline - NtGetTickCount64())))
+        {
             break;
+        }
     }
 
     PhDereferenceObject(fileName);
@@ -571,7 +607,7 @@ CleanupExit:
     PhClearReference(&responseBytes);
 
     if (eventHandle)
-        NtClose(eventHandle);
+        CloseHandle(eventHandle);
 
     CloseHandle(fileHandle);
 
@@ -717,11 +753,23 @@ static VOID WslpAddContextPipes(
             PPH_BYTES meta;
             PVOID object;
 
-            if (!(findData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || findData.cFileName[0] == L'.')
+            WIN32_FILE_ATTRIBUTE_DATA metaAttributes;
+
+            // A context is a small file the Docker CLI writes. A reparse point could lead
+            // anywhere, and System Informer may run elevated, so those are skipped.
+            if (!(findData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || (findData.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) || findData.cFileName[0] == L'.')
                 continue;
 
             if (!(metaFileName = PhFormatString(L"%s\\contexts\\meta\\%s\\meta.json", configDirectory->Buffer, findData.cFileName)))
                 continue;
+
+            if (!GetFileAttributesEx(metaFileName->Buffer, GetFileExInfoStandard, &metaAttributes) ||
+                (metaAttributes.dwFileAttributes & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY)) ||
+                metaAttributes.nFileSizeHigh != 0 || metaAttributes.nFileSizeLow > 1024 * 1024)
+            {
+                PhDereferenceObject(metaFileName);
+                continue;
+            }
 
             if (NT_SUCCESS(PhFileReadAllTextWin32(&meta, metaFileName->Buffer, FALSE)))
             {
@@ -979,6 +1027,7 @@ static VOID WslpFreeEngine(
     PhClearReference(&Engine->ProductText);
     PhClearReference(&Engine->EngineText);
     PhClearReference(&Engine->ServerText);
+    PhClearReference(&Engine->EngineId);
     PhClearReference(&Engine->DistroId);
     PhFree(Engine);
 }
@@ -1046,15 +1095,62 @@ static PPH_STRING WslpGetServerProductText(
 }
 
 /**
+ * Gets the ID of an engine from GET /info. Docker keeps it in /var/lib/docker/engine-id, which
+ * the distribution collector reads, so the engine can be placed without running containers.
+ *
+ * \param Engine The engine.
+ * \param TimeoutMs How long the request may take.
+ * \param EngineId Receives the ID, or NULL if the engine has none.
+ * \return TRUE if the engine answered.
+ */
+static BOOLEAN WslpQueryEngineId(
+    _In_ PWSL_ENGINE Engine,
+    _In_ ULONG TimeoutMs,
+    _Out_ PPH_STRING *EngineId
+    )
+{
+    ULONG statusCode;
+    PPH_BYTES body;
+    PVOID object;
+    PPH_STRING id = NULL;
+    BOOLEAN answered = FALSE;
+
+    if (NT_SUCCESS(WslEngineRequest(Engine->PipeName, "GET", "/info", TimeoutMs, &statusCode, &body)))
+    {
+        answered = statusCode == 200;
+
+        if (statusCode == 200 && body && NT_SUCCESS(PhCreateJsonParserEx(&object, body, FALSE)) && object)
+        {
+            if (PhGetJsonObjectType(object) == PH_JSON_OBJECT_TYPE_OBJECT)
+                id = PhGetJsonValueAsString(object, "ID");
+
+            PhFreeJsonObject(object);
+        }
+
+        PhClearReference(&body);
+    }
+
+    if (id && id->Length == 0)
+        PhClearReference(&id);
+
+    *EngineId = id;
+
+    return answered;
+}
+
+/**
  * Gets the product and the engine of an engine from GET /version.
  *
  * \param Engine The engine.
+ * \param TimeoutMs How long the request may take.
  * \param ProductText Receives the product, e.g. "Docker Desktop 4.92.0" from Platform.Name,
  * "Podman 5.2.0" from its "Podman Engine" component, or else that of the pipe's server process.
  * \param EngineText Receives the engine, e.g. "Docker 29.8.1", or NULL for Podman.
+ * \return TRUE if the engine answered.
  */
-static VOID WslpQueryEngineVersion(
+static BOOLEAN WslpQueryEngineVersion(
     _In_ PWSL_ENGINE Engine,
+    _In_ ULONG TimeoutMs,
     _Out_ PPH_STRING *ProductText,
     _Out_ PPH_STRING *EngineText
     )
@@ -1067,12 +1163,15 @@ static VOID WslpQueryEngineVersion(
     PPH_STRING platformName = NULL;
     PPH_STRING version = NULL;
     PPH_STRING podmanVersion = NULL;
+    BOOLEAN answered = FALSE;
 
     *ProductText = NULL;
     *EngineText = NULL;
 
-    if (NT_SUCCESS(WslEngineRequest(Engine->PipeName, "GET", "/version", WSL_ENGINE_TIMEOUT_MS, &statusCode, &body)))
+    if (NT_SUCCESS(WslEngineRequest(Engine->PipeName, "GET", "/version", TimeoutMs, &statusCode, &body)))
     {
+        answered = statusCode == 200;
+
         if (statusCode == 200 && body && NT_SUCCESS(PhCreateJsonParserEx(&object, body, FALSE)) && object)
         {
             PVOID platform;
@@ -1146,15 +1245,20 @@ static VOID WslpQueryEngineVersion(
     PhClearReference(&platformName);
     PhClearReference(&version);
     PhClearReference(&podmanVersion);
+
+    return answered;
 }
 
 /**
  * Asks a pipe for its containers.
  *
+ * \param PipeName The pipe.
+ * \param TimeoutMs How long the request may take.
  * \return The engine, without a distribution yet, or NULL if the pipe is not a Docker API.
  */
 static PWSL_ENGINE WslpQueryEngine(
-    _In_ PPH_STRING PipeName
+    _In_ PPH_STRING PipeName,
+    _In_ ULONG TimeoutMs
     )
 {
     PWSL_ENGINE engine = NULL;
@@ -1164,7 +1268,7 @@ static PWSL_ENGINE WslpQueryEngine(
     HANDLE serverProcessId;
     PVOID object;
 
-    if (!NT_SUCCESS(WslpEngineRequest(PipeName, "GET", "/containers/json?all=1", WSL_ENGINE_TIMEOUT_MS, &statusCode, &body, &server, &serverProcessId)))
+    if (!NT_SUCCESS(WslpEngineRequest(PipeName, "GET", "/containers/json?all=1", TimeoutMs, &statusCode, &body, &server, &serverProcessId)))
         return NULL;
 
     // The Server header ends with the OS, e.g. "Docker/29.8.1 (linux)". Windows containers do
@@ -1226,12 +1330,18 @@ static PWSL_CONTAINER WslpFindEngineContainer(
 /**
  * Determines whether two engines are one engine served on two pipes, e.g. Docker Desktop on
  * "docker_engine" and "dockerDesktopLinuxEngine".
+ *
+ * \remarks The engine IDs decide when both are known; otherwise the server process and the
+ * containers.
  */
 static BOOLEAN WslpIsSameEngine(
     _In_ PWSL_ENGINE Engine1,
     _In_ PWSL_ENGINE Engine2
     )
 {
+    if (Engine1->EngineId && Engine2->EngineId)
+        return PhEqualString(Engine1->EngineId, Engine2->EngineId, TRUE);
+
     if (Engine1->ServerProcessId != Engine2->ServerProcessId || Engine1->Containers->Count != Engine2->Containers->Count)
         return FALSE;
 
@@ -1338,70 +1448,152 @@ static PWSL_DISTRO_ITEM WslpFindSnapshotDistro(
 }
 
 /**
- * Finds where an engine was placed before.
+ * Finds what is known about a pipe.
  */
-static PWSL_ENGINE_PLACEMENT WslpFindEnginePlacement(
+static PWSL_ENGINE_PIPE WslpFindEnginePipe(
     _In_ PPH_STRING PipeName
     )
 {
-    for (ULONG i = 0; WslpEnginePlacements && i < WslpEnginePlacements->Count; i++)
+    for (ULONG i = 0; WslpEnginePipes && i < WslpEnginePipes->Count; i++)
     {
-        PWSL_ENGINE_PLACEMENT placement = WslpEnginePlacements->Items[i];
+        PWSL_ENGINE_PIPE pipe = WslpEnginePipes->Items[i];
 
-        if (PhEqualString(placement->PipeName, PipeName, TRUE))
-            return placement;
+        if (PhEqualString(pipe->PipeName, PipeName, TRUE))
+            return pipe;
     }
 
     return NULL;
 }
 
 /**
- * Remembers where an engine is placed.
+ * Finds what is known about a pipe, or starts knowing it.
  */
-static PWSL_ENGINE_PLACEMENT WslpSetEnginePlacement(
-    _In_ PPH_STRING PipeName,
-    _In_ PPH_STRING DistroId
+static PWSL_ENGINE_PIPE WslpGetEnginePipe(
+    _In_ PPH_STRING PipeName
     )
 {
-    PWSL_ENGINE_PLACEMENT placement;
+    PWSL_ENGINE_PIPE pipe;
 
-    if (!WslpEnginePlacements)
-        WslpEnginePlacements = PhCreateList(2);
-
-    if (!(placement = WslpFindEnginePlacement(PipeName)))
+    if (!(pipe = WslpFindEnginePipe(PipeName)))
     {
-        placement = PhAllocateZero(sizeof(WSL_ENGINE_PLACEMENT));
-        PhSetReference(&placement->PipeName, PipeName);
-        PhAddItemList(WslpEnginePlacements, placement);
+        pipe = PhAllocateZero(sizeof(WSL_ENGINE_PIPE));
+        PhSetReference(&pipe->PipeName, PipeName);
+        PhAddItemList(WslpEnginePipes, pipe);
     }
 
-    PhSetReference(&placement->DistroId, DistroId);
-
-    return placement;
+    return pipe;
 }
 
 /**
- * Forgets where the engines were placed, e.g. when the tab is hidden.
+ * Asks an unplaced pipe again only later: after one refresh interval, then twice as long each
+ * time, up to WSL_ENGINE_MAX_BACKOFF_MS.
  */
-VOID WslResetEngines(
-    VOID
+static VOID WslpBackOffEnginePipe(
+    _Inout_ PWSL_ENGINE_PIPE Pipe
     )
 {
-    if (!WslpEnginePlacements)
+    ULONG64 delay = (ULONG64)WSL_REFRESH_INTERVAL_MS << min(Pipe->BackoffCount, 4);
+
+    Pipe->BackoffCount++;
+    Pipe->NextQueryTime = NtGetTickCount64() + min(delay, WSL_ENGINE_MAX_BACKOFF_MS);
+}
+
+/**
+ * Forgets what was read from a pipe's server process, e.g. when another process serves it.
+ */
+static VOID WslpClearEnginePipe(
+    _Inout_ PWSL_ENGINE_PIPE Pipe
+    )
+{
+    Pipe->ServerProcessId = NULL;
+    Pipe->InfoQueried = FALSE;
+    Pipe->InfoAttempts = 0;
+    Pipe->SessionEngine = FALSE;
+    Pipe->FailedPolls = 0;
+    Pipe->BackoffCount = 0;
+    Pipe->NextQueryTime = 0;
+    PhClearReference(&Pipe->EngineId);
+    PhClearReference(&Pipe->ProductText);
+    PhClearReference(&Pipe->EngineText);
+    PhClearReference(&Pipe->DistroId);
+
+    if (Pipe->LastEngine)
+    {
+        WslpFreeEngine(Pipe->LastEngine);
+        Pipe->LastEngine = NULL;
+    }
+}
+
+/**
+ * Forgets the engines.
+ *
+ * \param Forget TRUE to forget everything, when the provider exits. FALSE, when the tab is
+ * hidden, keeps where each engine runs, so that showing it again does not ask an engine whose
+ * distribution stopped meanwhile, and forgets only the last answers, which would be stale.
+ */
+VOID WslResetEngines(
+    _In_ BOOLEAN Forget
+    )
+{
+    if (!WslpEnginePipes)
         return;
 
-    for (ULONG i = 0; i < WslpEnginePlacements->Count; i++)
+    for (ULONG i = 0; i < WslpEnginePipes->Count; i++)
     {
-        PWSL_ENGINE_PLACEMENT placement = WslpEnginePlacements->Items[i];
+        PWSL_ENGINE_PIPE pipe = WslpEnginePipes->Items[i];
 
-        PhDereferenceObject(placement->PipeName);
-        PhDereferenceObject(placement->DistroId);
-        PhClearReference(&placement->ProductText);
-        PhClearReference(&placement->EngineText);
-        PhFree(placement);
+        if (Forget)
+        {
+            WslpClearEnginePipe(pipe);
+            PhDereferenceObject(pipe->PipeName);
+            PhFree(pipe);
+        }
+        else if (pipe->LastEngine)
+        {
+            WslpFreeEngine(pipe->LastEngine);
+            pipe->LastEngine = NULL;
+            pipe->FailedPolls = 0;
+        }
     }
 
-    PhClearList(WslpEnginePlacements);
+    if (Forget)
+        PhClearList(WslpEnginePipes);
+}
+
+/**
+ * Copies an engine and its containers, without a distribution and without usage.
+ */
+static PWSL_ENGINE WslpCopyEngine(
+    _In_ PWSL_ENGINE Engine
+    )
+{
+    PWSL_ENGINE copy;
+
+    copy = PhAllocateZero(sizeof(WSL_ENGINE));
+    PhSetReference(&copy->PipeName, Engine->PipeName);
+    PhSetReference(&copy->ProductText, Engine->ProductText);
+    PhSetReference(&copy->EngineText, Engine->EngineText);
+    PhSetReference(&copy->ServerText, Engine->ServerText);
+    PhSetReference(&copy->EngineId, Engine->EngineId);
+    copy->ServerProcessId = Engine->ServerProcessId;
+    copy->Containers = PhCreateList(max(Engine->Containers->Count, 1));
+
+    for (ULONG i = 0; i < Engine->Containers->Count; i++)
+    {
+        PWSL_CONTAINER container = Engine->Containers->Items[i];
+        PWSL_CONTAINER containerCopy = PhAllocateZero(sizeof(WSL_CONTAINER));
+
+        PhSetReference(&containerCopy->Id, container->Id);
+        PhSetReference(&containerCopy->Name, container->Name);
+        PhSetReference(&containerCopy->Image, container->Image);
+        PhSetReference(&containerCopy->State, container->State);
+        PhSetReference(&containerCopy->Status, container->Status);
+        PhSetReference(&containerCopy->Ports, container->Ports);
+        containerCopy->Running = container->Running;
+        PhAddItemList(copy->Containers, containerCopy);
+    }
+
+    return copy;
 }
 
 /**
@@ -1439,22 +1631,66 @@ static VOID WslpUpdateEngineStats(
 }
 
 /**
+ * Finds the running distribution with an engine process that an engine runs in.
+ *
+ * \return The distribution whose collector read the engine's ID, else the one with the most
+ * processes in the engine's containers, or NULL if neither tells.
+ */
+static PWSL_DISTRO_ITEM WslpFindEngineDistro(
+    _In_ PWSL_ENGINE Engine,
+    _In_ PPH_LIST EngineDistros
+    )
+{
+    PWSL_DISTRO_ITEM bestDistro = NULL;
+    ULONG bestCount = 0;
+
+    for (ULONG i = 0; Engine->EngineId && i < EngineDistros->Count; i++)
+    {
+        PWSL_DISTRO_ITEM distro = EngineDistros->Items[i];
+
+        if (distro->Processes->EngineId && PhEqualString(distro->Processes->EngineId, Engine->EngineId, TRUE))
+            return distro;
+    }
+
+    for (ULONG i = 0; i < EngineDistros->Count; i++)
+    {
+        ULONG count = WslpCountEngineProcesses(Engine, EngineDistros->Items[i]);
+
+        if (count > bestCount)
+        {
+            bestCount = count;
+            bestDistro = EngineDistros->Items[i];
+        }
+    }
+
+    return bestDistro;
+}
+
+/**
  * Finds the container engines with a Docker API, and the distributions their containers run in.
  *
  * \param Snapshot The snapshot, with the frames of the running distributions attached.
  * \return The engines placed in a running distribution, or NULL if there are none. Free the
  * list with WslFreeEngines.
- * \remarks An engine without running containers is placed in the one distribution with an
- * engine process that no other engine was placed in; otherwise it is left out.
+ * \remarks Asking an engine can start its VM, so:
+ * - no pipe is asked unless a running distribution has an engine process;
+ * - a pipe whose engine was placed is asked only while that distribution runs, also a pipe
+ *   that serves an engine already seen on another pipe, which follows that engine;
+ * - a pipe that does not answer, or whose engine cannot be placed, is asked less and less often.
+ * Placed pipes are asked first, so unplaced ones cannot use up the refresh. An engine is placed
+ * by its ID, by the processes of its containers, where it was placed before, or, as the one
+ * engine left, in the one engine distribution left; otherwise it is left out.
  */
 PPH_LIST WslQueryEngines(
     _In_ struct _WSL_SNAPSHOT *Snapshot
     )
 {
+    ULONG64 deadline = NtGetTickCount64() + WSL_ENGINE_REFRESH_BUDGET_MS;
     PPH_LIST engineDistros;
     PPH_LIST candidates;
     PPH_LIST engines;
     PPH_LIST unplaced;
+    PPH_LIST followers; // PWSL_ENGINE_PIPE and the PWSL_ENGINE it serves too, in pairs
 
     engineDistros = PhCreateList(2);
 
@@ -1472,60 +1708,151 @@ PPH_LIST WslQueryEngines(
         return NULL;
     }
 
+    if (!WslpEnginePipes)
+        WslpEnginePipes = PhCreateList(4);
+
     candidates = WslpGetCandidatePipes();
     engines = PhCreateList(2);
     unplaced = PhCreateList(2);
+    followers = PhCreateList(2);
 
-    for (ULONG i = 0; i < candidates->Count; i++)
+    // Pass 0 asks the pipes placed in a distribution, pass 1 the others.
+    for (ULONG pass = 0; pass < 2; pass++)
     {
-        PPH_STRING pipeName = candidates->Items[i];
-        PWSL_ENGINE_PLACEMENT placement = WslpFindEnginePlacement(pipeName);
-        PWSL_DISTRO_ITEM placedDistro = placement ? WslpFindSnapshotDistro(Snapshot, placement->DistroId) : NULL;
-        PWSL_ENGINE engine;
-        BOOLEAN duplicate = FALSE;
-        PWSL_DISTRO_ITEM bestDistro = NULL;
-        ULONG bestCount = 0;
-
-        // Asking an engine whose distribution stopped could start it again.
-        if (placement && (!placedDistro || placedDistro->State != WslDistroStateRunning))
-            continue;
-
-        if (!(engine = WslpQueryEngine(pipeName)))
-            continue;
-
-        for (ULONG j = 0; j < engines->Count && !duplicate; j++)
-            duplicate = WslpIsSameEngine(engines->Items[j], engine);
-        for (ULONG j = 0; j < unplaced->Count && !duplicate; j++)
-            duplicate = WslpIsSameEngine(unplaced->Items[j], engine);
-
-        if (duplicate || WslpIsSessionEngine(engine, Snapshot->Sessions))
+        for (ULONG i = 0; i < min(candidates->Count, WSL_ENGINE_MAX_PIPES); i++)
         {
-            WslpFreeEngine(engine);
-            continue;
-        }
+            PPH_STRING pipeName = candidates->Items[i];
+            PWSL_ENGINE_PIPE pipe = WslpFindEnginePipe(pipeName);
+            PWSL_ENGINE engine;
+            PWSL_ENGINE original = NULL;
+            PWSL_DISTRO_ITEM distro;
+            ULONG64 now = NtGetTickCount64();
 
-        for (ULONG j = 0; j < engineDistros->Count; j++)
-        {
-            ULONG count = WslpCountEngineProcesses(engine, engineDistros->Items[j]);
+            if (WslIsProviderStopping() || now >= deadline)
+                break;
 
-            if (count > bestCount)
+            if (pipe && pipe->DistroId && !WslpFindSnapshotDistro(Snapshot, pipe->DistroId))
+                PhClearReference(&pipe->DistroId); // Unregistered; looked for again
+
+            if ((pass == 0) != (pipe && pipe->DistroId))
+                continue;
+            if (pipe && pipe->SessionEngine)
+                continue;
+
+            if (pipe && pipe->DistroId)
             {
-                bestCount = count;
-                bestDistro = engineDistros->Items[j];
+                if (WslpFindSnapshotDistro(Snapshot, pipe->DistroId)->State != WslDistroStateRunning)
+                    continue;
             }
-        }
+            else if (pipe && now < pipe->NextQueryTime)
+            {
+                continue;
+            }
 
-        if (!bestDistro && placedDistro && WslpHasEngineProcess(placedDistro))
-            bestDistro = placedDistro;
+            if (engine = WslpQueryEngine(pipeName, (ULONG)min(WSL_ENGINE_TIMEOUT_MS, deadline - now)))
+            {
+                pipe = WslpGetEnginePipe(pipeName);
 
-        if (bestDistro)
-        {
-            PhSetReference(&engine->DistroId, bestDistro->Id);
-            PhAddItemList(engines, engine);
-        }
-        else
-        {
-            PhAddItemList(unplaced, engine);
+                // Another process now serves the pipe, e.g. another product took "docker_engine".
+                if (pipe->ServerProcessId != engine->ServerProcessId)
+                {
+                    WslpClearEnginePipe(pipe);
+                    pipe->ServerProcessId = engine->ServerProcessId;
+                }
+
+                // The ID and the product only change with the server process, so they are asked
+                // until they answer, a few times at most.
+                if (!pipe->InfoQueried && NtGetTickCount64() < deadline)
+                {
+                    PPH_STRING engineId;
+                    PPH_STRING productText;
+                    PPH_STRING engineText;
+                    BOOLEAN answered;
+
+                    answered = WslpQueryEngineId(engine, (ULONG)min(WSL_ENGINE_TIMEOUT_MS, deadline - NtGetTickCount64()), &engineId);
+                    PhMoveReference(&pipe->EngineId, engineId);
+
+                    if (NtGetTickCount64() < deadline)
+                    {
+                        answered &= WslpQueryEngineVersion(engine, (ULONG)min(WSL_ENGINE_TIMEOUT_MS, deadline - NtGetTickCount64()), &productText, &engineText);
+                        PhMoveReference(&pipe->ProductText, productText);
+                        PhMoveReference(&pipe->EngineText, engineText);
+                    }
+                    else
+                    {
+                        answered = FALSE;
+                    }
+
+                    pipe->InfoQueried = answered || ++pipe->InfoAttempts >= WSL_ENGINE_MAX_INFO_ATTEMPTS;
+                }
+
+                PhSetReference(&engine->EngineId, pipe->EngineId);
+                PhSetReference(&engine->ProductText, pipe->ProductText);
+                PhSetReference(&engine->EngineText, pipe->EngineText);
+                pipe->FailedPolls = 0;
+
+                if (pipe->LastEngine)
+                    WslpFreeEngine(pipe->LastEngine);
+
+                pipe->LastEngine = WslpCopyEngine(engine);
+            }
+            else if (pipe && pipe->DistroId && pipe->LastEngine && pipe->FailedPolls < WSL_ENGINE_MAX_FAILED_POLLS)
+            {
+                // A missed poll, e.g. a busy engine, shows the last answer rather than removing the rows.
+                pipe->FailedPolls++;
+                engine = WslpCopyEngine(pipe->LastEngine);
+            }
+            else
+            {
+                // Where its engine runs is unknown, so it is asked less often.
+                if (!(pipe && pipe->DistroId))
+                    WslpBackOffEnginePipe(WslpGetEnginePipe(pipeName));
+
+                continue;
+            }
+
+            for (ULONG j = 0; j < engines->Count && !original; j++)
+            {
+                if (WslpIsSameEngine(engines->Items[j], engine))
+                    original = engines->Items[j];
+            }
+
+            for (ULONG j = 0; j < unplaced->Count && !original; j++)
+            {
+                if (WslpIsSameEngine(unplaced->Items[j], engine))
+                    original = unplaced->Items[j];
+            }
+
+            // An engine seen on another pipe is shown once; this pipe follows its distribution.
+            if (original)
+            {
+                PhAddItemList(followers, pipe);
+                PhAddItemList(followers, original);
+                WslpFreeEngine(engine);
+                continue;
+            }
+
+            if (WslpIsSessionEngine(engine, Snapshot->Sessions))
+            {
+                pipe->SessionEngine = TRUE;
+                WslpFreeEngine(engine);
+                continue;
+            }
+
+            distro = WslpFindEngineDistro(engine, engineDistros);
+
+            if (!distro && pipe->DistroId && (distro = WslpFindSnapshotDistro(Snapshot, pipe->DistroId)) && !WslpHasEngineProcess(distro))
+                distro = NULL;
+
+            if (distro)
+            {
+                PhSetReference(&engine->DistroId, distro->Id);
+                PhAddItemList(engines, engine);
+            }
+            else
+            {
+                PhAddItemList(unplaced, engine);
+            }
         }
     }
 
@@ -1560,29 +1887,47 @@ PPH_LIST WslQueryEngines(
         }
     }
 
-    for (ULONG i = 0; i < unplaced->Count; i++)
-        WslpFreeEngine(unplaced->Items[i]);
-
     for (ULONG i = 0; i < engines->Count; i++)
     {
         PWSL_ENGINE engine = engines->Items[i];
+        PWSL_ENGINE_PIPE pipe = WslpFindEnginePipe(engine->PipeName);
 
-        PWSL_ENGINE_PLACEMENT placement = WslpSetEnginePlacement(engine->PipeName, engine->DistroId);
-
-        // The product and version only change with the process that serves the pipe.
-        if (!placement->ProductText || placement->ServerProcessId != engine->ServerProcessId)
+        if (pipe)
         {
-            PhClearReference(&placement->ProductText);
-            PhClearReference(&placement->EngineText);
-            WslpQueryEngineVersion(engine, &placement->ProductText, &placement->EngineText);
-            placement->ServerProcessId = engine->ServerProcessId;
+            PhSetReference(&pipe->DistroId, engine->DistroId);
+            pipe->BackoffCount = 0;
+            pipe->NextQueryTime = 0;
         }
 
-        PhSetReference(&engine->ProductText, placement->ProductText);
-        PhSetReference(&engine->EngineText, placement->EngineText);
         WslpUpdateEngineStats(engine, WslpFindSnapshotDistro(Snapshot, engine->DistroId));
     }
 
+    // A pipe that serves an engine seen on another pipe is not asked while that engine's
+    // distribution is stopped either. The engines are still valid: unplaced ones are freed below.
+    for (ULONG i = 0; i + 1 < followers->Count; i += 2)
+    {
+        PWSL_ENGINE_PIPE pipe = followers->Items[i];
+        PWSL_ENGINE original = followers->Items[i + 1];
+
+        if (original->DistroId)
+            PhSetReference(&pipe->DistroId, original->DistroId);
+        else
+            WslpBackOffEnginePipe(pipe);
+    }
+
+    // Where these engines run is unknown, so their pipes are asked less often.
+    for (ULONG i = 0; i < unplaced->Count; i++)
+    {
+        PWSL_ENGINE engine = unplaced->Items[i];
+        PWSL_ENGINE_PIPE pipe = WslpFindEnginePipe(engine->PipeName);
+
+        if (pipe && !pipe->DistroId)
+            WslpBackOffEnginePipe(pipe);
+
+        WslpFreeEngine(engine);
+    }
+
+    PhDereferenceObject(followers);
     PhDereferenceObject(unplaced);
     PhDereferenceObjects(candidates->Items, candidates->Count);
     PhDereferenceObject(candidates);
