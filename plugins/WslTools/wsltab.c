@@ -83,12 +83,6 @@ typedef struct _WSL_ACTION_CONTEXT
     PPH_STRING Description;
     NTSTATUS Status;
     PPH_STRING Message; // the tool's own error text, if it printed one
-    // Reclaim memory: the VM process whose private bytes are reported, or NULL, its name for
-    // the report, e.g. "WSL VM", and its private bytes before and after.
-    HANDLE ReclaimProcessId;
-    PCWSTR ReclaimName;
-    SIZE_T ReclaimBefore;
-    SIZE_T ReclaimAfter;
 } WSL_ACTION_CONTEXT, *PWSL_ACTION_CONTEXT;
 
 // Drops the clean page cache of a VM's kernel, and compacts memory where the kernel can, so
@@ -1691,88 +1685,6 @@ static SIZE_T WslpGetVmPrivateBytes(
 }
 
 /**
- * Waits for WSL to return reclaimed memory to Windows.
- *
- * \param ProcessId The VM process.
- * \param Before The private bytes of the VM process before the reclaim.
- * \return The private bytes of the VM process once they fell and stopped falling, or after 30
- * seconds.
- * \remarks Measured on WSL 2.9.12: the private bytes stay the same for several seconds, most
- * of the memory is back after about 11 seconds, and a little more follows for another half
- * minute. So the wait only looks for the end once the fall has started.
- */
-static SIZE_T WslpWaitForReclaim(
-    _In_ HANDLE ProcessId,
-    _In_ SIZE_T Before
-    )
-{
-    SIZE_T history[4] = { 0 };
-    SIZE_T privateBytes = 0;
-    ULONG fallingSince = ULONG_MAX;
-    LARGE_INTEGER interval;
-
-    PhTimeoutFromMilliseconds(&interval, 1000);
-
-    for (ULONG seconds = 0; seconds < 30; seconds++)
-    {
-        NtDelayExecution(FALSE, &interval);
-
-        if (!(privateBytes = WslpGetVmPrivateBytes(ProcessId)))
-            break;
-
-        if (fallingSince == ULONG_MAX && privateBytes + 64 * 1024 * 1024 < Before)
-            fallingSince = seconds;
-
-        // Done once it fell by less than 16 MB over the last 3 seconds of the fall.
-        if (fallingSince != ULONG_MAX && seconds >= fallingSince + 3 &&
-            history[(seconds + 1) % 4] - min(history[(seconds + 1) % 4], privateBytes) < 16 * 1024 * 1024)
-        {
-            break;
-        }
-
-        history[seconds % 4] = privateBytes;
-    }
-
-    return privateBytes;
-}
-
-/**
- * Shows how much memory a VM returned to Windows. Runs on the GUI thread.
- *
- * \param Parameter The action context. This function frees it.
- */
-static VOID NTAPI WslpShowReclaimResult(
-    _In_ PVOID Parameter
-    )
-{
-    PWSL_ACTION_CONTEXT context = Parameter;
-
-    if (context->ReclaimBefore && context->ReclaimAfter && context->ReclaimAfter < context->ReclaimBefore)
-    {
-        PhShowInformation2(
-            SystemInformer_GetWindowHandle(),
-            L"Reclaim memory",
-            L"%s: %s returned to Windows, from %s to %s of private bytes. WSL can return a little more over the next seconds.",
-            context->ReclaimName,
-            PhaFormatSize(context->ReclaimBefore - context->ReclaimAfter, ULONG_MAX)->Buffer,
-            PhaFormatSize(context->ReclaimBefore, ULONG_MAX)->Buffer,
-            PhaFormatSize(context->ReclaimAfter, ULONG_MAX)->Buffer
-            );
-    }
-    else
-    {
-        PhShowInformation2(
-            SystemInformer_GetWindowHandle(),
-            L"Reclaim memory",
-            L"%s: the caches were dropped, but no memory was returned to Windows within 30 seconds.",
-            context->ReclaimName
-            );
-    }
-
-    WslpFreeActionContext(context);
-}
-
-/**
  * Runs a wsl.exe or wslc.exe action off the GUI thread; "--shutdown" can take several seconds.
  */
 _Function_class_(USER_THREAD_START_ROUTINE)
@@ -1783,9 +1695,6 @@ static NTSTATUS NTAPI WslpActionThread(
     PWSL_ACTION_CONTEXT context = Parameter;
     NTSTATUS status;
     PPH_BYTES output = NULL;
-
-    if (context->ReclaimProcessId)
-        context->ReclaimBefore = WslpGetVmPrivateBytes(context->ReclaimProcessId);
 
     if (context->PipeName)
     {
@@ -1814,14 +1723,6 @@ static NTSTATUS NTAPI WslpActionThread(
 
     PhClearReference(&output);
     context->Status = status;
-
-    if (NT_SUCCESS(status) && context->ReclaimProcessId)
-    {
-        context->ReclaimAfter = WslpWaitForReclaim(context->ReclaimProcessId, context->ReclaimBefore);
-        WslRefreshProvider();
-        SystemInformer_Invoke(WslpShowReclaimResult, context);
-        return STATUS_SUCCESS;
-    }
 
     WslRefreshProvider();
 
@@ -1868,14 +1769,293 @@ static VOID WslpStartAction(
         WslpFreeActionContext(context);
 }
 
+// A reclaim runs its command on a worker thread and then watches the VM process give the
+// memory back to Windows, while a dialog on a thread of its own shows the progress. The dialog
+// can be closed at any time; the worker then finishes without it.
+typedef enum _WSL_RECLAIM_PHASE
+{
+    WslReclaimPhaseRunning, // The command is running
+    WslReclaimPhaseWaiting, // Waiting for WSL to return the memory
+    WslReclaimPhaseDone,
+    WslReclaimPhaseFailed
+} WSL_RECLAIM_PHASE;
+
+typedef struct _WSL_RECLAIM_CONTEXT
+{
+    LONG RefCount; // One for the dialog thread, one for the worker thread
+    PPH_STRING FileName; // wsl.exe or wslc.exe; a cached string the context does not own
+    PPH_STRING Arguments;
+    HANDLE ProcessId; // The VM process whose private bytes are shown, or NULL if unknown
+    PCWSTR Name; // The VM for the texts, e.g. "WSL VM"
+    SIZE_T Before; // Private bytes of the VM process before the reclaim
+    volatile SIZE_T Current; // Private bytes of the VM process now; set by the worker
+    NTSTATUS Status;
+    PPH_STRING Message; // The command's own error text, if it printed one
+    volatile LONG Phase; // WSL_RECLAIM_PHASE; set by the worker after the fields above
+    BOOLEAN DialogFinished; // The dialog shows the result; used only by the dialog thread
+    PPH_STRING ContentText; // The text the dialog shows; used only by the dialog thread
+} WSL_RECLAIM_CONTEXT, *PWSL_RECLAIM_CONTEXT;
+
+// A reclaim runs, so the menu item is disabled.
+static LONG WslReclaimActive = 0;
+
 /**
- * Starts reclaiming the memory of a VM in the background, and reports how much it returned.
+ * Releases a reference to a reclaim context, and frees it with the last one.
+ */
+static VOID WslpDereferenceReclaim(
+    _In_ PWSL_RECLAIM_CONTEXT Context
+    )
+{
+    if (_InterlockedDecrement(&Context->RefCount) != 0)
+        return;
+
+    PhClearReference(&Context->Arguments);
+    PhClearReference(&Context->Message);
+    PhClearReference(&Context->ContentText);
+    PhFree(Context);
+}
+
+/**
+ * Waits for WSL to return reclaimed memory to Windows, keeping Context->Current up to date.
+ *
+ * \remarks Measured on WSL 2.9.12: the private bytes stay the same for several seconds, most
+ * of the memory is back after about 11 seconds, and a little more follows for another half
+ * minute. So the wait only looks for the end once the fall has started, and gives up after 30
+ * seconds.
+ */
+static VOID WslpWaitForReclaim(
+    _Inout_ PWSL_RECLAIM_CONTEXT Context
+    )
+{
+    SIZE_T history[4] = { 0 };
+    ULONG fallingSince = ULONG_MAX;
+    LARGE_INTEGER interval;
+
+    PhTimeoutFromMilliseconds(&interval, 1000);
+
+    for (ULONG seconds = 0; seconds < 30; seconds++)
+    {
+        SIZE_T privateBytes;
+
+        NtDelayExecution(FALSE, &interval);
+
+        if (!(privateBytes = WslpGetVmPrivateBytes(Context->ProcessId)))
+            break;
+
+        Context->Current = privateBytes;
+
+        if (fallingSince == ULONG_MAX && privateBytes + 64 * 1024 * 1024 < Context->Before)
+            fallingSince = seconds;
+
+        // Done once it fell by less than 16 MB over the last 3 seconds of the fall.
+        if (fallingSince != ULONG_MAX && seconds >= fallingSince + 3 &&
+            history[(seconds + 1) % 4] - min(history[(seconds + 1) % 4], privateBytes) < 16 * 1024 * 1024)
+        {
+            break;
+        }
+
+        history[seconds % 4] = privateBytes;
+    }
+}
+
+/**
+ * Runs the reclaim command and waits for the memory to be returned.
+ */
+_Function_class_(USER_THREAD_START_ROUTINE)
+static NTSTATUS NTAPI WslpReclaimWorkerThread(
+    _In_ PVOID Parameter
+    )
+{
+    PWSL_RECLAIM_CONTEXT context = Parameter;
+    PPH_BYTES output = NULL;
+    NTSTATUS status;
+
+    status = WslRunCommandEx(context->FileName, &context->Arguments->sr, WSL_ACTION_TIMEOUT_MS, &output, TRUE);
+
+    if (NT_SUCCESS(status))
+    {
+        if (context->ProcessId)
+        {
+            WriteRelease(&context->Phase, WslReclaimPhaseWaiting);
+            WslpWaitForReclaim(context);
+        }
+
+        WriteRelease(&context->Phase, WslReclaimPhaseDone);
+    }
+    else
+    {
+        if (output)
+            context->Message = WslpGetCommandErrorMessage(output);
+
+        context->Status = status;
+        WriteRelease(&context->Phase, WslReclaimPhaseFailed);
+    }
+
+    PhClearReference(&output);
+    WslRefreshProvider();
+    WriteRelease(&WslReclaimActive, FALSE);
+    WslpDereferenceReclaim(context);
+
+    return STATUS_SUCCESS;
+}
+
+/**
+ * Shows the state of a reclaim in its dialog. Runs on the dialog thread.
+ */
+static VOID WslpUpdateReclaimDialog(
+    _In_ HWND WindowHandle,
+    _Inout_ PWSL_RECLAIM_CONTEXT Context
+    )
+{
+    WSL_RECLAIM_PHASE phase = (WSL_RECLAIM_PHASE)ReadAcquire(&Context->Phase);
+    SIZE_T current = Context->Current;
+    PPH_STRING text = NULL;
+
+    if (Context->DialogFinished)
+        return;
+
+    switch (phase)
+    {
+    case WslReclaimPhaseRunning:
+        text = PhFormatString(L"Dropping the caches of the %s...", Context->Name);
+        break;
+    case WslReclaimPhaseWaiting:
+    case WslReclaimPhaseDone:
+        if (Context->ProcessId && current && current < Context->Before)
+        {
+            PPH_STRING returned = PhFormatSize(Context->Before - current, ULONG_MAX);
+            PPH_STRING before = PhFormatSize(Context->Before, ULONG_MAX);
+            PPH_STRING after = PhFormatSize(current, ULONG_MAX);
+
+            text = PhFormatString(
+                phase == WslReclaimPhaseDone ?
+                    L"%s: %s returned to Windows, from %s to %s of private bytes. WSL can return a little more over the next seconds." :
+                    L"%s: %s returned to Windows so far, from %s to %s of private bytes...",
+                Context->Name,
+                returned->Buffer,
+                before->Buffer,
+                after->Buffer
+                );
+
+            PhDereferenceObject(returned);
+            PhDereferenceObject(before);
+            PhDereferenceObject(after);
+        }
+        else if (phase == WslReclaimPhaseWaiting)
+        {
+            text = PhFormatString(L"The caches of the %s were dropped. Waiting for WSL to return the memory to Windows...", Context->Name);
+        }
+        else if (Context->ProcessId)
+        {
+            text = PhFormatString(L"%s: the caches were dropped, but no memory was returned to Windows within 30 seconds.", Context->Name);
+        }
+        else
+        {
+            text = PhFormatString(L"The caches of the %s were dropped.", Context->Name);
+        }
+        break;
+    case WslReclaimPhaseFailed:
+        text = Context->Message ? PhReferenceObject(Context->Message) : PhGetStatusMessage(Context->Status, 0);
+        break;
+    }
+
+    if (phase == WslReclaimPhaseDone || phase == WslReclaimPhaseFailed)
+    {
+        Context->DialogFinished = TRUE;
+
+        SendMessage(WindowHandle, TDM_SET_PROGRESS_BAR_MARQUEE, FALSE, 0);
+        SendMessage(WindowHandle, TDM_SET_MARQUEE_PROGRESS_BAR, FALSE, 0);
+        SendMessage(WindowHandle, TDM_SET_PROGRESS_BAR_POS, 100, 0);
+
+        if (phase == WslReclaimPhaseFailed)
+        {
+            SendMessage(WindowHandle, TDM_SET_PROGRESS_BAR_STATE, PBST_ERROR, 0);
+            SendMessage(WindowHandle, TDM_UPDATE_ICON, TDIE_ICON_MAIN, (LPARAM)TD_ERROR_ICON);
+            SendMessage(WindowHandle, TDM_SET_ELEMENT_TEXT, TDE_MAIN_INSTRUCTION, (LPARAM)L"Unable to reclaim memory");
+        }
+        else
+        {
+            SendMessage(WindowHandle, TDM_SET_ELEMENT_TEXT, TDE_MAIN_INSTRUCTION, (LPARAM)L"Memory reclaimed");
+        }
+    }
+
+    // Only a changed text is set, as setting it lays the dialog out again.
+    if (text && !(Context->ContentText && PhEqualString(text, Context->ContentText, FALSE)))
+    {
+        PhMoveReference(&Context->ContentText, text);
+        SendMessage(WindowHandle, TDM_SET_ELEMENT_TEXT, TDE_CONTENT, (LPARAM)Context->ContentText->Buffer);
+    }
+    else
+    {
+        PhClearReference(&text);
+    }
+}
+
+/**
+ * Task dialog callback of a reclaim.
+ */
+_Function_class_(PFTASKDIALOGCALLBACK)
+static HRESULT CALLBACK WslpReclaimDialogCallback(
+    _In_ HWND WindowHandle,
+    _In_ UINT Notification,
+    _In_ WPARAM wParam,
+    _In_ LPARAM lParam,
+    _In_ LONG_PTR Context
+    )
+{
+    switch (Notification)
+    {
+    case TDN_CREATED:
+        SendMessage(WindowHandle, TDM_SET_PROGRESS_BAR_MARQUEE, TRUE, 30);
+        WslpUpdateReclaimDialog(WindowHandle, (PWSL_RECLAIM_CONTEXT)Context);
+        break;
+    case TDN_TIMER:
+        WslpUpdateReclaimDialog(WindowHandle, (PWSL_RECLAIM_CONTEXT)Context);
+        break;
+    }
+
+    return S_OK;
+}
+
+/**
+ * Shows the dialog of a reclaim. It has no owner, so the main window stays usable.
+ */
+_Function_class_(USER_THREAD_START_ROUTINE)
+static NTSTATUS NTAPI WslpReclaimDialogThread(
+    _In_ PVOID Parameter
+    )
+{
+    PWSL_RECLAIM_CONTEXT context = Parameter;
+    TASKDIALOGCONFIG config = { sizeof(TASKDIALOGCONFIG) };
+    PH_AUTO_POOL autoPool;
+
+    PhInitializeAutoPool(&autoPool);
+
+    config.dwFlags = TDF_SHOW_MARQUEE_PROGRESS_BAR | TDF_CALLBACK_TIMER | TDF_ALLOW_DIALOG_CANCELLATION | TDF_CAN_BE_MINIMIZED;
+    config.dwCommonButtons = TDCBF_CLOSE_BUTTON;
+    config.pszWindowTitle = L"System Informer";
+    config.pszMainIcon = TD_INFORMATION_ICON;
+    config.pszMainInstruction = L"Reclaiming memory";
+    config.pszContent = L" ";
+    config.pfCallback = WslpReclaimDialogCallback;
+    config.lpCallbackData = (LONG_PTR)context;
+
+    PhShowTaskDialog(&config, NULL, NULL, NULL);
+
+    PhDeleteAutoPool(&autoPool);
+    WslpDereferenceReclaim(context);
+
+    return STATUS_SUCCESS;
+}
+
+/**
+ * Starts reclaiming the memory of a VM, with a dialog that shows the progress.
  *
  * \param FileName wsl.exe or wslc.exe.
  * \param Arguments The command that runs WSL_RECLAIM_SCRIPT in the VM, from PhFormatString.
  * This function takes ownership of the string; NULL does nothing.
- * \param ProcessId The VM process, or NULL if it is not known, which skips the report.
- * \param Name The VM for the report, e.g. "WSL VM".
+ * \param ProcessId The VM process, or NULL if it is not known, which leaves out the numbers.
+ * \param Name The VM for the texts, e.g. "WSL VM".
  */
 static VOID WslpStartReclaim(
     _In_ PPH_STRING FileName,
@@ -1884,20 +2064,42 @@ static VOID WslpStartReclaim(
     _In_ PCWSTR Name
     )
 {
-    PWSL_ACTION_CONTEXT context;
+    PWSL_RECLAIM_CONTEXT context;
+    NTSTATUS status;
 
     if (!Arguments)
         return;
 
-    context = PhAllocateZero(sizeof(WSL_ACTION_CONTEXT));
+    // One reclaim at a time; the menu item is disabled meanwhile.
+    if (_InterlockedCompareExchange(&WslReclaimActive, TRUE, FALSE) != FALSE)
+    {
+        PhDereferenceObject(Arguments);
+        return;
+    }
+
+    context = PhAllocateZero(sizeof(WSL_RECLAIM_CONTEXT));
+    context->RefCount = 2;
     context->FileName = FileName;
     context->Arguments = Arguments;
-    context->Description = PhCreateString(L"Unable to reclaim memory.");
-    context->ReclaimProcessId = ProcessId;
-    context->ReclaimName = Name;
+    context->ProcessId = ProcessId;
+    context->Name = Name;
+    context->Phase = WslReclaimPhaseRunning;
 
-    if (!NT_SUCCESS(PhCreateThread2(WslpActionThread, context)))
-        WslpFreeActionContext(context);
+    // Read before the command runs, so the dialog can compare against it.
+    if (ProcessId)
+        context->Before = context->Current = WslpGetVmPrivateBytes(ProcessId);
+
+    if (!NT_SUCCESS(PhCreateThread2(WslpReclaimDialogThread, context)))
+        WslpDereferenceReclaim(context);
+
+    // Without the worker the dialog shows why, rather than waiting for it.
+    if (!NT_SUCCESS(status = PhCreateThread2(WslpReclaimWorkerThread, context)))
+    {
+        context->Status = status;
+        WriteRelease(&context->Phase, WslReclaimPhaseFailed);
+        WriteRelease(&WslReclaimActive, FALSE);
+        WslpDereferenceReclaim(context);
+    }
 }
 
 /**
@@ -2282,8 +2484,9 @@ static VOID WslpShowContextMenu(
         if (!WslVmProcessItem)
             PhEnableEMenuItem(menu, ID_WSL_GOTOPROCESS, FALSE);
 
-        // Reclaiming runs in a distribution that is already running, so that it never starts one.
-        if (!WslpGetReclaimDistro())
+        // Reclaiming runs in a distribution that is already running, so that it never starts
+        // one, and one reclaim at a time.
+        if (!WslpGetReclaimDistro() || ReadAcquire(&WslReclaimActive))
             PhEnableEMenuItem(menu, ID_WSL_RECLAIMMEMORY, FALSE);
     }
     else if (node->Type == WslNodeTypeContainer)
@@ -2329,7 +2532,7 @@ static VOID WslpShowContextMenu(
             PhEnableEMenuItem(menu, ID_WSL_GOTOPROCESS, FALSE);
 
         // Any "--session" command starts a stopped session VM.
-        if (node->Session->State != WslDistroStateRunning || !WslIsSafeSessionName(node->Session->Name))
+        if (node->Session->State != WslDistroStateRunning || !WslIsSafeSessionName(node->Session->Name) || ReadAcquire(&WslReclaimActive))
             PhEnableEMenuItem(menu, ID_WSL_RECLAIMMEMORY, FALSE);
     }
     else if (node->Type == WslNodeTypeDistro)
