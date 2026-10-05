@@ -12,8 +12,8 @@
 #include "wsltools.h"
 #include <json.h>
 
-// Container engines with a Docker API, e.g. Docker Desktop, Skrog or Podman, whose containers
-// run in a WSL distribution.
+// Container engines with a Docker API, e.g. Docker Desktop, Rancher Desktop or Podman, whose
+// containers run in a WSL distribution.
 //
 // Such an engine serves the Docker API on a local named pipe. The pipes are found from the
 // Docker CLI contexts, DOCKER_HOST and the names of the existing pipes, and each is confirmed by
@@ -723,7 +723,7 @@ static VOID WslpAddCandidatePipe(
 }
 
 /**
- * Adds the pipes of the Docker CLI contexts, e.g. "skrog" or "desktop-linux".
+ * Adds the pipes of the Docker CLI contexts, e.g. "desktop-linux" of Docker Desktop.
  *
  * \remarks Each context is %USERPROFILE%\.docker\contexts\meta\<hash>\meta.json, or under
  * %DOCKER_CONFIG% when that is set, with {"Endpoints":{"docker":{"Host":"npipe:..."}}}.
@@ -813,7 +813,7 @@ static VOID WslpAddContextPipes(
 
 /**
  * Gets the pipes that serve a Docker API: those of the Docker CLI contexts, e.g.
- * "dockerDesktopLinuxEngine" or "skrog_engine", of DOCKER_HOST, the CLI's default
+ * "dockerDesktopLinuxEngine" of Docker Desktop, of DOCKER_HOST, the CLI's default
  * "docker_engine", and Podman's "podman-machine-<name>".
  *
  * \return The names of the candidate pipes that exist. Free the list with PhDereferenceObjects
@@ -1121,7 +1121,7 @@ static PPH_STRING WslpFormatEngineMounts(
 /**
  * Formats the Compose project and service of an element of GET /containers/json.
  *
- * \return e.g. "skrog / api", or NULL if the container is not from Compose.
+ * \return e.g. "myapp / api", or NULL if the container is not from Compose.
  */
 static PPH_STRING WslpFormatEngineCompose(
     _In_ PVOID Object
@@ -1270,7 +1270,7 @@ VOID WslFreeEngines(
 
 /**
  * Gets the product that serves an engine's pipe from the version resource of the server
- * process, e.g. "Rancher Desktop 1.16.0", or from its name, e.g. "Skrog" for skrog.exe.
+ * process, e.g. "Docker Desktop 4.92.0", or from its name, e.g. "myengine" for myengine.exe.
  *
  * \return The product, or NULL if the process is gone.
  */
@@ -1306,7 +1306,7 @@ static PPH_STRING WslpGetServerProductText(
         PH_STRINGREF baseName = processItem->ProcessName->sr;
         PH_STRINGREF extension;
 
-        // Without a version resource the name is all there is, e.g. "skrog.exe".
+        // Without a version resource the name is all there is, e.g. "myengine.exe".
         PhSplitStringRefAtLastChar(&processItem->ProcessName->sr, L'.', &baseName, &extension);
         text = PhCreateString2(&baseName);
         text->Buffer[0] = RtlUpcaseUnicodeChar(text->Buffer[0]);

@@ -36,6 +36,11 @@ extern PPH_PLUGIN PluginInstance;
 
 // wslproc.c
 
+// The line that ends a frame of the process scripts. A process can put line breaks in its
+// name, which /proc/<pid>/stat prints as they are, but the name has at most 15 bytes, so it
+// cannot hold a line break, this marker and another line break.
+#define WSL_FRAME_END_MARKER L"@end-of-wsltools-frame"
+
 typedef struct _WSL_LINUX_PROCESS
 {
     ULONG ProcessId; // In the distribution's PID namespace
@@ -136,7 +141,7 @@ typedef struct _WSL_CONTAINER
     PPH_STRING Networks; // e.g. "bridge, backend"
     PPH_STRING IpAddresses; // e.g. "172.17.0.3, 172.18.0.2"; Docker API only
     PPH_STRING Mounts; // e.g. "/data, /config"
-    PPH_STRING Compose; // Compose project and service, e.g. "skrog / api"
+    PPH_STRING Compose; // Compose project and service, e.g. "myapp / api"
     PPH_STRING Health; // e.g. "healthy", or NULL if the container has no health check
     PPH_STRING Platform; // e.g. "linux/amd64"; from "wslc list", or from the image for an engine
     struct _WSL_CONTAINER_DETAILS *Details; // From the inspect output, or NULL; referenced
@@ -235,12 +240,12 @@ BOOLEAN WslIsSafeContainerId(
 
 // wsldock.c
 
-// A container engine with a Docker API on a local named pipe, e.g. Docker Desktop, Skrog or
-// Podman, whose containers run in a WSL distribution.
+// A container engine with a Docker API on a local named pipe, e.g. Docker Desktop, Rancher
+// Desktop or Podman, whose containers run in a WSL distribution.
 typedef struct _WSL_ENGINE
 {
     PPH_STRING PipeName; // e.g. "docker_engine", without "\\.\pipe\"
-    PPH_STRING ProductText; // The product, e.g. "Docker Desktop 4.92.0", "Podman 5.2.0" or "Skrog"
+    PPH_STRING ProductText; // The product, e.g. "Docker Desktop 4.92.0" or "Podman 5.2.0"
     PPH_STRING EngineText; // The engine, e.g. "Docker 29.8.1", or NULL when ProductText names it
     PPH_STRING ServerText; // The Server header, e.g. "Docker/29.8.1 (linux)"
     PPH_STRING EngineId; // The ID from GET /info, or NULL
@@ -304,6 +309,7 @@ typedef struct _WSL_SNAPSHOT
     // When the running query fails, every distribution is shown as unknown, not stopped.
     NTSTATUS RunningQueryStatus;
     PPH_LIST Sessions; // PWSL_SESSION of running WSLC sessions, or NULL
+    PPH_LIST SessionVmProcesses; // PPH_PROCESS_ITEM, the session VMs as the sessions were asked
     PPH_LIST Engines; // PWSL_ENGINE placed in a running distribution, or NULL
 } WSL_SNAPSHOT, *PWSL_SNAPSHOT;
 
@@ -317,6 +323,10 @@ VOID WslInitializeSnapshotType(
 
 PWSL_SNAPSHOT WslQuerySnapshot(
     _In_ BOOLEAN VmRunning
+    );
+
+NTSTATUS WslCheckDistroRunning(
+    _In_ PPH_STRING DistroName
     );
 
 PCPH_STRINGREF WslGetDistroStateText(
@@ -377,12 +387,14 @@ PPH_STRING WslGetWslcVersion(
 
 NTSTATUS WslShowContainerInspect(
     _In_ PPH_STRING SessionName,
+    _In_ PWSL_SNAPSHOT SessionSnapshot,
     _In_ PPH_STRING ContainerId,
     _In_ PPH_STRING ContainerName
     );
 
 NTSTATUS WslShowEngineContainerInspect(
     _In_ PPH_STRING PipeName,
+    _In_ PPH_STRING DistroName,
     _In_ PPH_STRING ContainerId,
     _In_ PPH_STRING ContainerName
     );
@@ -429,6 +441,14 @@ PPH_PROCESS_ITEM WslReferenceVmProcessItem(
 
 PPH_PROCESS_ITEM WslReferenceSessionVmProcessItem(
     VOID
+    );
+
+BOOLEAN WslIsAnyVmProcessRunning(
+    VOID
+    );
+
+NTSTATUS WslCheckSessionVmsRunning(
+    _In_ PWSL_SNAPSHOT Snapshot
     );
 
 // wslsys.c

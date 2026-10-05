@@ -196,6 +196,8 @@ static WSLP_VM_KIND WslpGetVmKind(
  * several could be meant. The caller owns the reference.
  * \param NumberOfCandidates Receives the number of processes that could be the WSL VM.
  * \param NumberOfSessionVms Receives the number of processes identified as session VMs.
+ * \param SessionVms Receives the process items of the session VMs. The caller owns the list and
+ * the references in it.
  * \remarks Windows 11 names the WSL VM process "vmmemWSL". Windows 10 names every VM
  * process "vmmem", including Hyper-V and WSLC session VMs, which WslpGetVmKind tells apart.
  * A single vmmem of unknown kind is taken for the WSL VM, as before WSLC existed.
@@ -204,7 +206,8 @@ static VOID WslpFindVmProcessItems(
     _Out_opt_ PPH_PROCESS_ITEM *WslVm,
     _Out_opt_ PPH_PROCESS_ITEM *SessionVm,
     _Out_opt_ PULONG NumberOfCandidates,
-    _Out_opt_ PULONG NumberOfSessionVms
+    _Out_opt_ PULONG NumberOfSessionVms,
+    _Out_opt_ PPH_LIST *SessionVms
     )
 {
     PPH_PROCESS_ITEM *processItems;
@@ -215,6 +218,7 @@ static VOID WslpFindVmProcessItems(
     PPH_LIST candidates;
     PH_STRINGREF wslVmId;
     BOOLEAN haveWslVmId;
+    PPH_LIST sessionVms = SessionVms ? PhCreateList(1) : NULL;
     ULONG sessionCandidates = 0;
     ULONG unknownCandidates = 0;
 
@@ -251,6 +255,9 @@ static VOID WslpFindVmProcessItems(
         case WslpVmKindSession:
             sessionVmItem = candidate;
             sessionCandidates++;
+
+            if (sessionVms)
+                PhAddItemList(sessionVms, PhReferenceObject(candidate));
             break;
         case WslpVmKindForeign:
             break;
@@ -275,6 +282,8 @@ static VOID WslpFindVmProcessItems(
         *NumberOfCandidates = wslVmItem && candidates->Count == 0 ? 1 : candidates->Count;
     if (NumberOfSessionVms)
         *NumberOfSessionVms = sessionCandidates;
+    if (SessionVms)
+        *SessionVms = sessionVms;
 
     PhDereferenceObject(candidates);
     PhDereferenceObjects(processItems, numberOfProcessItems);
@@ -296,7 +305,7 @@ PPH_PROCESS_ITEM WslReferenceVmProcessItem(
 {
     PPH_PROCESS_ITEM vmProcessItem;
 
-    WslpFindVmProcessItems(&vmProcessItem, NULL, NumberOfCandidates, NumberOfSessionVms);
+    WslpFindVmProcessItems(&vmProcessItem, NULL, NumberOfCandidates, NumberOfSessionVms, NULL);
 
     return vmProcessItem;
 }
@@ -315,9 +324,91 @@ PPH_PROCESS_ITEM WslReferenceSessionVmProcessItem(
 {
     PPH_PROCESS_ITEM vmProcessItem;
 
-    WslpFindVmProcessItems(NULL, &vmProcessItem, NULL, NULL);
+    WslpFindVmProcessItems(NULL, &vmProcessItem, NULL, NULL, NULL);
 
     return vmProcessItem;
+}
+
+/**
+ * Determines whether a WSL VM process runs, from a process list read just now.
+ *
+ * \remarks Unlike WslReferenceVmProcessItem this does not use the process provider, whose list
+ * is old while updates are paused. Any VM process counts, as for the running query.
+ */
+BOOLEAN WslIsAnyVmProcessRunning(
+    VOID
+    )
+{
+    PVOID processes;
+    PSYSTEM_PROCESS_INFORMATION process;
+    BOOLEAN found = FALSE;
+
+    if (!NT_SUCCESS(PhEnumProcesses(&processes)))
+        return FALSE;
+
+    process = PH_FIRST_PROCESS(processes);
+
+    do
+    {
+        PH_STRINGREF imageName;
+
+        PhUnicodeStringToStringRef(&process->ImageName, &imageName);
+
+        if (PhEqualStringRef(&imageName, &WslpVmProcessNameWin11, TRUE) ||
+            PhEqualStringRef(&imageName, &WslpVmProcessName, TRUE))
+        {
+            found = TRUE;
+            break;
+        }
+    } while (process = PH_NEXT_PROCESS(process));
+
+    PhFree(processes);
+
+    return found;
+}
+
+/**
+ * Checks, just before a command for a WSLC session runs, that the session VMs still run.
+ *
+ * \param Snapshot The snapshot the command was chosen from, which showed the session running.
+ * \return STATUS_SUCCESS, or STATUS_INVALID_DEVICE_STATE if a session may have stopped.
+ * \remarks Any wslc command for a session starts its VM, and the snapshot can be old, e.g.
+ * while updates are paused. Nothing links a session VM to its session, so every session VM of
+ * the snapshot must still run, as read from a process list just now; the process provider's
+ * list is old while updates are paused too.
+ */
+NTSTATUS WslCheckSessionVmsRunning(
+    _In_ PWSL_SNAPSHOT Snapshot
+    )
+{
+    PVOID processes;
+    BOOLEAN running;
+
+    if (!Snapshot->SessionVmProcesses || Snapshot->SessionVmProcesses->Count == 0)
+        return STATUS_INVALID_DEVICE_STATE;
+
+    if (!NT_SUCCESS(PhEnumProcesses(&processes)))
+        return STATUS_INVALID_DEVICE_STATE;
+
+    running = TRUE;
+
+    for (ULONG i = 0; i < Snapshot->SessionVmProcesses->Count; i++)
+    {
+        PPH_PROCESS_ITEM processItem = Snapshot->SessionVmProcesses->Items[i];
+        PSYSTEM_PROCESS_INFORMATION process;
+
+        // A process ID can be reused, so the creation time must match too.
+        if (!(process = PhFindProcessInformation(processes, processItem->ProcessId)) ||
+            process->CreateTime.QuadPart != processItem->CreateTime.QuadPart)
+        {
+            running = FALSE;
+            break;
+        }
+    }
+
+    PhFree(processes);
+
+    return running ? STATUS_SUCCESS : STATUS_INVALID_DEVICE_STATE;
 }
 
 /**
@@ -481,10 +572,10 @@ static NTSTATUS NTAPI WslpProviderThread(
             // The session VMs are counted again just before the sessions are asked, after the
             // wsl.exe calls above, so that a VM that stopped on idle meanwhile is not started
             // again by asking. The process list itself is up to one update interval old.
+            // The session VMs are kept, so that an action can check that they still run.
             if (candidates != 0)
             {
-                vmProcessItem = WslReferenceVmProcessItem(NULL, &sessionVms);
-                PhClearReference(&vmProcessItem);
+                WslpFindVmProcessItems(NULL, NULL, NULL, &sessionVms, &snapshot->SessionVmProcesses);
                 snapshot->Sessions = WslQuerySessions(sessionVms);
             }
 

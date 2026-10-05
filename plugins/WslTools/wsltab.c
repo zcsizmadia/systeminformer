@@ -103,6 +103,8 @@ typedef struct _WSL_ACTION_CONTEXT
     PPH_STRING Arguments; // Command line arguments, or the request path for an engine
     PPH_STRING PipeName; // A Docker API engine to send the request to, instead of running FileName
     PCSTR Method; // The request method for an engine, e.g. "POST"
+    PPH_STRING RunningDistro; // A distribution that must still run, or NULL
+    PWSL_SNAPSHOT SessionSnapshot; // A snapshot whose session VMs must still run, or NULL
     PPH_STRING Description;
     NTSTATUS Status;
     PPH_STRING Message; // the tool's own error text, if it printed one
@@ -1062,12 +1064,6 @@ static PH_STRINGREF WslpGetDistroImageText(
 }
 
 /**
- * Compares two nodes for the current sort column.
- *
- * \remarks Siblings of different types, e.g. the VM, WSL 1 distributions and sessions at the
- * root, are grouped by type in WSL_NODE_TYPE order whatever the sort order.
- */
-/**
  * Compares containers by a column that shows their inspect details. Containers without
  * details sort first.
  */
@@ -1102,6 +1098,12 @@ static int WslpCompareContainerDetails(
     return 0;
 }
 
+/**
+ * Compares two nodes for the current sort column.
+ *
+ * \remarks Siblings of different types, e.g. the VM, WSL 1 distributions and sessions at the
+ * root, are grouped by type in WSL_NODE_TYPE order whatever the sort order.
+ */
 static int __cdecl WslpCompareNodes(
     _In_ void *Context,
     _In_ const void *Elem1,
@@ -1769,6 +1771,10 @@ static BOOLEAN WslpNodeMatchesSearch(
     if (Node->Type == WslNodeTypeContainer && WslToolStatusInterface->WordMatch(&Node->Id->sr))
         return TRUE;
 
+    // Getting the text replaces strings that the cached text of the node can point to, so the
+    // cache is dropped first and the next paint gets the text again.
+    memset(Node->TextCache, 0, sizeof(Node->TextCache));
+
     for (ULONG i = 0; i < RTL_NUMBER_OF(columns); i++)
     {
         PH_TREENEW_GET_CELL_TEXT getCellText;
@@ -1900,6 +1906,8 @@ static VOID WslpFreeActionContext(
 {
     PhClearReference(&Context->Message);
     PhClearReference(&Context->PipeName);
+    PhClearReference(&Context->RunningDistro);
+    PhClearReference(&Context->SessionSnapshot);
     PhDereferenceObject(Context->Arguments);
     PhDereferenceObject(Context->Description);
     PhFree(Context);
@@ -1994,6 +2002,33 @@ static SIZE_T WslpGetVmPrivateBytes(
 }
 
 /**
+ * Checks, just before a command runs, that the distribution or session it runs in still
+ * runs, as running a command in a stopped one would start it.
+ *
+ * \param RunningDistro A distribution that must still run, or NULL.
+ * \param SessionSnapshot The snapshot the command for a WSLC session was chosen from, or NULL.
+ * \param Message Receives the text to show if the check fails.
+ * \return Successful or errant status.
+ */
+static NTSTATUS WslpCheckStillRunning(
+    _In_opt_ PPH_STRING RunningDistro,
+    _In_opt_ PWSL_SNAPSHOT SessionSnapshot,
+    _Out_ PPH_STRING *Message
+    )
+{
+    NTSTATUS status = STATUS_SUCCESS;
+
+    *Message = NULL;
+
+    if (RunningDistro && !NT_SUCCESS(status = WslCheckDistroRunning(RunningDistro)))
+        *Message = PhFormatString(L"The distribution %s no longer runs, and the command would start it again.", RunningDistro->Buffer);
+    else if (SessionSnapshot && !NT_SUCCESS(status = WslCheckSessionVmsRunning(SessionSnapshot)))
+        *Message = PhCreateString(L"The WSLC session no longer runs, and the command would start it again.");
+
+    return status;
+}
+
+/**
  * Runs a wsl.exe or wslc.exe action off the GUI thread; "--shutdown" can take several seconds.
  */
 _Function_class_(USER_THREAD_START_ROUTINE)
@@ -2004,6 +2039,11 @@ static NTSTATUS NTAPI WslpActionThread(
     PWSL_ACTION_CONTEXT context = Parameter;
     NTSTATUS status;
     PPH_BYTES output = NULL;
+
+    status = WslpCheckStillRunning(context->RunningDistro, context->SessionSnapshot, &context->Message);
+
+    if (!NT_SUCCESS(status))
+        goto CleanupExit;
 
     if (context->PipeName)
     {
@@ -2030,6 +2070,7 @@ static NTSTATUS NTAPI WslpActionThread(
             context->Message = WslpGetCommandErrorMessage(output);
     }
 
+CleanupExit:
     PhClearReference(&output);
     context->Status = status;
 
@@ -2052,6 +2093,9 @@ static NTSTATUS NTAPI WslpActionThread(
  * \param Method The request method for PipeName, e.g. "POST".
  * \param Arguments The command line arguments, or the request path for PipeName, from
  * PhFormatString. This function takes ownership of the string; NULL does nothing.
+ * \param RunningDistro A distribution that must still run when the action starts, or NULL.
+ * \param SessionSnapshot For a command for a WSLC session, the snapshot it was chosen from, whose
+ * session VMs must still run when the action starts; otherwise NULL.
  * \param Description The error text shown if the action fails.
  */
 static VOID WslpStartAction(
@@ -2059,6 +2103,8 @@ static VOID WslpStartAction(
     _In_opt_ PPH_STRING PipeName,
     _In_opt_ PCSTR Method,
     _In_opt_ PPH_STRING Arguments,
+    _In_opt_ PPH_STRING RunningDistro,
+    _In_opt_ PWSL_SNAPSHOT SessionSnapshot,
     _In_ PCWSTR Description
     )
 {
@@ -2072,6 +2118,8 @@ static VOID WslpStartAction(
     PhSetReference(&context->PipeName, PipeName);
     context->Method = Method;
     context->Arguments = Arguments;
+    PhSetReference(&context->RunningDistro, RunningDistro);
+    PhSetReference(&context->SessionSnapshot, SessionSnapshot);
     context->Description = PhCreateString(Description);
 
     if (!NT_SUCCESS(PhCreateThread2(WslpActionThread, context)))
@@ -2094,6 +2142,8 @@ typedef struct _WSL_RECLAIM_CONTEXT
     LONG RefCount; // One for the dialog thread, one for the worker thread
     PPH_STRING FileName; // wsl.exe or wslc.exe; a cached string the context does not own
     PPH_STRING Arguments;
+    PPH_STRING RunningDistro; // The distribution the command runs in, or NULL
+    PWSL_SNAPSHOT SessionSnapshot; // A snapshot whose session VMs must still run, or NULL
     HANDLE ProcessId; // The VM process whose private bytes are shown, or NULL if unknown
     PCWSTR Name; // The VM for the texts, e.g. "WSL VM"
     SIZE_T Before; // Private bytes of the VM process before the reclaim
@@ -2119,6 +2169,8 @@ static VOID WslpDereferenceReclaim(
         return;
 
     PhClearReference(&Context->Arguments);
+    PhClearReference(&Context->RunningDistro);
+    PhClearReference(&Context->SessionSnapshot);
     PhClearReference(&Context->Message);
     PhClearReference(&Context->ContentText);
     PhFree(Context);
@@ -2179,7 +2231,8 @@ static NTSTATUS NTAPI WslpReclaimWorkerThread(
     PPH_BYTES output = NULL;
     NTSTATUS status;
 
-    status = WslRunCommandEx(context->FileName, &context->Arguments->sr, WSL_ACTION_TIMEOUT_MS, &output, TRUE);
+    if (NT_SUCCESS(status = WslpCheckStillRunning(context->RunningDistro, context->SessionSnapshot, &context->Message)))
+        status = WslRunCommandEx(context->FileName, &context->Arguments->sr, WSL_ACTION_TIMEOUT_MS, &output, TRUE);
 
     if (NT_SUCCESS(status))
     {
@@ -2363,12 +2416,16 @@ static NTSTATUS NTAPI WslpReclaimDialogThread(
  * \param FileName wsl.exe or wslc.exe.
  * \param Arguments The command that runs WSL_RECLAIM_SCRIPT in the VM, from PhFormatString.
  * This function takes ownership of the string; NULL does nothing.
+ * \param RunningDistro The distribution the command runs in, which must still run, or NULL.
+ * \param SessionSnapshot A snapshot whose session VMs must still run, or NULL.
  * \param ProcessId The VM process, or NULL if it is not known, which leaves out the numbers.
  * \param Name The VM for the texts, e.g. "WSL VM".
  */
 static VOID WslpStartReclaim(
     _In_ PPH_STRING FileName,
     _In_opt_ PPH_STRING Arguments,
+    _In_opt_ PPH_STRING RunningDistro,
+    _In_opt_ PWSL_SNAPSHOT SessionSnapshot,
     _In_opt_ HANDLE ProcessId,
     _In_ PCWSTR Name
     )
@@ -2390,6 +2447,8 @@ static VOID WslpStartReclaim(
     context->RefCount = 2;
     context->FileName = FileName;
     context->Arguments = Arguments;
+    PhSetReference(&context->RunningDistro, RunningDistro);
+    PhSetReference(&context->SessionSnapshot, SessionSnapshot);
     context->ProcessId = ProcessId;
     context->Name = Name;
     context->Phase = WslReclaimPhaseRunning;
@@ -2501,6 +2560,29 @@ static VOID WslpGoToVmProcess(
 }
 
 /**
+ * Gets the distribution that a Docker API engine runs in.
+ *
+ * \return The name of the distribution, or NULL if the current snapshot does not have it.
+ */
+static PPH_STRING WslpGetEngineDistroName(
+    _In_ PWSL_ENGINE Engine
+    )
+{
+    if (!WslCurrentSnapshot || !Engine->DistroId)
+        return NULL;
+
+    for (ULONG i = 0; i < WslCurrentSnapshot->Distributions->Count; i++)
+    {
+        PWSL_DISTRO_ITEM distro = WslCurrentSnapshot->Distributions->Items[i];
+
+        if (PhEqualString(distro->Id, Engine->DistroId, TRUE))
+            return distro->Name;
+    }
+
+    return NULL;
+}
+
+/**
  * Handles a command from the context menu or keyboard.
  *
  * \param WindowHandle The tree window handle.
@@ -2512,6 +2594,10 @@ static VOID WslpHandleCommand(
     )
 {
     PWSL_NODE node = WslpGetSelectedNode();
+
+    // A removed row is only shown for its highlight; what it names is gone.
+    if (node && node->RemoveTime)
+        node = NULL;
 
     switch (Id)
     {
@@ -2528,6 +2614,8 @@ static VOID WslpHandleCommand(
         break;
     case ID_WSL_TERMINATE:
         {
+            PPH_STRING distroName;
+
             if (!node || !node->Distro)
                 break;
 
@@ -2537,10 +2625,14 @@ static VOID WslpHandleCommand(
                 break;
             }
 
+            // The confirmation runs a message loop, in which a new snapshot can replace the node.
+            distroName = PhReferenceObject(node->Distro->Name);
+            node = NULL;
+
             if (PhShowConfirmMessage(
                 WindowHandle,
                 L"terminate",
-                node->Distro->Name->Buffer,
+                distroName->Buffer,
                 L"All processes in the distribution will be stopped.",
                 TRUE
                 ))
@@ -2549,10 +2641,14 @@ static VOID WslpHandleCommand(
                     WslGetWslFileName(),
                     NULL,
                     NULL,
-                    PhFormatString(L"--terminate %s", node->Distro->Name->Buffer),
+                    PhFormatString(L"--terminate %s", distroName->Buffer),
+                    NULL,
+                    NULL,
                     L"Unable to terminate the distribution."
                     );
             }
+
+            PhDereferenceObject(distroName);
         }
         break;
     case ID_WSL_SHUTDOWN:
@@ -2565,7 +2661,7 @@ static VOID WslpHandleCommand(
                 TRUE
                 ))
             {
-                WslpStartAction(WslGetWslFileName(), NULL, NULL, PhCreateString(L"--shutdown"), L"Unable to shut down WSL.");
+                WslpStartAction(WslGetWslFileName(), NULL, NULL, PhCreateString(L"--shutdown"), NULL, NULL, L"Unable to shut down WSL.");
             }
         }
         break;
@@ -2607,6 +2703,8 @@ static VOID WslpHandleCommand(
                 WslpStartReclaim(
                     WslGetWslFileName(),
                     PhFormatString(L"--distribution %s --user root --cd / --exec /bin/sh -c \"%s\"", distro->Name->Buffer, WSL_RECLAIM_SCRIPT),
+                    distro->Name,
+                    NULL,
                     WslVmProcessItem ? WslVmProcessItem->ProcessId : NULL,
                     L"WSL VM"
                     );
@@ -2618,6 +2716,8 @@ static VOID WslpHandleCommand(
                 WslpStartReclaim(
                     WslGetWslcFileName(),
                     PhFormatString(L"--session \"%s\" system session run /bin/sh -c \"%s\"", node->Session->Name->Buffer, WSL_RECLAIM_SCRIPT),
+                    NULL,
+                    WslCurrentSnapshot,
                     WslSessionVmProcessItem ? WslSessionVmProcessItem->ProcessId : NULL,
                     L"WSLC session VM"
                     );
@@ -2637,14 +2737,20 @@ static VOID WslpHandleCommand(
     case ID_WSL_CONTAINERINSPECT:
         {
             NTSTATUS status;
+            PPH_STRING distroName;
 
             if (!node || !node->Container)
                 break;
 
             if (node->Engine)
-                status = WslShowEngineContainerInspect(node->Engine->PipeName, node->Container->Id, node->Container->Name);
+            {
+                if (distroName = WslpGetEngineDistroName(node->Engine))
+                    status = WslShowEngineContainerInspect(node->Engine->PipeName, distroName, node->Container->Id, node->Container->Name);
+                else
+                    status = STATUS_INVALID_DEVICE_STATE;
+            }
             else
-                status = WslShowContainerInspect(node->Session->Name, node->Container->Id, node->Container->Name);
+                status = WslShowContainerInspect(node->Session->Name, WslCurrentSnapshot, node->Container->Id, node->Container->Name);
 
             if (!NT_SUCCESS(status))
                 PhShowStatus(WindowHandle, L"Unable to inspect the container.", status, 0);
@@ -2657,7 +2763,9 @@ static VOID WslpHandleCommand(
         {
             PCWSTR verb;
             PPH_STRING pipeName = NULL;
+            PPH_STRING distroName = NULL;
             PPH_STRING sessionName = NULL;
+            PWSL_SNAPSHOT sessionSnapshot = NULL;
             PPH_STRING containerId;
             PPH_STRING containerName;
             BOOLEAN confirmed = TRUE;
@@ -2690,10 +2798,23 @@ static VOID WslpHandleCommand(
 
             // The confirmation runs a message loop, in which a new snapshot can replace the node
             // and the engine or session it points to, so what the action needs is kept first.
+            // The distribution of an engine, or the session VMs, must still run when it starts.
             if (node->Engine)
+            {
+                if (!(distroName = WslpGetEngineDistroName(node->Engine)))
+                {
+                    PhShowStatus(WindowHandle, L"Unable to control the container.", STATUS_INVALID_DEVICE_STATE, 0);
+                    break;
+                }
+
+                PhReferenceObject(distroName);
                 PhSetReference(&pipeName, node->Engine->PipeName);
+            }
             else
+            {
                 PhSetReference(&sessionName, node->Session->Name);
+                PhSetReference(&sessionSnapshot, WslCurrentSnapshot);
+            }
 
             containerId = PhReferenceObject(node->Container->Id);
             containerName = PhReferenceObject(node->Container->Name);
@@ -2732,6 +2853,8 @@ static VOID WslpHandleCommand(
                     Id == ID_WSL_CONTAINERREMOVE ?
                         PhFormatString(L"/containers/%s", containerId->Buffer) :
                         PhFormatString(L"/containers/%s/%s", containerId->Buffer, verb),
+                    distroName,
+                    NULL,
                     L"Unable to control the container."
                     );
             }
@@ -2742,12 +2865,16 @@ static VOID WslpHandleCommand(
                     NULL,
                     NULL,
                     PhFormatString(L"--session \"%s\" %s %s", sessionName->Buffer, verb, containerId->Buffer),
+                    NULL,
+                    sessionSnapshot,
                     L"Unable to control the container."
                     );
             }
 
             PhClearReference(&pipeName);
+            PhClearReference(&distroName);
             PhClearReference(&sessionName);
+            PhClearReference(&sessionSnapshot);
             PhDereferenceObject(containerId);
             PhDereferenceObject(containerName);
         }

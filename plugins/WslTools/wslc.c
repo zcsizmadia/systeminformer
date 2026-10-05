@@ -36,7 +36,7 @@
     L"echo @ $u $t $p $$ $k $m $a; " \
     L"for d in /proc/[0-9]*; do { read -r g < $d/cgroup; } 2>/dev/null && echo %${d#/proc/} $g; done; " \
     L"cat /proc/[0-9]*/stat 2>/dev/null; " \
-    L"echo @end"
+    L"echo " WSL_FRAME_END_MARKER
 
 typedef struct _WSL_SESSION_PARSER
 {
@@ -426,7 +426,7 @@ static PPH_STRING WslpGetListLabel(
 /**
  * Formats the Compose project and service of a container from its labels.
  *
- * \return e.g. "skrog / api", or NULL if the container is not from Compose.
+ * \return e.g. "myapp / api", or NULL if the container is not from Compose.
  */
 static PPH_STRING WslpGetComposeText(
     _In_ PPH_STRING Labels

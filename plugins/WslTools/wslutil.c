@@ -96,6 +96,13 @@ VOID NTAPI WslpSnapshotDeleteProcedure(
 
     if (snapshot->Sessions)
         WslFreeSessions(snapshot->Sessions);
+
+    if (snapshot->SessionVmProcesses)
+    {
+        PhDereferenceObjects(snapshot->SessionVmProcesses->Items, snapshot->SessionVmProcesses->Count);
+        PhDereferenceObject(snapshot->SessionVmProcesses);
+    }
+
     if (snapshot->Engines)
         WslFreeEngines(snapshot->Engines);
 }
@@ -272,6 +279,48 @@ static VOID WslpApplyRunningList(
 }
 
 /**
+ * Checks, just before a command for a WSL 2 distribution runs, that the distribution still
+ * runs.
+ *
+ * \param DistroName The name of the distribution.
+ * \return STATUS_SUCCESS, or STATUS_INVALID_DEVICE_STATE if the distribution does not run.
+ * \remarks A command in a stopped distribution starts it, and the snapshot the command was
+ * chosen from can be old, e.g. while updates are paused. As for the snapshot, wsl.exe is only
+ * asked while a VM process runs.
+ */
+NTSTATUS WslCheckDistroRunning(
+    _In_ PPH_STRING DistroName
+    )
+{
+    static CONST PH_STRINGREF runningArguments = PH_STRINGREF_INIT(L"--list --running --quiet");
+    WSL_DISTRO_ITEM distro = { 0 };
+    PPH_LIST distributions;
+    PPH_BYTES output;
+    PPH_STRING text;
+    NTSTATUS status;
+
+    if (!WslIsAnyVmProcessRunning())
+        return STATUS_INVALID_DEVICE_STATE;
+
+    if (!NT_SUCCESS(status = WslRunCommand(WslGetWslFileName(), &runningArguments, &output)))
+        return status;
+
+    if (text = PhConvertUtf8ToUtf16Ex(output->Buffer, output->Length))
+    {
+        distro.Name = DistroName;
+        distributions = PhCreateList(1);
+        PhAddItemList(distributions, &distro);
+        WslpApplyRunningList(distributions, text);
+        PhDereferenceObject(distributions);
+        PhDereferenceObject(text);
+    }
+
+    PhDereferenceObject(output);
+
+    return distro.State == WslDistroStateRunning ? STATUS_SUCCESS : STATUS_INVALID_DEVICE_STATE;
+}
+
+/**
  * Builds a snapshot of the registered distributions and their state.
  *
  * \param VmRunning TRUE if a WSL virtual machine process exists.
@@ -295,6 +344,7 @@ PWSL_SNAPSHOT WslQuerySnapshot(
     snapshot->Distributions = PhCreateList(4);
     snapshot->RunningQueryStatus = STATUS_SUCCESS;
     snapshot->Sessions = NULL;
+    snapshot->SessionVmProcesses = NULL;
     snapshot->Engines = NULL;
 
     context.Distributions = snapshot->Distributions;

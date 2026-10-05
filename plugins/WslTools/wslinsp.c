@@ -37,10 +37,13 @@ typedef struct _WSL_INSPECT_NODE
 typedef struct _WSL_INSPECT_CONTEXT
 {
     PPH_STRING SessionName; // The WSLC session, or NULL for an engine container
+    PWSL_SNAPSHOT SessionSnapshot; // The snapshot the WSLC container was chosen from
     PPH_STRING PipeName; // The Docker API engine, or NULL for a WSLC container
+    PPH_STRING DistroName; // The distribution the engine runs in, or NULL for a WSLC container
     PPH_STRING ContainerId;
     PPH_STRING ContainerName;
     NTSTATUS Status;
+    PPH_STRING Message; // Why the inspect was not run, or NULL
     PPH_BYTES Output; // The JSON as wslc printed it or the engine returned it
 
     // Used by the window.
@@ -82,7 +85,10 @@ static VOID WslpFreeInspectContext(
     }
 
     PhClearReference(&Context->SessionName);
+    PhClearReference(&Context->SessionSnapshot);
     PhClearReference(&Context->PipeName);
+    PhClearReference(&Context->DistroName);
+    PhClearReference(&Context->Message);
     PhClearReference(&Context->ContainerId);
     PhClearReference(&Context->ContainerName);
     PhClearReference(&Context->Output);
@@ -392,7 +398,11 @@ static VOID NTAPI WslpShowInspectWindow(
 
     if (!NT_SUCCESS(context->Status))
     {
-        PhShowStatus(SystemInformer_GetWindowHandle(), L"Unable to inspect the container.", context->Status, 0);
+        if (context->Message)
+            PhShowError2(SystemInformer_GetWindowHandle(), L"Unable to inspect the container.", L"%s", context->Message->Buffer);
+        else
+            PhShowStatus(SystemInformer_GetWindowHandle(), L"Unable to inspect the container.", context->Status, 0);
+
         WslpFreeInspectContext(context);
         return;
     }
@@ -415,7 +425,17 @@ static NTSTATUS NTAPI WslpInspectThread(
     PWSL_INSPECT_CONTEXT context = Parameter;
     PPH_STRING arguments;
 
-    if (context->PipeName && (arguments = PhFormatString(L"/containers/%s/json", context->ContainerId->Buffer)))
+    // The snapshot the container was chosen from can be old, and asking about a container in a
+    // distribution or session that stopped meanwhile would start it again.
+    if (context->PipeName && !NT_SUCCESS(context->Status = WslCheckDistroRunning(context->DistroName)))
+    {
+        context->Message = PhFormatString(L"The distribution %s no longer runs, and inspecting would start it again.", context->DistroName->Buffer);
+    }
+    else if (!context->PipeName && !NT_SUCCESS(context->Status = WslCheckSessionVmsRunning(context->SessionSnapshot)))
+    {
+        context->Message = PhCreateString(L"The WSLC session no longer runs, and inspecting would start it again.");
+    }
+    else if (context->PipeName && (arguments = PhFormatString(L"/containers/%s/json", context->ContainerId->Buffer)))
     {
         PPH_BYTES path = PhConvertUtf16ToUtf8Ex(arguments->Buffer, arguments->Length);
         ULONG statusCode;
@@ -445,6 +465,10 @@ static NTSTATUS NTAPI WslpInspectThread(
         context->Status = STATUS_NO_MEMORY;
     }
 
+    // The window needs the JSON, which an engine can leave out even when it answers 200.
+    if (NT_SUCCESS(context->Status) && !context->Output)
+        context->Status = STATUS_UNSUCCESSFUL;
+
     SystemInformer_Invoke(WslpShowInspectWindow, context);
 
     return STATUS_SUCCESS;
@@ -454,12 +478,15 @@ static NTSTATUS NTAPI WslpInspectThread(
  * Inspects a container and shows the result in the Inspect window.
  *
  * \param SessionName The session the container runs in.
+ * \param SessionSnapshot The snapshot the container was chosen from, whose session VMs must
+ * still run.
  * \param ContainerId The container ID.
  * \param ContainerName The container name, for the window title.
  * \return NTSTATUS code indicating whether the inspect could be started.
  */
 NTSTATUS WslShowContainerInspect(
     _In_ PPH_STRING SessionName,
+    _In_ PWSL_SNAPSHOT SessionSnapshot,
     _In_ PPH_STRING ContainerId,
     _In_ PPH_STRING ContainerName
     )
@@ -474,6 +501,7 @@ NTSTATUS WslShowContainerInspect(
 
     context = PhAllocateZero(sizeof(WSL_INSPECT_CONTEXT));
     PhSetReference(&context->SessionName, SessionName);
+    PhSetReference(&context->SessionSnapshot, SessionSnapshot);
     PhSetReference(&context->ContainerId, ContainerId);
     PhSetReference(&context->ContainerName, ContainerName);
 
@@ -487,12 +515,14 @@ NTSTATUS WslShowContainerInspect(
  * Inspects a container of a Docker API engine and shows the result in the Inspect window.
  *
  * \param PipeName The engine's pipe.
+ * \param DistroName The distribution the engine runs in.
  * \param ContainerId The container ID.
  * \param ContainerName The container name, for the window title.
  * \return NTSTATUS code indicating whether the inspect could be started.
  */
 NTSTATUS WslShowEngineContainerInspect(
     _In_ PPH_STRING PipeName,
+    _In_ PPH_STRING DistroName,
     _In_ PPH_STRING ContainerId,
     _In_ PPH_STRING ContainerName
     )
@@ -505,6 +535,7 @@ NTSTATUS WslShowEngineContainerInspect(
 
     context = PhAllocateZero(sizeof(WSL_INSPECT_CONTEXT));
     PhSetReference(&context->PipeName, PipeName);
+    PhSetReference(&context->DistroName, DistroName);
     PhSetReference(&context->ContainerId, ContainerId);
     PhSetReference(&context->ContainerName, ContainerName);
 

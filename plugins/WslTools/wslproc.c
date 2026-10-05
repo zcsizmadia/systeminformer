@@ -41,7 +41,7 @@
     L"echo @ $u $t $p $$ $k $m $a ${e:--}; " \
     L"for d in /proc/[0-9]*; do { read -r g < $d/cgroup; } 2>/dev/null && echo %%${d#/proc/} $g; done; " \
     L"cat /proc/[0-9]*/stat 2>/dev/null; " \
-    L"echo @end; " \
+    L"echo " WSL_FRAME_END_MARKER L"; " \
     L"sleep $s; " \
     L"s=%lu; " \
     L"done"
@@ -337,7 +337,7 @@ static BOOLEAN WslpParseHeader(
  *
  * \return A new entry, or NULL if the line is malformed.
  * \remarks The name is between the first "(" and the last ")"; it can itself contain
- * spaces and parentheses, e.g. "init(skrog-engi".
+ * spaces and parentheses, e.g. "init(docker-des".
  */
 static PWSL_STAT_ENTRY WslpParseStatLine(
     _In_ PWSL_FRAME_PARSER Parser,
@@ -375,9 +375,14 @@ static PWSL_STAT_ENTRY WslpParseStatLine(
     remaining.Buffer = Line.Buffer + close + 2;
     remaining.Length = Line.Length - (close + 2) * sizeof(WCHAR);
 
-    for (ULONG i = 0; i < WSL_STAT_FIELD_COUNT && remaining.Length != 0; i++)
+    for (ULONG i = 0; i < WSL_STAT_FIELD_COUNT; i++)
     {
         PH_STRINGREF field;
+
+        // A real line has about 50 fields after the name. A shorter one is a piece of a line,
+        // e.g. one that a line break in a process name made up.
+        if (remaining.Length == 0)
+            return NULL;
 
         PhSplitStringRefAtChar(&remaining, L' ', &field, &remaining);
 
@@ -687,7 +692,7 @@ static PWSL_PROCESS_FRAME WslpProcessLine(
 
     lineRef = line->sr;
 
-    if (PhEqualStringRef2(&lineRef, L"@end", FALSE))
+    if (PhEqualStringRef2(&lineRef, WSL_FRAME_END_MARKER, FALSE))
     {
         if (Parser->InFrame)
             frame = WslpCompleteFrame(Parser);
